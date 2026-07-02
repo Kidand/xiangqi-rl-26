@@ -42,7 +42,25 @@ from rl.replay_buffer import ReplayBuffer
 from rl.inference_server import create_shared_buffers, eval_server_proc
 from rl.selfplay import num_eval_servers, num_selfplay_workers, selfplay_worker
 
-__all__ = ["run_training", "main"]
+__all__ = ["run_training", "main", "resolve_train_steps"]
+
+
+# ---------------------------------------------------------------------------
+# 训练步数解析（自动 / 固定）
+# ---------------------------------------------------------------------------
+def resolve_train_steps(new_samples: int, cfg: Config) -> int:
+    """本迭代训练步数（纯函数，DESIGN §9.3）。
+
+    - ``train.train_steps_per_iteration > 0``：固定步数，原样返回。
+    - ``== 0``：自动 ``clamp(ceil(新样本数 × sample_reuse / batch_size), 10, 5000)``，
+      防止小 buffer 期每个样本被重复学习过多遍导致过拟合。
+    """
+    fixed = int(cfg.train.train_steps_per_iteration)
+    if fixed > 0:
+        return fixed
+    batch = max(1, int(cfg.train.batch_size))
+    steps = math.ceil(int(new_samples) * float(cfg.train.sample_reuse) / batch)
+    return max(10, min(5000, int(steps)))
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +236,7 @@ def _selfplay_phase(
     # 聚合统计。
     agg = {
         "games": 0,
+        "new_samples": 0,
         "red_win": 0,
         "black_win": 0,
         "draw": 0,
@@ -296,6 +315,7 @@ def _selfplay_phase(
         values = msg["values"]
         if len(states) > 0:
             buffer.add_game(states, sparse, values)
+            agg["new_samples"] += len(states)
         append_jsonl(records_path, msg["record"])
 
         st = msg["stats"]
@@ -344,6 +364,7 @@ def _selfplay_phase(
     fp_rate = (agg["fp"] / agg["calib_would"]) if agg["calib_would"] > 0 else 0.0
     return {
         "games": agg["games"],
+        "new_samples": agg["new_samples"],
         "red_win": agg["red_win"],
         "black_win": agg["black_win"],
         "draw": agg["draw"],
@@ -368,12 +389,13 @@ def _train_phase(
     iteration: int,
     device: str,
     logger: TrainLogger,
+    steps: int,
 ) -> Dict[str, float]:
-    """在 buffer 上训练 train_steps_per_iteration 步，返回平均指标。"""
+    """在 buffer 上训练 ``steps`` 步（由 resolve_train_steps 解析），返回平均指标。"""
     import torch
     import torch.nn.functional as F
 
-    steps = int(cfg.train.train_steps_per_iteration)
+    steps = int(steps)
     batch = int(cfg.train.batch_size)
     total_steps = int(cfg.train.total_iterations) * steps
     dev = torch.device(device)
@@ -585,7 +607,13 @@ def run_training(cfg: Config, resume: bool = False) -> Dict[str, object]:
         tr_t0 = time.monotonic()
         trained = len(buffer) >= int(cfg.train.min_buffer_to_train)
         if trained:
-            tr_stats = _train_phase(model, optimizer, buffer, cfg, iteration, device, logger)
+            new_samples = int(sp_stats.get("new_samples", 0))
+            steps = resolve_train_steps(new_samples, cfg)
+            mode = "自动" if int(cfg.train.train_steps_per_iteration) == 0 else "固定"
+            logger.info(
+                f"[iter {iteration}] 本迭代新样本 {new_samples}，训练步数 {steps}（{mode}）"
+            )
+            tr_stats = _train_phase(model, optimizer, buffer, cfg, iteration, device, logger, steps)
         else:
             logger.info(
                 f"[iter {iteration}] buffer {len(buffer)} < min_buffer_to_train "

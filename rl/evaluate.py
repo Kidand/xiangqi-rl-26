@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Callable, Dict
 
 import numpy as np
@@ -46,7 +47,9 @@ def _play_one(
         max_plies=int(cfg.selfplay.max_game_plies),
         no_capture_plies=int(cfg.selfplay.no_capture_draw_plies),
     )
-    mcfg = cfg.mcts
+    # 注入树内和棋惩罚（与 selfplay 同一来源 selfplay.draw_penalty，避免两处配置漂移）。
+    # arena 不引入 temp_final：仍是 arena_temp_moves 之后 argmax。
+    mcfg = dataclasses.replace(cfg.mcts, draw_value=float(cfg.selfplay.draw_penalty))
     sims = int(cfg.arena.arena_sims)
     hist = int(cfg.model.history_steps)
     temp_moves = int(cfg.arena.arena_temp_moves)

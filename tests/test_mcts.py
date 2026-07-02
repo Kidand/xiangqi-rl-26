@@ -19,6 +19,7 @@ from xiangqi.constants import (
     ACTION_SIZE,
     BLACK,
     RED,
+    action_to_move,
     move_to_action,
     uci_to_move,
 )
@@ -303,3 +304,123 @@ def test_search_matches_manual_loop_shape():
     assert counts.dtype == np.float32
     assert int(counts.sum()) == 40
     assert isinstance(value, float)
+
+
+# ===========================================================================
+# 树内和棋惩罚（DESIGN §8：和棋回传 draw_value，不翻符号）
+# ===========================================================================
+# 初始局面：max_plies=1 时根有合法着法（root 非终局），但任意一步后 len(_undo)=1>=1
+# 触发 "max_moves" 和棋终局 —— 于是根的每条子边都指向一个立即和棋的终局叶子。
+_START_FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1"
+
+# 决策倾向用局面：红先，a0a5 吃黑车（no_capture_plies=1 时该吃子重置和棋计数 -> 非终局，
+# 进网络评估），其余安静着法均立即触发无吃子和棋。故根同时有"和棋边"与"非和棋边"。
+_MIXED_FEN = "3k5/9/9/9/r8/9/9/9/9/R3K4 w - - 0 1"
+_MIXED_CAP = "a0a5"
+
+
+def _const_eval(value: float):
+    """确定性 mock：均匀策略 + 固定价值（叶子=该叶子走子方视角）。"""
+    def fn(states: np.ndarray):
+        b = states.shape[0]
+        policy = np.full((b, ACTION_SIZE), 1.0 / ACTION_SIZE, dtype=np.float32)
+        values = np.full(b, float(value), dtype=np.float32)
+        return policy, values
+    return fn
+
+
+def _root_view_eval(root_value: float):
+    """把"根方视角价值"转成 mock：叶子处于对手走子视角（根的每条子边下一层），
+    故叶子常量取 ``-root_value``（深度 1 主导），使搜索把根方视角价值视为 root_value。
+    """
+    return _const_eval(-float(root_value))
+
+
+def _run_tree(board, cfg, eval_fn, num_sims):
+    """跑满 num_sims 次模拟并返回树（两阶段驱动，等价于 search()）。"""
+    tree = SearchTree(board, cfg, add_noise=False)
+    while tree.total_visits < num_sims:
+        before = tree.total_visits
+        states, tokens = tree.select_leaves(cfg.batch_size)
+        if tokens:
+            tree.apply_results(tokens, *eval_fn(states))
+        if tree.total_visits == before and not tokens:
+            break
+    return tree
+
+
+def test_draw_backup_sign_root_edges_equal_draw_value():
+    """核心防翻符号断言：根各"和棋子边"的 Q ≈ draw_value（负值），而非 +draw_value。
+
+    每条根子边指向立即和棋终局；和棋回传不翻符号（双方同罚），故边 W 累加 draw_value，
+    Q = W/N = draw_value。若误把 draw_value 沿路径取负（旧胜负逻辑），Q 会变成 +0.3。
+    """
+    draw_value = -0.3
+    board = Board(_START_FEN, max_plies=1)
+    assert board.result() is None  # 根本身非终局
+    cfg = MCTSConfig(num_sims=60, batch_size=8, draw_value=draw_value)
+
+    tree = _run_tree(board, cfg, _const_eval(0.5), num_sims=60)
+    root = tree._root
+    assert root.expanded
+    visited = root.child_N > 0
+    assert visited.any()
+    q = root.child_W[visited] / root.child_N[visited]
+    # 全部和棋子边 Q 必须等于 draw_value（负），绝不能是 +0.3。
+    assert np.allclose(q, draw_value, atol=1e-6), f"和棋边 Q={np.unique(q)} 期望 {draw_value}"
+    assert (q < 0).all()
+    assert tree.root_value() == pytest.approx(draw_value, abs=1e-6)
+
+
+def test_win_loss_backup_unaffected_by_draw_value():
+    """胜负路径（一步杀）不受 draw_value 影响：仍集中访问到杀着且根价值明显为正。"""
+    board = Board.from_fen(MATE_FEN)
+    mate_action = move_to_action(uci_to_move(MATE_MOVE))
+    cfg = MCTSConfig(num_sims=100, batch_size=8, draw_value=-0.3)
+    counts, value = search(board, _uniform_eval(seed=1), cfg, num_sims=100)
+    assert int(counts.argmax()) == mate_action
+    assert counts[mate_action] >= 0.6 * counts.sum()
+    assert value > 0.5  # 胜负 ±1 回传不受和棋分支干扰
+
+
+def test_disadvantaged_prefers_draw_edges():
+    """根方劣势（root_value=-0.8）时，多数访问应落到和棋边，argmax 为和棋着（非吃子）。"""
+    cap = move_to_action(uci_to_move(_MIXED_CAP))
+    board = Board(_MIXED_FEN, no_capture_plies=1)
+    cfg = MCTSConfig(num_sims=200, batch_size=8, draw_value=-0.1)
+    tree = _run_tree(board, cfg, _root_view_eval(-0.8), num_sims=200)
+    counts = tree.visit_counts()
+    total = int(counts.sum())
+    cap_visits = int(counts[cap])
+    draw_visits = total - cap_visits
+    assert draw_visits > cap_visits           # 多数访问给和棋边
+    assert int(counts.argmax()) != cap        # 最优着是和棋着
+
+
+def test_advantaged_avoids_draw_edges():
+    """根方占优（root_value=+0.8）时，应避开和棋边：argmax 为非和棋（吃子）着。"""
+    cap = move_to_action(uci_to_move(_MIXED_CAP))
+    board = Board(_MIXED_FEN, no_capture_plies=1)
+    cfg = MCTSConfig(num_sims=200, batch_size=8, draw_value=-0.1)
+    tree = _run_tree(board, cfg, _root_view_eval(0.8), num_sims=200)
+    counts = tree.visit_counts()
+    cap_visits = int(counts[cap])
+    assert int(counts.argmax()) == cap        # 最优着是非和棋着
+    # 吃子边访问数超过任一单条和棋边。
+    others = counts.copy()
+    others[cap] = 0
+    assert cap_visits > others.max()
+
+
+def test_terminal_draw_root_returns_draw_value():
+    """根即和棋终局（max_plies=0）时 root_value()==draw_value（不是 0，不翻符号）。"""
+    draw_value = -0.25
+    board = Board(_START_FEN, max_plies=0)
+    assert board.result() == "1/2-1/2"
+    cfg = MCTSConfig(num_sims=30, batch_size=8, draw_value=draw_value)
+    tree = SearchTree(board, cfg, add_noise=False)
+    assert tree.root_value() == pytest.approx(draw_value, abs=1e-9)
+    # search() 便捷封装在根终局时同样返回 draw_value。
+    counts, value = search(board, _zero_eval, cfg, num_sims=30)
+    assert int(counts.sum()) == 0
+    assert value == pytest.approx(draw_value, abs=1e-9)

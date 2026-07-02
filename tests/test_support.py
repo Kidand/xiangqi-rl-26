@@ -20,6 +20,7 @@ from xiangqi.board import Board
 from xiangqi.constants import (
     ACTION_SIZE,
     ADVISOR,
+    action_to_move,
     CANNON,
     ELEPHANT,
     HORSE,
@@ -34,7 +35,7 @@ from xiangqi.constants import (
 )
 
 # ── 待测模块 ──────────────────────────────────────────────────────────────
-from rl.config import SelfPlayConfig
+from rl.config import Config, SelfPlayConfig
 from rl.heuristics import (
     ResignTracker,
     apply_draw_penalty,
@@ -45,6 +46,8 @@ from rl.heuristics import (
 )
 from rl.logger import CSV_COLUMNS, TrainLogger
 from rl.replay_buffer import ReplayBuffer
+from rl.selfplay import sample_action_from_counts
+from rl.train import resolve_train_steps
 
 
 # ======================================================================
@@ -839,3 +842,96 @@ class TestOptimizerWeightDecay:
 
         # 至少存在若干 1D 张量（BN），确保测试有意义
         assert sum(1 for p in model.parameters() if p.ndim <= 1) == len(nodecay_params)
+
+
+# ======================================================================
+# temp_final：温度期后走子采样（复用 sample_action_from_counts 温度路径）
+# ======================================================================
+
+class TestTempFinal:
+    """走子选择在温度期后按 temp_final 采样：0 → argmax；>0 → N^(1/temp_final) 采样。
+
+    _decide 温度期后取 tau=temp_final（>0）或 0（argmax），再交给
+    sample_action_from_counts，故此处直接以伪 counts 验证该采样路径。
+    """
+
+    # 伪访问计数：argmax 明显（action 10），另有两个次优着。
+    def _counts(self):
+        counts = np.zeros(ACTION_SIZE, dtype=np.float32)
+        counts[10] = 10.0   # argmax
+        counts[20] = 5.0
+        counts[30] = 3.0
+        return counts
+
+    def test_temp_final_zero_is_argmax(self):
+        """temp_final=0（tau=0）恒返回 argmax 着。"""
+        counts = self._counts()
+        argmax_move = action_to_move(10)
+        rng = np.random.default_rng(0)
+        for _ in range(1000):
+            assert sample_action_from_counts(counts, 0.0, rng) == argmax_move
+
+    def test_temp_final_positive_samples_non_argmax(self):
+        """temp_final=0.25：1000 次采样（固定 seed）非 argmax 着频次 > 0，且 argmax 仍占多数。"""
+        counts = self._counts()
+        argmax_move = action_to_move(10)
+        rng = np.random.default_rng(12345)
+        picks = [sample_action_from_counts(counts, 0.25, rng) for _ in range(1000)]
+        n_argmax = sum(1 for m in picks if m == argmax_move)
+        n_other = 1000 - n_argmax
+        assert n_other > 0, "temp_final>0 应能采到非 argmax 着"
+        assert n_argmax > 500, f"argmax 仍应占多数，实际 {n_argmax}/1000"
+        # 只采到了合法（有访问）着法。
+        legal = {action_to_move(a) for a in (10, 20, 30)}
+        assert set(picks).issubset(legal)
+
+
+# ======================================================================
+# resolve_train_steps：自动 / 固定训练步数（DESIGN §9.3）
+# ======================================================================
+
+class TestResolveTrainSteps:
+    def _cfg(self, fixed=1000, reuse=3.0, batch=4096):
+        cfg = Config()
+        cfg.train.train_steps_per_iteration = fixed
+        cfg.train.sample_reuse = reuse
+        cfg.train.batch_size = batch
+        return cfg
+
+    def test_fixed_returns_as_is(self):
+        """train_steps_per_iteration > 0 时原样返回，忽略新样本数。"""
+        cfg = self._cfg(fixed=1000)
+        assert resolve_train_steps(0, cfg) == 1000
+        assert resolve_train_steps(10_000_000, cfg) == 1000
+
+    def test_auto_lower_clamp(self):
+        """自动模式下限 10：新样本极少时 ceil(...) < 10 → 返回 10。"""
+        cfg = self._cfg(fixed=0, reuse=3.0, batch=4096)
+        # ceil(100*3/4096)=ceil(0.073)=1 -> clamp 10
+        assert resolve_train_steps(100, cfg) == 10
+        assert resolve_train_steps(0, cfg) == 10
+
+    def test_auto_upper_clamp(self):
+        """自动模式上限 5000：新样本极多时 ceil(...) > 5000 → 返回 5000。"""
+        cfg = self._cfg(fixed=0, reuse=3.0, batch=4096)
+        # ceil(1e8*3/4096) 远大于 5000
+        assert resolve_train_steps(100_000_000, cfg) == 5000
+
+    def test_auto_typical_hand_calc(self):
+        """典型值手算对照：ceil(1_000_000*3/4096)=733，落在 [10,5000] 内。"""
+        cfg = self._cfg(fixed=0, reuse=3.0, batch=4096)
+        assert resolve_train_steps(1_000_000, cfg) == 733
+
+    def test_auto_boundary_exact_5000(self):
+        """恰好边界：构造 ceil 结果正好 5000。"""
+        cfg = self._cfg(fixed=0, reuse=1.0, batch=100)
+        # ceil(500_000*1/100)=5000
+        assert resolve_train_steps(500_000, cfg) == 5000
+
+    def test_auto_reuse_scales_steps(self):
+        """sample_reuse 线性缩放步数：reuse 翻倍步数翻倍（未触边界时）。"""
+        cfg1 = self._cfg(fixed=0, reuse=2.0, batch=1000)
+        cfg2 = self._cfg(fixed=0, reuse=4.0, batch=1000)
+        # ceil(100_000*2/1000)=200 ; ceil(100_000*4/1000)=400
+        assert resolve_train_steps(100_000, cfg1) == 200
+        assert resolve_train_steps(100_000, cfg2) == 400

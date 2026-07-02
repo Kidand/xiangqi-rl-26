@@ -36,6 +36,9 @@ class MCTSConfig:
     virtual_loss: float = 1.0
     temp_moves: int = 24             # 前 N ply 温度采样
     temperature: float = 1.0
+    temp_final: float = 0.0          # temp_moves 之后的采样温度；0 = argmax（旧行为）
+    draw_value: float = 0.0          # 树内和棋终局回传值（不翻符号，双方同罚）；
+                                     # selfplay/arena 会注入 selfplay.draw_penalty
     batch_size: int = 64             # 单进程叶子评估凑批上限
 
 
@@ -71,7 +74,8 @@ class TrainConfig:
     device: str = "cuda"             # "cuda" / "cpu"
     num_gpus: int = 8
     batch_size: int = 4096
-    train_steps_per_iteration: int = 1000
+    train_steps_per_iteration: int = 1000  # 0 = 自动：clamp(ceil(新样本×sample_reuse/batch), 10, 5000)
+    sample_reuse: float = 3.0        # 自动步数下每个新样本的期望学习次数
     buffer_window: int = 1_500_000   # 保留最近样本数
     min_buffer_to_train: int = 20_000
     optimizer: str = "adamw"         # "adamw" / "sgd"

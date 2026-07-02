@@ -153,8 +153,12 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
 - Q 存储为**该节点走子方**视角；回传逐层取负。未访问子节点 Q 初始化 = FPU（父 Q - 0.2，配置）。
 - 根节点 Dirichlet 噪声：`α=0.2, ε=0.25`（训练时开，评测/GUI 关）。
 - **批量叶子评估**：单进程内跨多盘对局收集叶子，凑 batch 送 GPU/CPU 前向；用 virtual loss（默认 1.0）允许同一棵树并发选路。
-- 温度：ply < `temp_moves`（默认 24）时按 `N^{1/τ}` 采样（τ=1），之后 argmax。
-- 终局叶子直接用真实结果（±1 / 和棋值），不进网络。
+- 温度：ply < `temp_moves`（默认 24）时按 `N^{1/τ}` 采样（τ=1）；之后若 `temp_final` > 0
+  则按 τ=temp_final 采样（打破确定性循环、抑制重复判和），否则 argmax（默认，兼容旧行为）。
+- 终局叶子直接用真实结果，不进网络。**回传符号规则**：胜负 ±1 沿路径逐层取负（负极大）；
+  和棋回传 `draw_value`（MCTSConfig，默认 0.0；selfplay 与 arena 注入 `selfplay.draw_penalty`
+  以与 z 目标一致），且**不做符号交替**——和棋对双方同罚，负值若翻符号会让父节点误以为和棋有利。
+  终局节点需记录"是否和棋"标志，复访回传同样遵守此规则。
 - 树复用：走子后子树保根。
 - 接口（两阶段 API，支持跨对局合并 batch）：
   ```python
@@ -196,7 +200,9 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
 每次迭代（iteration）：
 1. **Self-play**：上述拓扑产生 `games_per_iteration` 盘（默认 2000）。当前 best 模型执红黑双方。
 2. **写盘**：样本 (state, π, z) 追加进 replay buffer（保留最近 `buffer_window` 个位置，默认 1,500,000）；对局记录写 `records/selfplay/iter_XXXX.jsonl`。
-3. **训练**：GPU 0（或 DDP）在 buffer 上采样 `train_steps_per_iteration`（默认 1000）步，batch 4096。损失 `CE(π) + MSE(z) + L2(1e-4)`，AdamW lr 1e-3 余弦退火（配置可换 SGD+momentum）。
+3. **训练**：GPU 0（或 DDP）在 buffer 上采样 `train_steps_per_iteration` 步（默认 1000；
+   **0 = 自动**：`clamp(ceil(本迭代新样本数 × sample_reuse / batch), 10, 5000)`，防止小 buffer
+   期过拟合——步数固定 1000 时早期每样本会被重复学习数十遍），batch 4096。损失 `CE(π) + MSE(z) + L2(1e-4)`，AdamW lr 1e-3 余弦退火（配置可换 SGD+momentum）。
 4. **Arena 门控**：新模型 vs best，`arena_games`（默认 40，红黑各半）盘，200 sims、无噪声、低温。胜率 ≥ `gate_threshold`（默认 0.55，和棋计 0.5）则晋升 best。
 5. 保存 checkpoint、打日志、进入下一迭代。
 

@@ -307,7 +307,10 @@ train:
 症状：和率 > 50%，红黑胜率都较低。
 
 对策：
-- 降低 `draw_penalty`（默认 -0.1），如改为 -0.2 或 -0.3
+- 降低 `draw_penalty`（默认 -0.1），如改为 -0.2 或 -0.3。该值既作为训练 z 目标的和棋惩罚，
+  也会被注入 MCTS 作为**树内和棋终局回传值**（见下文「树内和棋惩罚」），双管齐下抑制塌缩。
+- 开启 `mcts.temp_final`（默认 0=关），如改为 0.25：温度期后不再纯 argmax，而是按访问计数
+  轻度采样，打破确定性循环、抑制重复判和（见下文「温度期后采样」）。
 - 提早启用认输 `resign_start_iter`（默认 10），改为 5
 - 检查是否进入随机走子的循环（MCTS 搜索不足）
 
@@ -342,6 +345,27 @@ train:
 - 确认无 GPU 显存溢出导致的降速
 
 > **注**：`workers_per_gpu` 已弃用（新架构按 CPU 核数而非 GPU 数扩展 worker），保留该字段仅为兼容旧 YAML，新配置请改用 `num_workers`。
+
+#### 7. **三项训练优化参数**（收敛加速）
+
+以下三个参数用于抑制和棋塌缩、加速小 buffer 期收敛：
+
+- **温度期后采样（`mcts.temp_final`，默认 0.0）**：`ply >= temp_moves`（温度期结束）后的走子选择。
+  为 0 时 argmax（旧行为）；> 0 时按 `N^(1/temp_final)` 归一采样（`temp_final` 越小越接近
+  argmax）。推荐 0.25 左右，用于打破确定性循环、抑制重复判和。开局多样化与温度期逻辑不变；
+  **arena 不受影响**（arena 仍是 `arena_temp_moves` 之后 argmax）。
+
+- **树内和棋惩罚（`draw_value` 注入机制）**：`MCTSConfig.draw_value`（默认 0.0）是 MCTS 树内
+  和棋终局的回传值。selfplay worker 与 arena 在构造搜索树前，用 `dataclasses.replace(cfg.mcts,
+  draw_value=cfg.selfplay.draw_penalty)` 注入——**单一来源为 `selfplay.draw_penalty`**，避免两处
+  配置漂移。和棋回传时**不翻符号**（双方同罚），与逐层取负的胜负回传区分。GUI 不注入（默认 0）。
+  效果：搜索阶段就把和棋当作（轻微）负收益，与训练 z 目标一致，减少 AI 主动求和。
+
+- **自动训练步数（`train.train_steps_per_iteration=0` + `train.sample_reuse`）**：
+  `train_steps_per_iteration > 0` 时为固定步数（默认 1000）；**为 0 时自动**：
+  `clamp(ceil(本迭代新样本数 × sample_reuse / batch_size), 10, 5000)`。`sample_reuse`（默认 3.0）
+  是每个新样本的期望学习次数。自动模式可防止小 buffer 期步数固定导致每样本被重复学习数十遍而
+  过拟合；日志每迭代打印一行「本迭代新样本 X，训练步数 Y（自动/固定）」。
 
 #### 6. **entropy 过低** → 增加温度或噪声
 

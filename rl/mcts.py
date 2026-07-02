@@ -48,6 +48,7 @@ class _Node:
         "pending",
         "terminal",
         "terminal_value",
+        "terminal_draw",  # 该终局是否和棋（决定回传是否翻符号）
         "child_moves",   # list[(from_sq,to_sq)]，棋盘真实坐标，顺序 = legal_moves
         "child_nodes",   # list[_Node | None]，惰性创建
         "child_P",       # np.float32 (n,) 先验
@@ -61,6 +62,7 @@ class _Node:
         self.pending = False
         self.terminal = False
         self.terminal_value = 0.0
+        self.terminal_draw = False
         self.child_moves = None
         self.child_nodes = None
         self.child_P = None
@@ -118,6 +120,8 @@ class SearchTree:
         self._vl = float(cfg.virtual_loss)
         self._alpha = float(cfg.dirichlet_alpha)
         self._eps = float(cfg.dirichlet_eps)
+        # 树内和棋终局回传值（不翻符号，双方同罚）。selfplay/arena 注入 draw_penalty。
+        self._draw_value = float(cfg.draw_value)
 
         self._root = _Node()
 
@@ -131,11 +135,21 @@ class SearchTree:
         return int(root.child_N.sum())
 
     def root_value(self) -> float:
-        """根 Q（当前走子方视角）。"""
+        """根 Q（当前走子方视角）。
+
+        根为终局时返回其终局值：胜负 ±1、和棋返回 ``draw_value``（终局节点已把
+        ``terminal_value`` 存为 draw_value）。根从未搜索但局面本身即终局时，惰性判定
+        并返回对应终局值（同样区分和棋 draw_value）。
+        """
         root = self._root
         if root.terminal:
             return float(root.terminal_value)
         if not root.expanded:
+            res = self._board.result()
+            if res is not None:
+                if res == "1/2-1/2":
+                    return self._draw_value
+                return _terminal_value(res, self._board.side_to_move)
             return 0.0
         n = int(root.child_N.sum())
         if n <= 0:
@@ -195,6 +209,25 @@ class SearchTree:
             node.child_vloss[i] -= 1
             sign = -sign
 
+    def _backup_draw(self, path: list, value: float) -> None:
+        """和棋回传：沿 path 每层 child_W 加 ``value`` **不翻符号**（双方同罚），
+        照常 child_N += 1 与撤销 virtual loss。
+
+        和棋对双方同为一个结果，若像胜负那样逐层取负，父节点会把 -draw_value 误读为
+        "对我有利"（当 draw_value < 0 时尤甚），故此处必须保持符号不变。
+        """
+        for node, i in reversed(path):
+            node.child_N[i] += 1
+            node.child_W[i] += value
+            node.child_vloss[i] -= 1
+
+    def _backup_terminal(self, path: list, node: _Node) -> None:
+        """按终局节点的和棋标志选择回传方式（和棋不翻符号、胜负逐层取负）。"""
+        if node.terminal_draw:
+            self._backup_draw(path, node.terminal_value)
+        else:
+            self._backup(path, node.terminal_value)
+
     def _descend(self):
         """从根下行一次。
 
@@ -209,8 +242,8 @@ class SearchTree:
 
         while True:
             if node.terminal:
-                # 复访已解出的终局节点：再计一次访问，值固定。
-                self._backup(path, node.terminal_value)
+                # 复访已解出的终局节点：再计一次访问，值固定，按和棋标志选回传方式。
+                self._backup_terminal(path, node)
                 self._pop_n(len(path))
                 return ("terminal", None)
 
@@ -227,8 +260,14 @@ class SearchTree:
                 result, _term = board.status(legal)
                 if result is not None:
                     node.terminal = True
-                    node.terminal_value = _terminal_value(result, board.side_to_move)
-                    self._backup(path, node.terminal_value)
+                    if result == "1/2-1/2":
+                        # 和棋：记 draw 标志，回传 draw_value 不翻符号（双方同罚）。
+                        node.terminal_draw = True
+                        node.terminal_value = self._draw_value
+                    else:
+                        node.terminal_draw = False
+                        node.terminal_value = _terminal_value(result, board.side_to_move)
+                    self._backup_terminal(path, node)
                     self._pop_n(len(path))
                     return ("terminal", None)
 
@@ -420,9 +459,9 @@ def search(
     """
     tree = SearchTree(board, cfg, add_noise, history_steps=history_steps)
 
-    # 根即终局：无可搜索内容，直接返回真实结果值。
+    # 根即终局：无可搜索内容，直接返回真实结果值（root_value 惰性判定，和棋返回 draw_value）。
     if board.result() is not None:
-        return tree.visit_counts(), _terminal_value(board.result(), board.side_to_move)
+        return tree.visit_counts(), tree.root_value()
 
     batch_cap = max(1, int(cfg.batch_size))
     while tree.total_visits < num_sims:

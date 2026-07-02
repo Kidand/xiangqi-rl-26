@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import os
 from typing import Callable, List, Optional, Tuple
@@ -252,7 +253,11 @@ class _WorkerEngine:
         self.rng = base_rng
         self.proc_id = int(proc_id)
 
-        self.mcts_cfg = cfg.mcts
+        # 注入树内和棋惩罚（单一来源 selfplay.draw_penalty，避免与 arena 配置漂移）。
+        # 树内终局和棋回传该值，与训练 z 目标（draw_penalty）一致。
+        self.mcts_cfg = dataclasses.replace(
+            cfg.mcts, draw_value=float(cfg.selfplay.draw_penalty)
+        )
         self.history_steps = int(cfg.model.history_steps)
         self.num_sims = int(cfg.mcts.num_sims)
         self.batch_cap = max(1, int(cfg.mcts.batch_size))
@@ -331,13 +336,16 @@ class _WorkerEngine:
         root_value = slot.tree.root_value()
         side = board.side_to_move
 
-        # 温度：开局多样化 > 温度采样步 > argmax。
+        # 温度：开局多样化 > 温度采样步 > 温度期后（temp_final>0 采样，否则 argmax）。
         if slot.ply < int(self.cfg.selfplay.opening_random_plies):
             tau = float(self.cfg.selfplay.opening_temperature)
         elif slot.ply < int(self.mcts_cfg.temp_moves):
             tau = float(self.mcts_cfg.temperature)
         else:
-            tau = 0.0
+            # temp_final > 0：按 N^(1/temp_final) 归一采样（打破确定性循环、抑制重复判和）；
+            # 否则 argmax（旧行为）。复用 sample_action_from_counts 同一温度采样路径。
+            temp_final = float(self.mcts_cfg.temp_final)
+            tau = temp_final if temp_final > 0.0 else 0.0
 
         move = sample_action_from_counts(counts, tau, slot.rng)
         if move is None:

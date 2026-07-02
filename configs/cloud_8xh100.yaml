@@ -8,7 +8,8 @@ mcts:
   num_sims: 600
   c_puct: 1.8
   dirichlet_alpha: 0.2
-  temp_moves: 24
+  temp_moves: 32
+  temp_final: 0.15    # temp_moves 后保留小温度采样，打破确定性循环（抑制 80%+ 重复判和）
   batch_size: 96
 selfplay:
   games_per_iteration: 2000
@@ -22,13 +23,16 @@ selfplay:
   max_game_plies: 400
   value_blend_init: 0.5
   value_blend_iters: 30
-  draw_penalty: -0.1
+  draw_penalty: -0.2  # 同时注入 MCTS 树内和棋值（搜索会主动避免重复循环）
   resign_start_iter: 10
 train:
   device: cuda
   num_gpus: 8
   batch_size: 4096
-  train_steps_per_iteration: 1000
+  # 0 = 按新样本量自动定步数（sample_reuse×新样本/batch，夹在 [10,5000]）：
+  # buffer 小的早期只训一两百步，防止把首批噪声数据背 30 遍（曾实测 410 万采样 vs 13.9 万样本）
+  train_steps_per_iteration: 0
+  sample_reuse: 3.0
   buffer_window: 1500000
   min_buffer_to_train: 100000
   lr: 0.001
