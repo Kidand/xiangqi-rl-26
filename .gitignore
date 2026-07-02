@@ -5,7 +5,8 @@ venv/
 *.egg-info/
 build/
 dist/
-checkpoints/
+ckpts/
+!ckpts/.gitkeep
 logs/
 records/
 !records/.gitkeep

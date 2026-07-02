@@ -3,8 +3,10 @@ model: {blocks: 2, filters: 32, history_steps: 2}
 mcts: {num_sims: 24, batch_size: 8, temp_moves: 8}
 selfplay:
   games_per_iteration: 4
-  workers_per_gpu: 1
+  num_workers: 2
   games_per_worker: 2
+  eval_max_batch: 64
+  eval_wait_ms: 1.0
   max_game_plies: 60
   resign_enabled: false
   value_blend_iters: 2

@@ -3,7 +3,7 @@
 GUI FastAPI 后端（DESIGN.md §13）。
 
 入口:
-    python -m gui.server --port 8000 --model checkpoints/best.pt --sims 400 --device cpu
+    python -m gui.server --port 8000 --model ckpts/best.pt --sims 400 --device cpu
 
 功能:
 - 内存对局 store（dict, uuid game_id）

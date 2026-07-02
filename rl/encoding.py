@@ -53,6 +53,9 @@ def encode_board(board, history_steps: int = 2) -> np.ndarray:
     # 获取历史快照列表（index 0=当前，1=上一步，...，不足补 None）
     snapshots = board.snapshots(history_steps)
 
+    # 棋子平面向量化填充：worker 现在是纯 CPU 进程，encode_board 是热点。
+    # planes 视作 (C, 90) 二维视图（planes 连续，reshape 为 view，写入穿透原数组）。
+    flat = planes.reshape(C, NUM_SQUARES)
     for t, snap in enumerate(snapshots):
         if snap is None:
             # 历史不足，该时间步全零（已默认）
@@ -60,36 +63,22 @@ def encode_board(board, history_steps: int = 2) -> np.ndarray:
 
         base = t * 14
 
-        for raw_sq in range(NUM_SQUARES):
-            raw_val = snap[raw_sq]       # 0..14，7 = 空格
-            piece = raw_val - 7          # -7..7，0 = 空
+        # snap 为 90 字节（0..14，7=空）。frombuffer→int16 再 -7 得 piece（-7..7，0=空）。
+        vals = np.frombuffer(snap, dtype=np.uint8).astype(np.int16) - 7  # (90,)
+        occ = np.nonzero(vals)[0]                # 有子格子（raw 坐标）
+        if occ.size == 0:
+            continue
+        pieces = vals[occ]                       # 各子有符号类型（±1..±7）
 
-            if piece == 0:
-                continue  # 空格不处理
+        # 编码坐标：黑方视角翻转 enc_sq = 89 - raw_sq，红方视角保持不变。
+        enc_sq = (89 - occ) if flip else occ
 
-            # 计算编码坐标（黑方视角下翻转格子）
-            enc_sq = flip_sq(raw_sq) if flip else raw_sq
-            enc_row = enc_sq // COLS
-            enc_col = enc_sq % COLS
+        pt_idx = np.abs(pieces) - 1              # 0..6 棋子类型通道
+        # 判定"自方"：黑方视角自方=黑子(<0)，红方视角自方=红子(>0)。
+        is_self = (pieces < 0) if flip else (pieces > 0)
+        chan = np.where(is_self, pt_idx, 7 + pt_idx)  # 0..13
 
-            if flip:
-                # 黑方视角：黑子（piece<0）变成"自方"，红子（piece>0）变成"对手"
-                if piece < 0:
-                    # 当前走子方（黑）自己的棋子
-                    pt_idx = (-piece) - 1          # 0..6
-                    planes[base + pt_idx, enc_row, enc_col] = 1.0
-                else:
-                    # 对手（红）的棋子
-                    pt_idx = piece - 1             # 0..6
-                    planes[base + 7 + pt_idx, enc_row, enc_col] = 1.0
-            else:
-                # 红方视角：红子（piece>0）为自方，黑子（piece<0）为对手
-                if piece > 0:
-                    pt_idx = piece - 1             # 0..6
-                    planes[base + pt_idx, enc_row, enc_col] = 1.0
-                else:
-                    pt_idx = (-piece) - 1          # 0..6
-                    planes[base + 7 + pt_idx, enc_row, enc_col] = 1.0
+        flat[base + chan, enc_sq] = 1.0
 
     # C-3：走子方颜色（红=全1，黑=全0）
     if side == RED:

@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""自我博弈 worker（多进程，批量叶子评估）——DESIGN.md §9-§11。
+"""自我博弈 worker（纯 CPU 进程，推理服务架构）——DESIGN.md §9-§11。
 
 核心职责
 --------
-- ``selfplay_worker``：顶层函数（Windows/Linux spawn 兼容），加载 best 模型（eval），
-  在单进程内并发 ``games_per_worker`` 盘对局，用 ``SearchTree.select_leaves`` 跨盘收集
-  叶子 → stack 成一个大 batch → 一次网络前向 → 逐盘 ``apply_results``，最大化吞吐。
+- ``selfplay_worker``：顶层函数（Windows/Linux spawn 兼容），**纯 CPU**（不加载模型、
+  不碰 CUDA context，``torch.set_num_threads(1)``），在单进程内并发 ``games_per_worker``
+  盘对局，用 ``SearchTree.select_leaves`` 跨盘收集叶子 → 转 uint8 + 取策略索引 →
+  ``EvalClient.evaluate`` 向所属 EvalServer 请求批量前向 → 逐盘 ``apply_results_sparse``。
 - 走子：温度采样 + 开局多样化（heuristics.opening_temperature）；一步杀捷径
   （mate_shortcut：遍历合法着法找立即将死则直接走，π 记该着 one-hot）；ResignTracker。
 - 对局结束：组装训练样本（state uint8、稀疏 π=visits 归一后经 move_to_policy_index 转
@@ -20,6 +21,7 @@
 from __future__ import annotations
 
 import datetime
+import os
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
@@ -42,13 +44,14 @@ from rl.heuristics import (
     lambda_schedule,
     material_score,
 )
+from rl.inference_server import EvalClient, WorkerStop
 from rl.mcts import SearchTree
-from rl.model import load_checkpoint
 
 __all__ = [
     "selfplay_worker",
     "build_eval_fn",
     "num_selfplay_workers",
+    "num_eval_servers",
     "worker_game_quota",
     "sample_action_from_counts",
 ]
@@ -81,26 +84,36 @@ def build_eval_fn(model, device) -> Callable[[np.ndarray], Tuple[np.ndarray, np.
 
 
 # ---------------------------------------------------------------------------
-# worker 数量与配额（worker 与主进程须用同一公式，保证总局数恰为
-# games_per_iteration，且 worker 签名无需额外参数）。
+# worker / server 数量与配额（推理服务架构，DESIGN §9）。
+# 瓶颈在 CPU 端 Python MCTS，故 worker 数量按 CPU 核数扩展（而非 GPU 数）。
 # ---------------------------------------------------------------------------
-def num_selfplay_workers(cfg: Config) -> int:
-    """本次自博弈的 worker 进程总数。
-
-    - CUDA：``num_gpus * workers_per_gpu``（每 GPU round-robin 绑若干进程）。
-    - CPU ：``max(1, workers_per_gpu)``（无 GPU 降级，本地冒烟）。
-    """
+def num_eval_servers(cfg: Config) -> int:
+    """EvalServer 进程数：cuda 时每 GPU 一个，cpu 时共 1 个。"""
     if str(cfg.train.device).startswith("cuda") and cfg.train.num_gpus > 0:
-        return max(1, cfg.train.num_gpus * cfg.selfplay.workers_per_gpu)
-    return max(1, cfg.selfplay.workers_per_gpu)
+        return max(1, int(cfg.train.num_gpus))
+    return 1
 
 
-def worker_game_quota(cfg: Config, proc_id: int) -> int:
-    """proc_id 号 worker 需产出的对局数（把 games_per_iteration 均摊到各 worker）。"""
-    total = int(cfg.selfplay.games_per_iteration)
-    n = num_selfplay_workers(cfg)
-    base, rem = divmod(total, n)
-    return base + (1 if proc_id < rem else 0)
+def num_selfplay_workers(cfg: Config) -> int:
+    """本次自博弈的纯 CPU worker 进程总数。
+
+    - ``num_workers > 0``：直接使用该值。
+    - ``num_workers == 0``：自动 ``max(8, cpu_count - num_gpus - 4)``；cpu 设备
+      ``num_gpus`` 按 0 算。
+    """
+    n = int(cfg.selfplay.num_workers)
+    if n > 0:
+        return n
+    ngpu = int(cfg.train.num_gpus) if str(cfg.train.device).startswith("cuda") else 0
+    cpu = os.cpu_count() or 1
+    return max(8, cpu - ngpu - 4)
+
+
+def worker_game_quota(total_games: int, worker_id: int, n_workers: int) -> int:
+    """worker_id 号 worker 需产出的对局数（把 total_games 均摊到 n_workers 个 worker）。"""
+    n = max(1, int(n_workers))
+    base, rem = divmod(int(total_games), n)
+    return base + (1 if int(worker_id) < rem else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -232,10 +245,10 @@ def _record_sample(
 class _WorkerEngine:
     """单进程内并发多盘对局的批量自博弈引擎。"""
 
-    def __init__(self, cfg: Config, iteration: int, net_eval, base_rng: np.random.Generator, proc_id: int) -> None:
+    def __init__(self, cfg: Config, iteration: int, client, base_rng: np.random.Generator, proc_id: int) -> None:
         self.cfg = cfg
         self.iteration = int(iteration)
-        self.net_eval = net_eval
+        self.client = client          # EvalClient：向所属 EvalServer 请求批量前向
         self.rng = base_rng
         self.proc_id = int(proc_id)
 
@@ -378,8 +391,14 @@ class _WorkerEngine:
 
     # -------------------------------------------------- 批量搜索一轮
     def search_round(self, searching: List[_GameSlot]) -> None:
-        """对所有 searching slot 各选一批叶子 → 合并前向 → 逐盘回填。"""
+        """对所有 searching slot 各选一批叶子 → 合并成一个评估请求 → 逐盘回填。
+
+        叶子 states（encode 输出 0/1 float32）直接 astype uint8；tokens 经
+        tree.policy_indices 取当前方视角策略索引 → EvalClient.evaluate（稀疏返回）→
+        逐 slot apply_results_sparse（与稠密 apply_results 数值等价）。
+        """
         batch_states: List[np.ndarray] = []
+        batch_idx: List[np.ndarray] = []      # 扁平：跨 slot 所有叶子的策略索引
         layout: List[Tuple[_GameSlot, list, int]] = []
 
         for slot in searching:
@@ -390,7 +409,9 @@ class _WorkerEngine:
             v0 = slot.tree.total_visits
             states, tokens = slot.tree.select_leaves(min(self.batch_cap, remaining))
             if tokens:
-                batch_states.append(states)
+                # encode_board 输出 0/1 float32，直接 astype uint8（数值无损）。
+                batch_states.append(states.astype(np.uint8, copy=False))
+                batch_idx.extend(slot.tree.policy_indices(tokens))
                 layout.append((slot, tokens, states.shape[0]))
             else:
                 # 无待评估叶子（全终局/撞车）且无进展 → 结束本步搜索。
@@ -401,10 +422,12 @@ class _WorkerEngine:
             return
 
         big = np.concatenate(batch_states, axis=0)
-        probs, values = self.net_eval(big)
+        probs_list, values = self.client.evaluate(big, batch_idx)
         off = 0
         for slot, tokens, n in layout:
-            slot.tree.apply_results(tokens, probs[off:off + n], values[off:off + n])
+            slot.tree.apply_results_sparse(
+                tokens, probs_list[off:off + n], values[off:off + n]
+            )
             slot.nn_evals += n
             off += n
             if slot.tree.total_visits >= self.target:
@@ -491,53 +514,51 @@ class _WorkerEngine:
 # 顶层 worker（spawn 目标函数）。
 # ---------------------------------------------------------------------------
 def selfplay_worker(
-    proc_id: int,
-    device: str,
-    ckpt_path: str,
+    worker_id: int,
     cfg: Config,
     iteration: int,
+    shm: dict,
+    req_queue,
+    resp_queue,
     game_queue,
     stop_event,
     seed: int,
+    n_workers: int,
 ) -> None:
-    """自我博弈 worker 进程入口（Windows/Linux spawn 兼容，顶层函数）。
+    """自我博弈 worker 进程入口（纯 CPU，Windows/Linux spawn 兼容，顶层函数）。
+
+    不加载模型、不碰 CUDA context；评估请求经 ``EvalClient``（共享内存 + 队列）转发给
+    所属 EvalServer。
 
     Parameters
     ----------
-    proc_id     : worker 序号（用于 GPU round-robin 与配额计算）
-    device      : "cuda" / "cpu"（cuda 时按 proc_id % num_gpus 绑卡）
-    ckpt_path   : best 模型 checkpoint 路径（本 worker 加载并 eval）
+    worker_id   : worker 序号（用于配额计算与共享内存/队列定位）
     cfg         : 全局 Config
     iteration   : 当前迭代编号
+    shm         : 本 worker 的共享张量字典（主进程创建并 share_memory_ 后传入）
+    req_queue   : 所属 EvalServer 的请求队列
+    resp_queue  : 本 worker 的响应队列
     game_queue  : 多进程队列，逐盘上报 {"type":"game",...}，收尾上报 {"type":"done"}
     stop_event  : 多进程 Event，置位后尽快收尾
     seed        : 本 worker 随机种子
+    n_workers   : worker 总数（用于配额均摊）
     """
     import torch
 
-    torch.set_num_threads(1)  # 多进程避免线程超订
+    torch.set_num_threads(1)  # 纯 CPU，多进程避免线程超订
     try:
-        # 设备解析：GPU round-robin cuda:{proc_id % num_gpus}，无 GPU 降级 cpu。
-        if str(device).startswith("cuda") and torch.cuda.is_available() and cfg.train.num_gpus > 0:
-            dev = f"cuda:{proc_id % max(1, cfg.train.num_gpus)}"
-        else:
-            dev = "cpu"
-
-        torch.manual_seed(int(seed) & 0x7FFFFFFF)
-        model, _ = load_checkpoint(ckpt_path, device=dev)
-        model.eval()
-        net_eval = build_eval_fn(model, dev)
+        client = EvalClient(worker_id, shm, req_queue, resp_queue, stop_event)
 
         base_rng = np.random.default_rng(int(seed) & (2**63 - 1))
-        engine = _WorkerEngine(cfg, iteration, net_eval, base_rng, proc_id)
+        engine = _WorkerEngine(cfg, iteration, client, base_rng, worker_id)
 
-        quota = worker_game_quota(cfg, proc_id)
+        quota = worker_game_quota(int(cfg.selfplay.games_per_iteration), worker_id, n_workers)
         concurrency = min(int(cfg.selfplay.games_per_worker), quota) if quota > 0 else 0
 
         started = 0
         live: List[_GameSlot] = []
         for _ in range(concurrency):
-            gid = proc_id * 1_000_000 + started
+            gid = worker_id * 1_000_000 + started
             live.append(engine.new_slot(gid))
             started += 1
 
@@ -562,15 +583,18 @@ def selfplay_worker(
                         game_queue.put(engine.build_payload(slot))
                         slot.emitted = True
                     if started < quota and not (stop_event is not None and stop_event.is_set()):
-                        gid = proc_id * 1_000_000 + started
+                        gid = worker_id * 1_000_000 + started
                         next_live.append(engine.new_slot(gid))
                         started += 1
                     # 否则丢弃（该 slot 结束）
                 else:
                     next_live.append(slot)
             live = next_live
+    except WorkerStop:
+        # stop_event 置位或评估超时（server 疑似死亡）：尽快收尾。
+        pass
     finally:
         try:
-            game_queue.put({"type": "done", "proc_id": proc_id})
+            game_queue.put({"type": "done", "proc_id": worker_id})
         except Exception:
             pass

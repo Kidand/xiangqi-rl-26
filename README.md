@@ -48,7 +48,7 @@ xiangqi-rl-26/
 │   ├── bench_engine.py       # 引擎性能基准
 │   └── export_model.py       # 导出 TorchScript/ONNX
 ├── records/                   # 对局记录（selfplay/ 与 gui/ 子目录）
-├── checkpoints/              # 模型检查点（best.pt, iter_XXXX.pt）
+├── ckpts/                    # 模型检查点（best.pt, iter_XXXX.pt）
 ├── logs/                     # 训练日志（train.log, metrics.csv, tb/）
 └── tests/                    # pytest
 ```
@@ -79,7 +79,7 @@ python -m gui.server --port 8000
 
 ### 3. 加载预训练模型（可选）
 
-GUI 中点击「模型」→「加载」，选择 `checkpoints/best.pt`（若存在）。若无模型，仍可进行人机互动（hvh=人vs人，hvh 无需 AI）。
+GUI 中点击「模型」→「加载」，选择 `ckpts/best.pt`（若存在）。若无模型，仍可进行人机互动（hvh=人vs人，hvh 无需 AI）。
 
 ### 4. 对战操作
 
@@ -220,19 +220,21 @@ bash scripts/train_cloud.sh --resume
 
 ```bash
 # 训练完成后
-python scripts/export_model.py checkpoints/best.pt --torchscript --onnx
-# 生成 best.pt.pt（TorchScript）和 best.onnx（ONNX）
+python scripts/export_model.py ckpts/best.pt --torchscript --onnx
+# 生成 best.ts（TorchScript）和 best.onnx（ONNX）
 ```
 
 #### 拷回笔记本
 
 ```bash
 # 笔记本上（sftp/scp 或云存储）
-scp -r /path/to/remote/checkpoints/best.pt ~/xiangqi-rl-26/checkpoints/
-scp -r /path/to/remote/checkpoints/best.onnx ~/xiangqi-rl-26/checkpoints/
+scp -r /path/to/remote/ckpts/best.pt ~/xiangqi-rl-26/ckpts/
+scp -r /path/to/remote/ckpts/best.onnx ~/xiangqi-rl-26/ckpts/
 ```
 
-然后笔记本 GUI 加载 `checkpoints/best.pt` 即可推理。
+然后笔记本 GUI 加载 `ckpts/best.pt` 即可推理。
+
+> **迁移提示**：检查点统一存放于 `ckpts/`；如需从旧训练目录续训，把历史检查点整理进 `ckpts/` 后 `--resume` 可无缝续训。
 
 ## 配置说明
 
@@ -273,7 +275,10 @@ model: {blocks: 10, filters: 128}        # 10 个残差块，128 通道，~7M �
 mcts: {num_sims: 600}                    # 大量模拟（覆盖更多变化）
 selfplay:
   games_per_iteration: 2000              # 2000 盘对局
-  workers_per_gpu: 4                     # 每 GPU 4 个 worker（8 GPU × 4 = 32 进程）
+  num_workers: 0                         # 0 = 自动 max(8, cpu_count - num_gpus - 4)
+  eval_max_batch: 2048                   # EvalServer 单次前向 batch 上限
+  eval_wait_ms: 2.0                      # 聚合请求的等待窗口（毫秒）
+  eval_fp16: true                        # cuda 上 bf16 autocast 推理
 train:
   device: cuda
   num_gpus: 8                            # 分布式（DDP 或 DataParallel）
@@ -321,7 +326,7 @@ train:
 
 对策：
 - 减少 `batch_size`（默认 4096），如改为 2048
-- 减少 `workers_per_gpu`（默认 4），如改为 2
+- 减少 `eval_max_batch`（默认 2048），如改为 1024（减少 EvalServer 单次前向显存占用）
 - 减少 `games_per_worker`（默认 16），如改为 8
 
 #### 5. **吞吐过低** → 增加并发
@@ -329,9 +334,14 @@ train:
 症状：`games/hour` < 1000（预期 2000-5000）。
 
 对策：
-- 增加 `workers_per_gpu`（若 CPU 核心足够，预期 64+）
+- 增加 `num_workers`（默认 0=自动，手动指定如 64+，按 CPU 核数扩展）
+- 日志中观察 `evals/s`（EvalServer 每秒评估数）和 `avg_batch`（平均 batch 大小）：
+  - `avg_batch` 过低（< 64）→ 增加 `num_workers` 或调大 `eval_wait_ms`（延长聚合窗口）
+  - `evals/s` 瓶颈 → 检查 GPU 利用率，适当增大 `eval_max_batch`
 - 检查 I/O 瓶颈：buffer 写盘是否阻塞（看 `moves/s`）
 - 确认无 GPU 显存溢出导致的降速
+
+> **注**：`workers_per_gpu` 已弃用（新架构按 CPU 核数而非 GPU 数扩展 worker），保留该字段仅为兼容旧 YAML，新配置请改用 `num_workers`。
 
 #### 6. **entropy 过低** → 增加温度或噪声
 
@@ -515,7 +525,7 @@ JSON 格式，一局一条（`.json` 单局或 `.jsonl` 多局）。
 **A:** 可以。GUI 支持三种模式：
 
 1. **hvh**（人 vs 人）：无需 AI/模型，纯本地对战
-2. **hva/ava**（需模型）：加载 `checkpoints/best.pt`（从云端拷回）后可用
+2. **hva/ava**（需模型）：加载 `ckpts/best.pt`（从云端拷回）后可用
 
 若无模型，hvh 仍完全可用。
 
@@ -541,14 +551,14 @@ python scripts/smoke_test.py
 **A:**
 ```bash
 # 云端
-python scripts/export_model.py checkpoints/best.pt --torchscript --onnx
+python scripts/export_model.py ckpts/best.pt --torchscript --onnx
 
 # 拷回笔记本
-scp best.pt your-laptop:~/xiangqi-rl-26/checkpoints/
-scp best.onnx your-laptop:~/xiangqi-rl-26/checkpoints/
+scp best.pt your-laptop:~/xiangqi-rl-26/ckpts/
+scp best.onnx your-laptop:~/xiangqi-rl-26/ckpts/
 
 # 笔记本 GUI 加载
-# POST /api/model/load {"path": "checkpoints/best.pt"}
+# POST /api/model/load {"path": "ckpts/best.pt"}
 ```
 
 支持 TorchScript（`.pt`）和 ONNX（`.onnx`，推理加速，需装 onnxruntime）。
@@ -592,8 +602,8 @@ tensorboard --logdir logs/tb --port 6006
 
 **A:** 不会。训练脚本每迭代末自动保存：
 
-- `checkpoints/best.pt`：历史最佳（Arena 晋升）
-- `checkpoints/iter_XXXX.pt`：最新迭代（中间存档）
+- `ckpts/best.pt`：历史最佳（Arena 晋升）
+- `ckpts/iter_XXXX.pt`：最新迭代（中间存档）
 - `rl/replay_buffer/` 下 `.npz` 文件：经验缓冲
 
 重新连接后 `bash scripts/train_cloud.sh --resume` 从最新 checkpoint 续训，buffer 自动加载。

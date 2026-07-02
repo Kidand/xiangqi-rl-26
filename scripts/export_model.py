@@ -1,8 +1,8 @@
 """checkpoint 导出工具：TorchScript / ONNX（DESIGN.md §7 末段）。
 
 用法示例：
-    python scripts/export_model.py checkpoints/best.pt --torchscript --onnx
-    python scripts/export_model.py checkpoints/best.pt --onnx --out-dir exports/
+    python scripts/export_model.py ckpts/best.pt --torchscript --onnx
+    python scripts/export_model.py ckpts/best.pt --onnx --out-dir exports/
 
 导出后自动用随机输入对比原模型与导出模型的输出，atol=1e-4 验证一致性。
 """

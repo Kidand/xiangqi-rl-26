@@ -1,5 +1,6 @@
-# 云端 8×H100 正式训练预设（CUDA 12.8）
-# 预计吞吐：~2000-5000 局/小时（视 CPU 核数），建议先跑 3-5 个迭代观察日志再调参
+# 云端 8×H100 正式训练预设（CUDA 12.8）——推理服务架构
+# 拓扑：8 个 EvalServer（每 GPU 一个）+ num_workers 个纯 CPU 自博弈进程（0=自动按核数）
+# 建议先跑 1-2 个迭代，观察日志中的 moves/s、evals/s、avg_batch 与 htop CPU 占用再调参
 model: {blocks: 10, filters: 128, history_steps: 2}
 mcts:
   # 前 30~50 迭代可先用 num_sims=400 加快出数据（早期网络弱、更多模拟收益低），
@@ -11,10 +12,13 @@ mcts:
   batch_size: 96
 selfplay:
   games_per_iteration: 2000
-  # 瓶颈在 CPU 端 Python MCTS 而非 GPU，故该值应随 vCPU 数（而非 GPU 数）调整：
-  # 32 vCPU→4，96+ vCPU→8~12。8 GPU × 4 = 32 个 selfplay 进程；CPU 核少于 64 时调低。
-  workers_per_gpu: 4
+  # 瓶颈在 CPU 端 Python MCTS：worker 是纯 CPU 进程，数量按 vCPU 数自动扩展
+  # （max(8, cpu_count - num_gpus - 4)）；如需手动指定填正整数。
+  num_workers: 0
   games_per_worker: 16
+  eval_max_batch: 4096      # H100 单次前向上限（3.2M 模型毫无压力）
+  eval_wait_ms: 2.0         # 请求聚合窗口：调大→batch 更大但叶子延迟更高
+  eval_fp16: true           # bf16 推理
   max_game_plies: 400
   value_blend_init: 0.5
   value_blend_iters: 30

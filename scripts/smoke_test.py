@@ -49,7 +49,7 @@ def main() -> int:
     out_dir = Path(tempfile.mkdtemp(prefix="xiangqi_smoke_"))
     cfg.log.log_dir = str(out_dir / "logs")
     cfg.log.records_dir = str(out_dir / "records")
-    cfg.train.checkpoint_dir = str(out_dir / "checkpoints")
+    cfg.train.checkpoint_dir = str(out_dir / "ckpts")
     cfg.log.tensorboard = False  # 冒烟无需 TB
 
     total_iters = int(cfg.train.total_iterations)

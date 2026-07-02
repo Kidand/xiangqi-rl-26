@@ -170,7 +170,9 @@ class TrainLogger:
           draw            和局数
           avg_plies       平均步数
           moves_per_sec   走子速度（moves/s）
-          nn_evals_per_sec 网络评估速度（evals/s）
+          nn_evals_per_sec 网络评估速度（evals/s，worker 侧累计）
+          evals_per_sec   EvalServer 侧网络评估速度（evals/s，推理服务架构，缺省容错）
+          avg_batch       EvalServer 平均前向 batch 大小（缺省容错）
           resign_rate     认输率（0.0~1.0）
           buffer_size     buffer 中样本总数
           elapsed_sec     已用秒数
@@ -184,6 +186,8 @@ class TrainLogger:
         avg_plies = stats.get("avg_plies", 0.0)
         moves_s = stats.get("moves_per_sec", 0.0)
         nn_s = stats.get("nn_evals_per_sec", 0.0)
+        evals_s = stats.get("evals_per_sec", 0.0)
+        avg_batch = stats.get("avg_batch", 0.0)
         resign_rate = stats.get("resign_rate", 0.0)
         buf = stats.get("buffer_size", 0)
         elapsed = stats.get("elapsed_sec", 0.0)
@@ -203,7 +207,8 @@ class TrainLogger:
             f"R/B/D {red_win}/{black_win}/{draw} | "
             f"红胜率 {red_wr:.1f}% 黑胜率 {black_wr:.1f}% 和率 {draw_r:.1f}%\n"
             f"  | avg_plies {avg_plies:.1f} | moves/s {moves_s:.1f} | "
-            f"nn_evals/s {nn_s:.0f} | resign {resign_rate * 100:.1f}% | "
+            f"nn_evals/s {nn_s:.0f} | evals/s {evals_s:.0f} | avg_batch {avg_batch:.1f} | "
+            f"resign {resign_rate * 100:.1f}% | "
             f"buffer {buf_k:.0f}k | elapsed {elapsed_str}"
         )
         self._emit(line)

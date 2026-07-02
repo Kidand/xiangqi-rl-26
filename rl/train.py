@@ -6,12 +6,15 @@
     python -m rl.train --config configs/cloud_8xh100.yaml [--resume]
 
 每迭代：
-  1. Self-play：spawn workers（best 模型执双方），主进程边收 queue 边按 log_interval_sec
-     实时打印红黑胜率进度；收完 join，样本入 buffer，逐局 record append 到
+  1. Self-play（推理服务架构，DESIGN §9）：主进程创建共享内存与队列 → spawn
+     ``num_servers`` 个 EvalServer（cuda 每 GPU 一个 / cpu 一个，持有 best 模型）
+     + ``num_workers`` 个纯 CPU selfplay worker，主进程边收 game_queue 边按
+     log_interval_sec 实时打印红黑胜率进度（含 evals/s 与 avg_batch）；全部 done 后
+     置 stop_event、join 全部进程，样本入 buffer，逐局 record append 到
      ``records/selfplay/iter_XXXX.jsonl``。
   2. Train：buffer ≥ min_buffer_to_train 后训练 train_steps（AdamW/SGD、余弦 lr、
      bf16 amp（cpu 自动关）、grad_clip），每 train_log_interval 步打印。
-  3. Arena：新模型 vs best 门控，晋升则更新 ``checkpoints/best.pt``。
+  3. Arena：新模型 vs best 门控，晋升则更新 best.pt（``cfg.train.checkpoint_dir``）。
   4. 始终存 ``iter_XXXX.pt``、buffer、metrics.csv 汇总行。
 
 --resume：找最新 iter_XXXX.pt，载模型/optimizer/buffer 续训。
@@ -36,7 +39,8 @@ from rl.evaluate import arena
 from rl.logger import TrainLogger
 from rl.model import create_model, save_checkpoint
 from rl.replay_buffer import ReplayBuffer
-from rl.selfplay import num_selfplay_workers, selfplay_worker
+from rl.inference_server import create_shared_buffers, eval_server_proc
+from rl.selfplay import num_eval_servers, num_selfplay_workers, selfplay_worker
 
 __all__ = ["run_training", "main"]
 
@@ -150,25 +154,66 @@ def _selfplay_phase(
     buffer: ReplayBuffer,
     records_path: Path,
 ) -> Dict[str, float]:
-    """并行自博弈，收集样本入 buffer、record 写盘，返回本迭代统计。"""
+    """并行自博弈（推理服务架构），收集样本入 buffer、record 写盘，返回本迭代统计。
+
+    拓扑：num_servers 个 EvalServer（持有 best 模型）+ num_workers 个纯 CPU worker，
+    共享内存传叶子/结果，队列传元数据。任一 server 死亡 → 置 stop_event、报错退出迭代。
+    """
+    import torch
     import torch.multiprocessing as mp
 
     ctx = mp.get_context("spawn")
-    queue = ctx.Queue()
-    stop_event = ctx.Event()
-    n_workers = num_selfplay_workers(cfg)
-    total_games = int(cfg.selfplay.games_per_iteration)
 
-    procs = []
-    for pid in range(n_workers):
-        wseed = (int(cfg.seed) * 1_000_003 + iteration * 7_919 + pid) & (2**63 - 1)
+    n_workers = num_selfplay_workers(cfg)
+    n_servers = num_eval_servers(cfg)
+    total_games = int(cfg.selfplay.games_per_iteration)
+    use_cuda = str(cfg.train.device).startswith("cuda") and torch.cuda.is_available()
+
+    # 共享内存：每 worker 一套（MAX_LEAVES = games_per_worker × mcts.batch_size）。
+    max_leaves = int(cfg.selfplay.games_per_worker) * max(1, int(cfg.mcts.batch_size))
+    shm = create_shared_buffers(n_workers, max_leaves, int(cfg.model.in_channels))
+
+    # 统计共享张量（每 server 一行）：[n_evals, n_batches, sum_batch_leaves]。
+    stats_shm = torch.zeros((n_servers, 3), dtype=torch.float64)
+    stats_shm.share_memory_()
+
+    # 队列：每 server 一个请求队列；每 worker 一个响应队列；一个全局 game_queue。
+    req_queues = [ctx.Queue() for _ in range(n_servers)]
+    resp_queues = [ctx.Queue() for _ in range(n_workers)]
+    game_queue = ctx.Queue()
+    stop_event = ctx.Event()
+
+    # worker → server round-robin 绑定。
+    worker_server = [w % n_servers for w in range(n_workers)]
+
+    # spawn EvalServer 进程。
+    servers = []
+    for sid in range(n_servers):
+        my_workers = [w for w in range(n_workers) if worker_server[w] == sid]
+        shm_dict = {w: shm[w] for w in my_workers}
+        dev = f"cuda:{sid}" if use_cuda else "cpu"
         p = ctx.Process(
-            target=selfplay_worker,
-            args=(pid, cfg.train.device, str(best_path), cfg, iteration, queue, stop_event, wseed),
+            target=eval_server_proc,
+            args=(sid, dev, str(best_path), cfg, shm_dict, req_queues[sid],
+                  resp_queues, stop_event, stats_shm),
             daemon=False,
         )
         p.start()
-        procs.append(p)
+        servers.append(p)
+
+    # spawn 纯 CPU selfplay worker 进程。
+    workers = []
+    for w in range(n_workers):
+        sid = worker_server[w]
+        wseed = (int(cfg.seed) * 1_000_003 + iteration * 7_919 + w) & (2**63 - 1)
+        p = ctx.Process(
+            target=selfplay_worker,
+            args=(w, cfg, iteration, shm[w], req_queues[sid], resp_queues[w],
+                  game_queue, stop_event, wseed, n_workers),
+            daemon=False,
+        )
+        p.start()
+        workers.append(p)
 
     # 聚合统计。
     agg = {
@@ -188,10 +233,23 @@ def _selfplay_phase(
     t0 = time.monotonic()
     last_log = t0
     done_workers = 0
+    server_died = False
+
+    def _server_stats() -> Tuple[float, float]:
+        """从 stats_shm 汇总 evals/s 与 avg_batch。"""
+        s = stats_shm.sum(dim=0)
+        n_evals = float(s[0].item())
+        n_batches = float(s[1].item())
+        sum_leaves = float(s[2].item())
+        elapsed = max(1e-6, time.monotonic() - t0)
+        evals_ps = n_evals / elapsed
+        avg_batch = (sum_leaves / n_batches) if n_batches > 0 else 0.0
+        return evals_ps, avg_batch
 
     def _emit_progress() -> None:
         elapsed = max(1e-6, time.monotonic() - t0)
         g = agg["games"]
+        evals_ps, avg_batch = _server_stats()
         logger.selfplay_progress(
             {
                 "iter": iteration,
@@ -203,6 +261,8 @@ def _selfplay_phase(
                 "avg_plies": (agg["plies_sum"] / g) if g > 0 else 0.0,
                 "moves_per_sec": agg["moves"] / elapsed,
                 "nn_evals_per_sec": agg["nn_evals"] / elapsed,
+                "evals_per_sec": evals_ps,
+                "avg_batch": avg_batch,
                 "resign_rate": (agg["resigned"] / g) if g > 0 else 0.0,
                 "buffer_size": len(buffer),
                 "elapsed_sec": elapsed,
@@ -210,11 +270,19 @@ def _selfplay_phase(
         )
 
     while done_workers < n_workers:
+        # server 存活监控：任一 server 死亡 → 置 stop_event、报错退出迭代。
+        dead = [i for i, p in enumerate(servers) if not p.is_alive()]
+        if dead and not server_died:
+            server_died = True
+            stop_event.set()
+            logger.warn(f"[iter {iteration}] EvalServer {dead} 进程异常退出，终止本迭代自博弈")
+            break
+
         try:
-            msg = queue.get(timeout=1.0)
+            msg = game_queue.get(timeout=1.0)
         except Empty:
-            # 所有进程已退出且队列空 → 收尾（防御死锁）。
-            if all(not p.is_alive() for p in procs) and queue.empty():
+            # 所有 worker 已退出且队列空 → 收尾（防御死锁）。
+            if all(not p.is_alive() for p in workers) and game_queue.empty():
                 break
             continue
 
@@ -257,10 +325,20 @@ def _selfplay_phase(
             last_log = now
 
     _emit_progress()  # 收尾行
-    for p in procs:
+
+    # 全部 done（或 server 死亡）后置 stop_event、join 全部进程。
+    stop_event.set()
+    for p in workers:
         p.join(timeout=30.0)
         if p.is_alive():
             p.terminate()
+    for p in servers:
+        p.join(timeout=30.0)
+        if p.is_alive():
+            p.terminate()
+
+    if server_died:
+        raise RuntimeError(f"iter {iteration}: EvalServer 进程死亡，自博弈中断")
 
     g = max(1, agg["games"])
     fp_rate = (agg["fp"] / agg["calib_would"]) if agg["calib_would"] > 0 else 0.0

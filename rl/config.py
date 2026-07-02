@@ -42,8 +42,14 @@ class MCTSConfig:
 @dataclass
 class SelfPlayConfig:
     games_per_iteration: int = 2000
-    workers_per_gpu: int = 4
+    # 推理服务架构（DESIGN §9）：worker 为纯 CPU 进程，数量按 CPU 核数扩展
+    num_workers: int = 0             # 0 = 自动 max(8, cpu_count - num_gpus - 4)
+    workers_per_gpu: int = 4         # [已弃用] 仅为兼容旧 YAML 保留，新架构不使用
     games_per_worker: int = 16       # 每 worker 并发对局数
+    # EvalServer（每 GPU 一个批量推理服务进程）
+    eval_max_batch: int = 2048       # 单次前向 batch 上限
+    eval_wait_ms: float = 2.0        # 聚合请求的等待窗口（毫秒）
+    eval_fp16: bool = True           # cuda 上用 bf16 autocast 推理
     max_game_plies: int = 400
     no_capture_draw_plies: int = 120
     # 启发式（DESIGN §10）
@@ -76,7 +82,7 @@ class TrainConfig:
     value_loss_weight: float = 1.0
     grad_clip: float = 5.0
     total_iterations: int = 200
-    checkpoint_dir: str = "checkpoints"
+    checkpoint_dir: str = "ckpts"
     amp: bool = True                 # 混合精度（bf16）
 
 

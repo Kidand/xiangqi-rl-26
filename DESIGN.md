@@ -46,7 +46,7 @@ xiangqi-rl-26/
 │   ├── bench_engine.py        # 引擎性能基准（movegen/s, perft）
 │   └── export_model.py        # checkpoint → TorchScript / ONNX
 ├── records/                   # 对局记录（selfplay/ 与 gui/ 子目录）
-├── checkpoints/               # 模型检查点（best.pt, iter_XXXX.pt）
+├── ckpts/               # 模型检查点（best.pt, iter_XXXX.pt）
 ├── logs/                      # train.log / metrics.csv / tb/
 └── tests/                     # pytest
 ```
@@ -165,6 +165,11 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
           # 终局叶子内部直接回传真实值、计入 visits，不出现在返回值里（K 可为 0）。
       def apply_results(self, tokens, policy_probs, values) -> None
           # policy_probs[K,8100] 为 softmax 后概率（未 mask），内部按合法着法 mask 归一再展开
+      def policy_indices(self, tokens) -> list["np.ndarray"]
+          # 每叶子的合法着法策略索引（当前走子方视角，int64），供稀疏评估协议使用
+      def apply_results_sparse(self, tokens, sparse_probs, values) -> None
+          # sparse_probs[i] 与 policy_indices(tokens)[i] 对齐（softmax 后 gather 所得，未归一化），
+          # 内部归一后展开；与 apply_results 数值等价
       @property
       def total_visits(self) -> int       # 根已完成模拟数
       def visit_counts(self) -> "np.ndarray"  # (8100,) 根访问计数，**棋盘真实坐标**（非翻转视角）
@@ -178,14 +183,24 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
 
 ## 9. 自我博弈与训练流水线（同步迭代制，便于看日志调参）
 
+**进程拓扑（推理服务架构）**：瓶颈在 CPU 端 Python MCTS，故 worker 数量按 CPU 核数（而非 GPU 数）扩展：
+- **推理服务**：每 GPU 一个 EvalServer 进程（`device=cpu` 时共 1 个），持有模型，循环：在 `eval_wait_ms` 窗口内聚合多个 worker 的评估请求 → 合并成大 batch（上限 `eval_max_batch`）一次前向（cuda 上 bf16 autocast，`eval_fp16` 可关）→ 结果写回各 worker 的共享内存。周期性上报 evals/s 与平均 batch 大小。
+- **Selfplay worker**：`num_workers` 个纯 CPU 进程（**0 = 自动 `max(8, cpu_count - num_gpus - 4)`**），不持有模型与 CUDA context，每进程并发 `games_per_worker` 盘；worker 按 round-robin 绑定一个 EvalServer。
+- **共享内存协议**（torch.multiprocessing 共享张量，请求/响应队列只传元数据）：每 worker 预分配
+  `states uint8 (MAX_LEAVES,C,10,9)`、`idx int16 (MAX_LEAVES,MAX_MOVES)`、`idx_len int16`、
+  响应 `probs float32 (MAX_LEAVES,MAX_MOVES)`、`values float32`。worker 填充后向所属 server 的请求队列发
+  `(worker_id, n)`，阻塞等待自己的响应队列（带 timeout + stop_event 检查防死锁）；server 只返回每叶子
+  合法着法索引处的 softmax 概率（稀疏返回，避免 8100 维全量拷贝），worker 侧归一化。
+  MAX_LEAVES = games_per_worker × mcts.batch_size；MAX_MOVES = 120（象棋合法着法上限富余值）。
+
 每次迭代（iteration）：
-1. **Self-play**：8 个 GPU × `workers_per_gpu`（默认 4）个进程，每进程并发 `games_per_worker`（默认 16）盘，共产生 `games_per_iteration` 盘（默认 2000）。当前 best 模型执红黑双方。
+1. **Self-play**：上述拓扑产生 `games_per_iteration` 盘（默认 2000）。当前 best 模型执红黑双方。
 2. **写盘**：样本 (state, π, z) 追加进 replay buffer（保留最近 `buffer_window` 个位置，默认 1,500,000）；对局记录写 `records/selfplay/iter_XXXX.jsonl`。
 3. **训练**：GPU 0（或 DDP）在 buffer 上采样 `train_steps_per_iteration`（默认 1000）步，batch 4096。损失 `CE(π) + MSE(z) + L2(1e-4)`，AdamW lr 1e-3 余弦退火（配置可换 SGD+momentum）。
 4. **Arena 门控**：新模型 vs best，`arena_games`（默认 40，红黑各半）盘，200 sims、无噪声、低温。胜率 ≥ `gate_threshold`（默认 0.55，和棋计 0.5）则晋升 best。
 5. 保存 checkpoint、打日志、进入下一迭代。
 
-多进程结构：`train.py` 主进程 spawn selfplay workers（`torch.multiprocessing`，每 worker `CUDA_VISIBLE_DEVICES` 绑卡），worker 通过 `Queue` 上报完成的对局（样本+统计），主进程聚合。**必须支持 `device=cpu` 无 GPU 降级**（本地冒烟）。中断恢复：`--resume` 从最新 checkpoint + buffer 续训。
+多进程结构：`train.py` 主进程 spawn EvalServer（每 GPU 一个）与 CPU selfplay workers（`torch.multiprocessing` spawn），worker 通过共享内存+队列向 server 请求评估、通过 `Queue` 上报完成的对局（样本+统计），主进程聚合并监控 server 存活（server 死亡→置 stop_event 终止迭代）。**必须支持 `device=cpu` 无 GPU 降级**（本地冒烟）。中断恢复：`--resume` 从最新 checkpoint + buffer 续训。
 
 ## 10. 启发式收敛加速（rl/heuristics.py，全部可配置开关）
 
@@ -251,11 +266,11 @@ Base: `http://127.0.0.1:8000`。静态页面挂 `/`。所有响应 JSON；错误
 | `POST /api/replay/load` | `{"record": <v1 JSON>}` 或 `{"text": "FEN\n着法..."}` | `{"fens":[逐步FEN], "moves":[...], "chinese":[...], "result", "start_fen"}` |
 | `GET /api/records/list` | – | `{"files":[{"path","games","mtime"}]}`（扫描 records/ 递归） |
 | `GET /api/records/get?path=...&index=0` | – | 该文件第 index 局的 v1 JSON（路径必须限制在 records/ 内） |
-| `POST /api/model/load` | `{"path":"checkpoints/best.pt"}` | `{"ok":true,"info":{...}}` |
+| `POST /api/model/load` | `{"path":"ckpts/best.pt"}` | `{"ok":true,"info":{...}}` |
 | `GET /api/model/info` | – | `{"loaded":bool,"path","params","blocks","filters","device"}` |
 | `POST /api/game/{id}/resign` | – | GameState（人认输） |
 
-无模型加载时 hva/ava 返回 400（提示先加载模型）；hvh 与回放不需要模型。AI 走子在线程池执行避免阻塞事件循环。启动参数：`python -m gui.server --model checkpoints/best.pt --port 8000 --sims 400 --device cpu`。
+无模型加载时 hva/ava 返回 400（提示先加载模型）；hvh 与回放不需要模型。AI 走子在线程池执行避免阻塞事件循环。启动参数：`python -m gui.server --model ckpts/best.pt --port 8000 --sims 400 --device cpu`。
 
 ## 14. GUI 前端功能清单（gui/web/，原生 JS，无构建）
 
@@ -288,4 +303,4 @@ python -m rl.train --config configs/cloud_8xh100.yaml   # 或 bash scripts/train
 # 观察: tail -f logs/train.log ; tensorboard --logdir logs/tb
 ```
 中断续训：`python -m rl.train --config configs/cloud_8xh100.yaml --resume`。
-训好后：`python scripts/export_model.py checkpoints/best.pt --onnx --torchscript`，把 `best.pt`/`best.onnx` 拷回笔记本，GUI 加载即可。
+训好后：`python scripts/export_model.py ckpts/best.pt --onnx --torchscript`，把 `best.pt`/`best.onnx` 拷回笔记本，GUI 加载即可。

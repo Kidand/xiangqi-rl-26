@@ -25,11 +25,11 @@ AlphaZero 式中国象棋强化学习系统：纯自我博弈训练（无人类�
 python -m rl.train --config configs/smoke.yaml
 
 # GUI（浏览器开 http://127.0.0.1:8000；hvh 与复盘不需要模型）
-.venv/Scripts/python.exe -m gui.server --model checkpoints/best.pt --port 8000 --device cpu
+.venv/Scripts/python.exe -m gui.server --model ckpts/best.pt --port 8000 --device cpu
 
 # 引擎基准 / 模型导出
 .venv/Scripts/python.exe scripts/bench_engine.py
-.venv/Scripts/python.exe scripts/export_model.py checkpoints/best.pt --torchscript --onnx
+.venv/Scripts/python.exe scripts/export_model.py ckpts/best.pt --torchscript --onnx
 ```
 
 ## 架构要点（跨文件才能看懂的部分）
@@ -50,7 +50,7 @@ value 恒为当前走子方期望。因此：
 
 **MCTS 两阶段 API**（DESIGN §8）：`select_leaves()`（施加 virtual loss，终局叶子内部直接回传）→ 跨多盘 stack 成大 batch 一次前向 → `apply_results()`。selfplay worker 按此跨盘合批。树复用 `advance()` 后必须给新根重新混 Dirichlet 噪声（曾修复过丢失 bug）。
 
-**训练循环**（`rl/train.py`，同步迭代制）：spawn 多进程自博弈（每进程绑 1 GPU、`torch.multiprocessing` spawn，Windows 兼容）→ queue 聚合实时统计（红黑胜率是核心观测指标）→ replay buffer（states uint8、π 稀疏存储）→ GPU 0 训练（BN/bias 不做 weight decay）→ arena 门控晋升 best。
+**训练循环**（`rl/train.py`，同步迭代制，推理服务架构见 DESIGN §9）：spawn 每 GPU 一个 EvalServer（`rl/inference_server.py`，聚合请求成大 batch、bf16 前向、稀疏返回合法着法概率）+ `num_workers` 个纯 CPU 自博弈 worker（0=按核数自动；共享内存传状态，`torch.multiprocessing` spawn，Windows 兼容）→ queue 聚合实时统计（红黑胜率是核心观测指标；`evals/s`/`avg_batch` 看推理吞吐）→ replay buffer（states uint8、π 稀疏存储）→ GPU 0 训练（BN/bias 不做 weight decay）→ arena 门控晋升 best。检查点目录 `ckpts/`。
 
 **规则引擎注意**：困毙即负（≠国象和棋）；长将判负；`Board.status(legal=None)` 接受预计算 legal_moves 避免重复生成（MCTS 热路径，`legal_moves` 占 CPU ~47%，勿在同一叶子重复调用）；`push/pop` 是 make-unmake，禁止 deepcopy。
 

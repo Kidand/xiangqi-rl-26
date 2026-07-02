@@ -77,6 +77,23 @@ def _terminal_value(result: str, side_to_move: int) -> float:
     return 1.0 if winner == side_to_move else -1.0
 
 
+def _leaf_policy_indices(legal: list, side: int) -> np.ndarray:
+    """把一个叶子的合法着法转换为**当前走子方视角**策略索引（int64，(n,)）。
+
+    legal 拆成 from/to 两列：action = from*90 + to；BLACK 视角需 flip_action，即
+    flip_sq(from)*90 + flip_sq(to) = (89-from)*90 + (89-to)。与
+    ``rl.encoding.move_to_policy_index`` 逐项等价。稀疏评估协议（policy_indices /
+    apply_results_sparse）与稠密路径（apply_results）复用同一计算，保证数值一致。
+    """
+    n = len(legal)
+    lm = np.asarray(legal, dtype=np.int64).reshape(n, 2)
+    frm = lm[:, 0]
+    to = lm[:, 1]
+    if side == BLACK:
+        return (89 - frm) * 90 + (89 - to)
+    return frm * 90 + to
+
+
 class SearchTree:
     """单棵 MCTS 树（对应一盘对局），支持两阶段批量叶子评估。"""
 
@@ -276,13 +293,52 @@ class SearchTree:
         return batch, tokens
 
     # ------------------------------------------------------------ 阶段二
+    def policy_indices(self, tokens: list) -> list:
+        """每个叶子的合法着法策略索引（当前走子方视角，int64），供稀疏评估协议使用。
+
+        返回 list[np.ndarray]，长度 = len(tokens)，第 i 个数组与 tokens[i] 的合法着法
+        顺序一致，取值为网络策略输出的索引（0..8099）。它是稀疏返回协议
+        （EvalServer 只在这些索引处 gather softmax 概率）的对齐依据。
+        """
+        return [_leaf_policy_indices(token[2], token[3]) for token in tokens]
+
+    def _expand_and_backup(self, token, prior_unnorm: np.ndarray, value: float) -> None:
+        """稠密 / 稀疏路径共享的展开逻辑：归一化先验→（根节点混噪声）→建子边→backup。
+
+        prior_unnorm 为按合法着法顺序 gather 得到的先验（未归一化）；两条路径喂进的
+        prior_unnorm 数值一致（同一 softmax 后在同一组索引处 gather），故结果严格等价。
+        """
+        node, path, legal, _side = token
+        n = len(legal)
+        prior = np.asarray(prior_unnorm, dtype=np.float64).reshape(-1)
+        s = float(prior.sum())
+        if s > 1e-12:
+            prior = prior / s
+        elif n > 0:
+            prior = np.full(n, 1.0 / n, dtype=np.float64)
+
+        # 根节点 Dirichlet 噪声（仅训练时）。
+        if node is self._root and self._add_noise and n > 0:
+            prior = self._mix_noise(prior)
+
+        node.child_moves = list(legal)
+        node.child_nodes = [None] * n
+        node.child_P = prior.astype(np.float32)
+        node.child_N = np.zeros(n, dtype=np.int64)
+        node.child_W = np.zeros(n, dtype=np.float64)
+        node.child_vloss = np.zeros(n, dtype=np.int64)
+        node.expanded = True
+        node.pending = False
+
+        self._backup(path, float(value))
+
     def apply_results(
         self,
         tokens: list,
         policy_probs: np.ndarray,
         values: np.ndarray,
     ) -> None:
-        """回填网络先验并 backup。
+        """回填网络先验并 backup（稠密路径）。
 
         policy_probs[K,8100] 为 softmax 后概率（未 mask），内部按合法着法 mask 归一后
         再展开到各子边。values[K] 为对应叶子走子方视角价值。
@@ -291,42 +347,27 @@ class SearchTree:
         values = np.asarray(values, dtype=np.float64).reshape(-1)
 
         for k, token in enumerate(tokens):
-            node, path, legal, side = token
-            probs = policy_probs[k]
+            _node, _path, legal, side = token
+            idxs = _leaf_policy_indices(legal, side)
+            prior = policy_probs[k][idxs].astype(np.float64)
+            self._expand_and_backup(token, prior, float(values[k]))
 
-            n = len(legal)
-            # 按当前走子方视角取每个合法着法的先验（向量化 move_to_policy_index）。
-            # legal 拆成 from/to 两列：action = from*90 + to；BLACK 视角需 flip_action，
-            # 即 flip_sq(from)*90 + flip_sq(to) = (89-from)*90 + (89-to)。与
-            # rl.encoding.move_to_policy_index 逐项等价。
-            lm = np.asarray(legal, dtype=np.int64).reshape(n, 2)
-            frm = lm[:, 0]
-            to = lm[:, 1]
-            if side == BLACK:
-                idxs = (89 - frm) * 90 + (89 - to)
-            else:
-                idxs = frm * 90 + to
-            prior = probs[idxs].astype(np.float64)
-            s = float(prior.sum())
-            if s > 1e-12:
-                prior /= s
-            else:
-                prior = np.full(n, 1.0 / n, dtype=np.float64)
+    def apply_results_sparse(
+        self,
+        tokens: list,
+        sparse_probs,
+        values: np.ndarray,
+    ) -> None:
+        """回填网络先验并 backup（稀疏路径）。
 
-            # 根节点 Dirichlet 噪声（仅训练时）。
-            if node is self._root and self._add_noise and n > 0:
-                prior = self._mix_noise(prior)
-
-            node.child_moves = list(legal)
-            node.child_nodes = [None] * n
-            node.child_P = prior.astype(np.float32)
-            node.child_N = np.zeros(n, dtype=np.int64)
-            node.child_W = np.zeros(n, dtype=np.float64)
-            node.child_vloss = np.zeros(n, dtype=np.int64)
-            node.expanded = True
-            node.pending = False
-
-            self._backup(path, float(values[k]))
+        sparse_probs[i] 与 ``policy_indices(tokens)[i]`` 对齐（softmax 后在合法着法索引
+        处 gather 所得，未归一化），values[i] 为对应叶子走子方视角价值。内部归一后展开，
+        与 ``apply_results`` 数值严格等价。
+        """
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        for k, token in enumerate(tokens):
+            prior = np.asarray(sparse_probs[k], dtype=np.float64).reshape(-1)
+            self._expand_and_backup(token, prior, float(values[k]))
 
     def _mix_noise(self, prior: np.ndarray) -> np.ndarray:
         """把 Dirichlet 噪声混入先验（float64 输入，返回 float64）。"""
