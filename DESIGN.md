@@ -135,10 +135,12 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
 
 - Stem: Conv3×3(C_in→F) + BN + ReLU
 - N × 残差块 [Conv3×3 + BN + ReLU + Conv3×3 + BN +（可选 SE）+ skip + ReLU]
-- Policy head: Conv1×1(F→32) + BN + ReLU → Flatten(2880) → FC(8100)，输出 logits
+- Policy head（全卷积结构化头）: Conv1×1(F→F) + BN + ReLU → Conv1×1(F→90)。输出 (B,90,10,9)，
+  通道 = 终点格 to_sq、空间位置 = 起点格 from_sq；`flatten(2).transpose(1,2).reshape(B,8100)`
+  得到 action = from_sq*90 + to_sq 的 logits。（相比 Flatten→FC(8100) 省 ~23M 参数且保留空间结构。）
 - Value head: Conv1×1(F→8) + BN + ReLU → Flatten(720) → FC(256) + ReLU → FC(1) → tanh
 
-预设：`small` 5b×64f（~1M 参数，冒烟/调试）、`medium` 10b×128f（~7M，**默认**，笔记本可跑）、`large` 15b×192f（~22M）。
+预设：`small` 5b×64f（~0.6M 参数，冒烟/调试）、`medium` 10b×128f（~3.2M，**默认**，笔记本可跑）、`large` 15b×192f（~10M）。
 `forward(x) -> (policy_logits[B,8100], value[B])`。导出支持 TorchScript 与 ONNX（scripts/export_model.py，动态 batch）。
 
 **Checkpoint 格式**（train / export / GUI 共用）：`torch.save` 的 dict：

@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>中国象棋 AlphaZero</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ═══ 顶栏 ═══════════════════════════════════════════════════════════ -->
+<div id="topbar">
+  <h1>象棋 AlphaZero</h1>
+  <div id="statusbar">
+    <div class="spinner" id="spinner"></div>
+    <span id="status-text">就绪</span>
+  </div>
+</div>
+
+<!-- ═══ 主体 ════════════════════════════════════════════════════════════ -->
+<div id="main">
+
+  <!-- ── 棋盘区 ──────────────────────────────────────────────────── -->
+  <div id="board-area">
+    <div id="board-with-eval">
+      <!-- 评估条 -->
+      <div id="eval-bar-wrap">
+        <div id="eval-bar">
+          <div id="eval-fill"></div>
+        </div>
+        <div id="eval-label">红方胜率</div>
+      </div>
+
+      <!-- 棋盘 -->
+      <div id="board-container">
+        <svg id="board-svg"></svg>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 右侧面板 ─────────────────────────────────────────────────── -->
+  <div id="panel">
+
+    <!-- 页签按钮 -->
+    <div id="tabs">
+      <button class="tab-btn active" id="tab-game-btn">对局</button>
+      <button class="tab-btn" id="tab-replay-btn">复盘</button>
+      <button class="tab-btn" id="tab-settings-btn">设置</button>
+    </div>
+
+    <!-- ══ 对局页签 ══════════════════════════════════════════════ -->
+    <div class="tab-pane active" id="tab-game">
+
+      <!-- 操作按钮 -->
+      <div id="action-btns">
+        <button class="btn primary" id="btn-new-game">新对局</button>
+        <button class="btn" id="btn-undo">悔棋</button>
+        <button class="btn danger" id="btn-resign">认输</button>
+        <button class="btn" id="btn-flip">翻转</button>
+        <button class="btn" id="btn-hint">提示</button>
+        <button class="btn" id="btn-export">导出</button>
+        <button class="btn" id="btn-return-live" style="display:none">↩ 返回</button>
+        <button class="btn" id="btn-ava-toggle" style="display:none">▶ 继续</button>
+      </div>
+
+      <!-- 着法列表 -->
+      <div id="moves-header">着法记录</div>
+      <div id="moves-list"></div>
+
+      <!-- 提示区 -->
+      <div id="hint-area">
+        <div id="hint-title">AI 推荐着法</div>
+        <div id="hint-moves"></div>
+      </div>
+
+    </div><!-- /tab-game -->
+
+    <!-- ══ 复盘页签 ══════════════════════════════════════════════ -->
+    <div class="tab-pane" id="tab-replay">
+
+      <!-- 导入 -->
+      <div class="section-title">导入棋谱</div>
+      <div id="replay-import">
+        <div id="replay-import-btns">
+          <button class="btn" id="btn-replay-file">📂 打开文件</button>
+          <button class="btn" id="btn-replay-paste">✏ 粘贴</button>
+        </div>
+        <textarea id="replay-paste-area" placeholder="粘贴 FEN + UCCI 着法，或 JSON 记录…"></textarea>
+        <div id="replay-paste-btns">
+          <button class="btn primary" id="btn-paste-load">加载</button>
+          <button class="btn" id="btn-paste-clear">清除</button>
+        </div>
+      </div>
+      <!-- 隐藏文件输入 -->
+      <input type="file" id="replay-file-input" accept=".json,.jsonl,.txt" style="display:none" />
+
+      <!-- records 浏览 -->
+      <div id="records-section">
+        <div class="section-title" style="display:flex;align-items:center;justify-content:space-between;padding-right:10px">
+          <span>自对弈记录</span>
+          <button class="btn" id="btn-records-refresh" style="padding:2px 8px;font-size:11px">刷新</button>
+        </div>
+        <div id="records-list">
+          <div class="text-sm text-muted" style="padding:6px 10px">点击刷新加载</div>
+        </div>
+        <select id="records-game-select" aria-label="选择局次"></select>
+      </div>
+
+      <!-- 复盘信息 -->
+      <div id="replay-info">请导入棋谱或从记录中选择</div>
+
+      <!-- 复盘着法列表 -->
+      <div id="replay-moves-list"></div>
+
+      <!-- 播放控制 -->
+      <div id="replay-controls">
+        <div id="replay-pos-label">0 / 0</div>
+        <div id="replay-ctrl-btns">
+          <button class="ctrl-btn" id="ctrl-first"  title="跳到开局">|◀</button>
+          <button class="ctrl-btn" id="ctrl-prev"   title="上一步">◀</button>
+          <button class="ctrl-btn" id="ctrl-play"   title="播放/暂停">▶</button>
+          <button class="ctrl-btn" id="ctrl-next"   title="下一步">▶</button>
+          <button class="ctrl-btn" id="ctrl-last"   title="跳到终局">▶|</button>
+        </div>
+        <div id="replay-speed-wrap">
+          <span>慢</span>
+          <input type="range" id="replay-speed" min="1" max="5" value="3" />
+          <span>快</span>
+        </div>
+      </div>
+
+    </div><!-- /tab-replay -->
+
+    <!-- ══ 设置页签 ══════════════════════════════════════════════ -->
+    <div class="tab-pane" id="tab-settings">
+
+      <div class="section-title">音效与显示</div>
+
+      <div class="setting-row">
+        <span class="setting-label">走子音效</span>
+        <label class="toggle">
+          <input type="checkbox" id="toggle-sound" checked />
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="setting-row">
+        <span class="setting-label">自动翻转视角</span>
+        <label class="toggle">
+          <input type="checkbox" id="toggle-auto-flip" />
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="section-title" style="margin-top:12px">模型</div>
+      <div id="model-info-box">加载中…</div>
+
+      <div class="model-load-row">
+        <input type="text" id="model-path-input" class="form-input"
+               placeholder="checkpoints/best.pt" />
+        <button class="btn primary" id="btn-load-model">加载</button>
+      </div>
+
+    </div><!-- /tab-settings -->
+
+  </div><!-- /panel -->
+</div><!-- /main -->
+
+<!-- Toast 容器 -->
+<div id="toast-container"></div>
+
+<!-- ═══ 新对局对话框 ══════════════════════════════════════════════════ -->
+<div class="dialog-overlay" id="dialog-new-game" role="dialog" aria-modal="true" aria-labelledby="dlg-title">
+  <div class="dialog">
+    <h2 id="dlg-title">新对局</h2>
+
+    <div class="form-group">
+      <label>对战模式</label>
+      <div class="radio-group">
+        <div class="radio-btn">
+          <input type="radio" name="new-mode" id="mode-hva" value="hva" checked />
+          <label for="mode-hva">人机对战</label>
+        </div>
+        <div class="radio-btn">
+          <input type="radio" name="new-mode" id="mode-hvh" value="hvh" />
+          <label for="mode-hvh">双人对战</label>
+        </div>
+        <div class="radio-btn">
+          <input type="radio" name="new-mode" id="mode-ava" value="ava" />
+          <label for="mode-ava">AI 观战</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="form-group" id="side-group">
+      <label>执子方</label>
+      <div class="radio-group">
+        <div class="radio-btn">
+          <input type="radio" name="new-side" id="side-red" value="red" checked />
+          <label for="side-red">执红先行</label>
+        </div>
+        <div class="radio-btn">
+          <input type="radio" name="new-side" id="side-black" value="black" />
+          <label for="side-black">执黑后行</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>AI 难度（模拟次数）</label>
+      <div class="radio-group">
+        <div class="radio-btn">
+          <input type="radio" name="new-sims" id="sims-fast" value="100" />
+          <label for="sims-fast">快速 100</label>
+        </div>
+        <div class="radio-btn">
+          <input type="radio" name="new-sims" id="sims-std" value="400" checked />
+          <label for="sims-std">标准 400</label>
+        </div>
+        <div class="radio-btn">
+          <input type="radio" name="new-sims" id="sims-strong" value="1200" />
+          <label for="sims-strong">强力 1200</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>自定义起始 FEN（可选）</label>
+      <input type="text" class="form-input" id="new-fen"
+             placeholder="留空使用初始局面" />
+    </div>
+
+    <div class="dialog-btns">
+      <button class="btn" id="dlg-cancel">取消</button>
+      <button class="btn primary" id="dlg-start">开始对局</button>
+    </div>
+  </div>
+</div>
+
+<!-- 加载脚本（board.js 先于 app.js） -->
+<script src="board.js"></script>
+<script src="app.js"></script>
+
+<!-- 启动后隐藏/显示相关按钮的补丁逻辑 -->
+<script>
+// 根据模式显隐 AVA 按钮和返回按钮
+document.addEventListener("DOMContentLoaded", () => {
+  // 监听 App 状态变化（通过 applyGameState 触发）
+  const origApply = window._origApplyGameState = applyGameState;
+  // 返回按钮：历史跳转时显示
+  const btnReturn = document.getElementById("btn-return-live");
+  const btnAva    = document.getElementById("btn-ava-toggle");
+
+  // 监听对局模式切换，动态显隐 AVA 按钮
+  const modeRadios = document.querySelectorAll("input[name='new-mode']");
+  modeRadios.forEach(r => {
+    r.addEventListener("change", () => {
+      const sideGroup = document.getElementById("side-group");
+      sideGroup.style.display = r.value === "ava" ? "none" : "";
+    });
+  });
+
+  // 重写部分 App 流程以更新按钮可见性
+  // 此处通过轮询 App.viewingHistory / App.mode 更新按钮状态
+  function updateBtns() {
+    if (btnReturn) btnReturn.style.display = App.viewingHistory ? "" : "none";
+    if (btnAva)    btnAva.style.display    = App.mode === "ava"  ? "" : "none";
+  }
+
+  // 每 200ms 检查一次（足够，不涉及性能问题）
+  setInterval(updateBtns, 200);
+  updateBtns();
+});
+</script>
+
+</body>
+</html>
