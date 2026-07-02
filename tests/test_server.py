@@ -452,6 +452,145 @@ def test_new_game_bad_fen(client: SimpleClient):
 
 
 # ────────────────────────────────────────────────────────────────
+# 模型相关：fixture（需 torch；用极小模型加快速度）
+# ────────────────────────────────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def client_with_model(tmp_path_factory):
+    """启动带极小模型的测试服务器，用于验证 AI / eval 相关端点。"""
+    import torch
+    from rl.model import create_model, save_checkpoint
+    from rl.config import ModelConfig
+    from gui.server import app, _games, _model_state
+
+    tmp = tmp_path_factory.mktemp("models")
+    ckpt_path = str(tmp / "mini.pt")
+    cfg = ModelConfig(blocks=1, filters=16)
+    m = create_model(cfg)
+    save_checkpoint(m, cfg, ckpt_path, iteration=0)
+
+    # 重置全局状态
+    _games.clear()
+    _model_state.model = None
+    _model_state.path = ""
+
+    port = _free_port()
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    server = uvicorn.Server(config)
+    t = threading.Thread(target=server.run, daemon=True)
+    t.start()
+
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/model/info", timeout=1)
+            break
+        except Exception:
+            time.sleep(0.1)
+
+    c = SimpleClient(f"http://127.0.0.1:{port}")
+    # 加载模型
+    resp = c.post("/api/model/load", body={"path": ckpt_path})
+    assert resp.status_code == 200, f"模型加载失败: {resp.json()}"
+
+    yield c
+
+    server.should_exit = True
+    t.join(timeout=3)
+
+
+# ────────────────────────────────────────────────────────────────
+# 测试：hva eval.value 语义（评估条符号契约）
+# DESIGN §13: eval.value 随 GameState 附带，联合 side_to_move 解读。
+# 约定：AI 走子前 MCTS 以 AI 方视角运算，walk_val 为 AI 期望值；
+#        AI 走子后 side_to_move 切到人类侧：
+#          - AI=黑 → side_to_move="red"  → 红方 POV = -eval.value
+#          - AI=红 → side_to_move="black" → 红方 POV = +eval.value
+# 该契约决定前端 updateEvalBar 必须在 side_to_move=="red" 时取反（而非"black"）。
+# ────────────────────────────────────────────────────────────────
+
+def test_hva_eval_value_in_range_human_red(client_with_model: SimpleClient):
+    """hva human=red：AI（黑）回着后 eval.value ∈ [-1,1]，side_to_move 应回到 "red"。"""
+    resp = client_with_model.post("/api/game/new",
+                                  body={"mode": "hva", "human_side": "red", "sims": 4})
+    assert resp.status_code == 200
+    gs0 = resp.json()
+    gid = gs0["game_id"]
+    legal = gs0.get("legal_moves", [])
+    assert legal, "初始局面无合法着法"
+
+    resp2 = client_with_model.post(f"/api/game/{gid}/move", body={"move": legal[0]})
+    assert resp2.status_code == 200
+    gs = resp2.json()
+
+    # 人类（红）走后 AI（黑）应已回着 → move_history 应有 ≥2 条
+    hist = gs.get("move_history", [])
+    if not gs.get("game_over"):
+        assert len(hist) >= 2, f"AI 未回着，move_history={hist}"
+        # 轮回红方
+        assert gs["side_to_move"] == "red", f"预期轮到红方，实际 {gs['side_to_move']}"
+
+    # eval 应存在且 value ∈ [-1,1]
+    ev = gs.get("eval")
+    assert ev is not None, "AI 回着后 GameState 缺少 eval 字段"
+    v = ev.get("value")
+    assert v is not None, "eval 缺少 value 字段"
+    assert -1.0 <= float(v) <= 1.0, f"eval.value={v} 超出 [-1,1]"
+
+    # 约定：AI=黑走后 side_to_move="red"；前端应对 eval.value 取反得红方 POV
+    # （见 app.js updateEvalBar：negate when side_to_move === "red"）
+    # 此处只验证符号约定可推导：不测具体值，只确认字段存在且在范围内。
+    assert ev.get("top_moves") is not None, "eval 缺少 top_moves 字段"
+
+
+def test_hva_eval_value_in_range_human_black(client_with_model: SimpleClient):
+    """hva human=black：AI（红）先走，eval.value ∈ [-1,1]，side_to_move 应为 "black"。"""
+    resp = client_with_model.post("/api/game/new",
+                                  body={"mode": "hva", "human_side": "black", "sims": 4})
+    assert resp.status_code == 200
+    gs = resp.json()
+
+    # AI=红先走 → move_history 应有 ≥1 条，side_to_move 应为 "black"
+    hist = gs.get("move_history", [])
+    if not gs.get("game_over"):
+        assert len(hist) >= 1, f"AI 未先走，move_history={hist}"
+        assert gs["side_to_move"] == "black", f"预期轮到黑方，实际 {gs['side_to_move']}"
+
+    ev = gs.get("eval")
+    assert ev is not None, "AI 先走后 GameState 缺少 eval 字段"
+    v = ev.get("value")
+    assert v is not None, "eval 缺少 value 字段"
+    assert -1.0 <= float(v) <= 1.0, f"eval.value={v} 超出 [-1,1]"
+
+    # 约定：AI=红走后 side_to_move="black"；前端不应对 eval.value 取反（eval 已是红方视角）
+    top = ev.get("top_moves", [])
+    # top_moves 应按概率降序排列
+    for i in range(len(top) - 1):
+        assert top[i]["prob"] >= top[i+1]["prob"] - 1e-9, (
+            f"top_moves 未降序：[{i}].prob={top[i]['prob']} > [{i+1}].prob={top[i+1]['prob']}"
+        )
+
+
+def test_hint_value_in_range(client_with_model: SimpleClient):
+    """hint 返回的 value ∈ [-1,1] 且 top_moves 概率降序。"""
+    resp = client_with_model.post("/api/game/new",
+                                  body={"mode": "hvh", "human_side": "red", "sims": 4})
+    assert resp.status_code == 200
+    gid = resp.json()["game_id"]
+
+    resp2 = client_with_model.get(f"/api/game/{gid}/hint", params={"sims": "4"})
+    assert resp2.status_code == 200
+    h = resp2.json()
+    assert "move" in h and "value" in h and "top_moves" in h
+    assert -1.0 <= float(h["value"]) <= 1.0, f"hint value={h['value']} out of range"
+    tops = h["top_moves"]
+    for i in range(len(tops) - 1):
+        assert tops[i]["prob"] >= tops[i+1]["prob"] - 1e-9, (
+            f"hint top_moves 未降序 [{i}]={tops[i]['prob']} [{i+1}]={tops[i+1]['prob']}"
+        )
+
+
+# ────────────────────────────────────────────────────────────────
 # 测试：resign 端点
 # ────────────────────────────────────────────────────────────────
 def test_resign(client: SimpleClient):

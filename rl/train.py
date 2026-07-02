@@ -66,21 +66,38 @@ def _set_global_seed(seed: int) -> None:
 # ---------------------------------------------------------------------------
 # 优化器 / 学习率
 # ---------------------------------------------------------------------------
+def _param_groups(model, weight_decay: float):
+    """把参数拆成 decay / no-decay 两组：BN 与所有 bias（1D 张量）不做 weight decay。
+
+    对 L2 正则而言，对 BatchNorm 的 scale/shift 与卷积/全连接的 bias 施加 weight decay
+    既无必要也有害（会把归一化统计往 0 拉）。仅对 2D+ 权重张量做 weight decay。
+    """
+    decay, no_decay = [], []
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim <= 1:  # BN weight/bias 与各层 bias
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [
+        {"params": decay, "weight_decay": float(weight_decay)},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
 def _build_optimizer(model, cfg: Config):
     import torch
 
-    params = model.parameters()
+    groups = _param_groups(model, cfg.train.weight_decay)
     if str(cfg.train.optimizer).lower() == "sgd":
         return torch.optim.SGD(
-            params,
+            groups,
             lr=cfg.train.lr,
             momentum=cfg.train.momentum,
-            weight_decay=cfg.train.weight_decay,
             nesterov=True,
         )
-    return torch.optim.AdamW(
-        params, lr=cfg.train.lr, weight_decay=cfg.train.weight_decay
-    )
+    return torch.optim.AdamW(groups, lr=cfg.train.lr)
 
 
 def _cosine_lr(cfg: Config, global_step: int, total_steps: int) -> float:
@@ -297,11 +314,28 @@ def _train_phase(
     last_lr = float(cfg.train.lr)
     n = 0
 
+    # GPU 传输优化：batch 形状固定，cuda 设备下预分配 pinned CPU 张量，每步 copy_ 后
+    # 以 non_blocking 异步拷到 GPU（overlap H2D 与计算）；cpu 设备走原路径，数值不变。
+    use_cuda = dev.type == "cuda"
+    pin_states = pin_policy = pin_values = None
+
     for step in range(steps):
         states_np, policy_np, values_np = buffer.sample(batch)
-        states = torch.from_numpy(states_np).to(dev)
-        policy_target = torch.from_numpy(policy_np).to(dev)
-        value_target = torch.from_numpy(values_np).to(dev)
+        if use_cuda:
+            if pin_states is None:
+                pin_states = torch.empty(states_np.shape, dtype=torch.float32, pin_memory=True)
+                pin_policy = torch.empty(policy_np.shape, dtype=torch.float32, pin_memory=True)
+                pin_values = torch.empty(values_np.shape, dtype=torch.float32, pin_memory=True)
+            pin_states.copy_(torch.from_numpy(states_np))
+            pin_policy.copy_(torch.from_numpy(policy_np))
+            pin_values.copy_(torch.from_numpy(values_np))
+            states = pin_states.to(dev, non_blocking=True)
+            policy_target = pin_policy.to(dev, non_blocking=True)
+            value_target = pin_values.to(dev, non_blocking=True)
+        else:
+            states = torch.from_numpy(states_np).to(dev)
+            policy_target = torch.from_numpy(policy_np).to(dev)
+            value_target = torch.from_numpy(values_np).to(dev)
 
         global_step = iteration * steps + step
         lr = _cosine_lr(cfg, global_step, total_steps)

@@ -565,10 +565,20 @@ class TestCheckDetection:
         assert b.is_in_check(BLACK)
 
     def test_check_by_horse(self):
-        """马将军：红马攻击黑将，蹩腿点为空。"""
-        # 红马在 f7(row7 col5)，黑将在 e9(row9 col4)
-        # 马步 f7->e9: dr=+2, dc=-1，腿在 f8(row8 col5)，为空
-        b = Board.from_fen("4k4/9/9/9/9/9/9/5N3/9/4K4 b - - 0 1")
+        """马将军：红马攻击黑将，蹩腿点为空。
+
+        红马在 f7(row7 col5)，黑将在 e9(row9 col4)。
+        马步 f7->e9: dr=+2, dc=-1，腿在 f8(row8 col5) 为空。
+        红帅在 f0(col5)，与黑将不同列，避免飞将干扰——将军来源纯为马。
+
+        FEN 段序(row9..row0):
+          row9="4k4"  → 黑将 e9
+          row8="9"    → f8 空（蹩腿点）
+          row7="5N3"  → 红马 f7
+          ...
+          row0="5K3"  → 红帅 f0（col5，非 e 列）
+        """
+        b = Board.from_fen("4k4/9/5N3/9/9/9/9/9/9/5K3 b - - 0 1")
         assert b.is_in_check(BLACK)
 
     def test_check_by_cannon(self):

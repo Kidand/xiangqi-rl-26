@@ -64,31 +64,14 @@ def _parse_board_segment(board_segment: str) -> dict:
 # §10.1 材料价值
 # ─────────────────────────────────────────────────────────────────────────────
 
-def material_score(board_or_fen: Union[str, object]) -> float:
-    """计算局面材料分（红方视角：红正黑负）。
+def _score_pieces(items) -> float:
+    """给定 (sq_idx, piece_int) 序列（只含非空格）累加材料分。
 
-    材料价值参见 constants.MATERIAL_VALUE：
-      车9  炮4.5  马4  象2  士2  兵1（过河 2）  帅/将 0
-
-    过河判定（DESIGN §2）：
-      红兵 row >= 5（BLACK_RIVER_BANK）→ 过河
-      黑兵 row <= 4（RED_RIVER_BANK）   → 过河
-
-    Parameters
-    ----------
-    board_or_fen : FEN 字符串，或任意带 .fen() 方法的 Board 对象
+    红子得正分、黑子得负分；过河兵覆盖为 PAWN_CROSSED_VALUE（DESIGN §2/§10.1）。
+    FEN 路径与 Board.squares 路径共用此函数，逐子取值完全一致。
     """
-    if isinstance(board_or_fen, str):
-        fen_str = board_or_fen
-    else:
-        # Board 对象（须有 .fen() 方法）
-        fen_str = board_or_fen.fen()
-
-    board_segment = fen_str.split()[0]
-    pieces = _parse_board_segment(board_segment)
-
     score = 0.0
-    for sq_idx, piece in pieces.items():
+    for sq_idx, piece in items:
         piece_type = abs(piece)
         side = RED if piece > 0 else BLACK  # 1 or -1
 
@@ -110,6 +93,35 @@ def material_score(board_or_fen: Union[str, object]) -> float:
         score += base_val * side  # side=RED=+1, BLACK=-1
 
     return score
+
+
+def material_score(board_or_fen: Union[str, object]) -> float:
+    """计算局面材料分（红方视角：红正黑负）。
+
+    材料价值参见 constants.MATERIAL_VALUE：
+      车9  炮4.5  马4  象2  士2  兵1（过河 2）  帅/将 0
+
+    过河判定（DESIGN §2）：
+      红兵 row >= 5（BLACK_RIVER_BANK）→ 过河
+      黑兵 row <= 4（RED_RIVER_BANK）   → 过河
+
+    Parameters
+    ----------
+    board_or_fen : FEN 字符串；带 ``squares`` 属性的 Board 对象（走快路径，直接遍历
+                   棋盘数组，免 fen() 字符串往返）；或任意仅带 .fen() 方法的对象。
+    """
+    if isinstance(board_or_fen, str):
+        board_segment = board_or_fen.split()[0]
+        return _score_pieces(_parse_board_segment(board_segment).items())
+
+    # 快路径：Board 对象直接遍历 squares（正=红 / 负=黑 / 0=空），语义与 FEN 路径一致。
+    squares = getattr(board_or_fen, "squares", None)
+    if squares is not None:
+        return _score_pieces((s, p) for s, p in enumerate(squares) if p != 0)
+
+    # 兼容仅有 .fen() 方法的对象（无 squares 属性）。
+    board_segment = board_or_fen.fen().split()[0]
+    return _score_pieces(_parse_board_segment(board_segment).items())
 
 
 # ─────────────────────────────────────────────────────────────────────────────

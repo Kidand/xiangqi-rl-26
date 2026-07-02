@@ -239,6 +239,62 @@ def test_advance_reuses_subtree():
         assert int(idx) in legal_actions
 
 
+def test_dirichlet_noise_reapplied_after_advance():
+    """树复用：advance 到已展开子树后，新根必须重新混入 Dirichlet 噪声（DESIGN §8）。
+
+    该子节点在非根位置展开时先验里没有噪声；若 advance 后不补噪声，自博弈开局将
+    塌缩（每步只有真正的根第一次搜索有噪声）。此测试固定 mock 为均匀策略：无噪声时
+    新根先验会是均匀的，补了噪声则明显偏离均匀。
+    """
+    board = Board()
+    cfg = MCTSConfig(num_sims=200, batch_size=8)
+    tree = SearchTree(board, cfg, add_noise=True, rng=np.random.default_rng(7))
+
+    while tree.total_visits < 200:
+        before = tree.total_visits
+        states, tokens = tree.select_leaves(8)
+        if tokens:
+            tree.apply_results(tokens, *_zero_eval(states))
+        if tree.total_visits == before and not tokens:
+            break
+
+    root = tree._root
+    best_i = int(np.argmax(root.child_N))
+    child = root.child_nodes[best_i]
+    # 前提：被推进的子节点确实已展开（否则测不出补噪声）。
+    assert child is not None and child.expanded
+    move = root.child_moves[best_i]
+
+    tree.advance(move)
+    new_root = tree._root
+    assert new_root.expanded
+    priors = new_root.child_P
+    # 均匀 mock 策略下，若未补噪声先验会保持均匀；补了噪声则偏离均匀。
+    assert not np.allclose(priors, priors[0]), "advance 后新根缺少 Dirichlet 噪声"
+    assert abs(float(priors.sum()) - 1.0) < 1e-4
+
+
+def test_no_noise_advance_keeps_uniform_prior():
+    """add_noise=False（arena/GUI）时 advance 不得引入噪声，先验保持确定性。"""
+    board = Board()
+    cfg = MCTSConfig(num_sims=200, batch_size=8)
+    tree = SearchTree(board, cfg, add_noise=False)
+    while tree.total_visits < 200:
+        before = tree.total_visits
+        states, tokens = tree.select_leaves(8)
+        if tokens:
+            tree.apply_results(tokens, *_zero_eval(states))
+        if tree.total_visits == before and not tokens:
+            break
+    root = tree._root
+    best_i = int(np.argmax(root.child_N))
+    child = root.child_nodes[best_i]
+    assert child is not None and child.expanded
+    tree.advance(root.child_moves[best_i])
+    priors = tree._root.child_P
+    assert np.allclose(priors, priors[0]), "无噪声模式不应在 advance 后混入噪声"
+
+
 def test_search_matches_manual_loop_shape():
     board = Board()
     cfg = MCTSConfig(num_sims=40, batch_size=8)

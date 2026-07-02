@@ -15,7 +15,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-# ── xiangqi 常量 ─────────────────────────────────────────────────────────
+# ── xiangqi 引擎 / 常量 ──────────────────────────────────────────────────
+from xiangqi.board import Board
 from xiangqi.constants import (
     ACTION_SIZE,
     ADVISOR,
@@ -108,6 +109,50 @@ class TestReplayBufferBasic:
             row_sums, 1.0, atol=1e-5,
             err_msg="稠密化策略行和不等于 1"
         )
+
+    def test_sample_dense_matches_naive(self, monkeypatch):
+        """sample() 稀疏→稠密结果与逐样本朴素参考实现 bit-exact 一致（densification 契约）。
+
+        固定采样索引（monkeypatch np.random.randint），覆盖变长稀疏策略、空策略、
+        重复采样同一样本、int16 大索引等情形，作为稠密化行为的回归保护，并同时校验
+        states/values 与采样索引对齐。
+        """
+        buf = ReplayBuffer(capacity=50, state_shape=(4, 10, 9))
+        states = np.random.randint(0, 2, (6, 4, 10, 9), dtype=np.uint8)
+        sps = [
+            (np.array([1, 5, 7], dtype=np.int16),
+             np.array([0.2, 0.5, 0.3], dtype=np.float32)),
+            (np.array([0], dtype=np.int16),
+             np.array([1.0], dtype=np.float32)),
+            (np.array([3, 8], dtype=np.int16),
+             np.array([0.4, 0.6], dtype=np.float32)),
+            (np.array([], dtype=np.int16),
+             np.array([], dtype=np.float32)),                    # 空策略
+            (np.array([100, 200, 300, 8099], dtype=np.int16),
+             np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float32)),
+            (np.array([42], dtype=np.int16),
+             np.array([1.0], dtype=np.float32)),
+        ]
+        values = np.arange(6, dtype=np.float32)
+        buf.add_game(states, sps, values)
+
+        # 固定采样索引：含空策略(3)、重复(4 出现两次)、边界大索引(4)。
+        fixed_idx = np.array([0, 3, 4, 1, 4, 2, 5, 3], dtype=np.int64)
+        monkeypatch.setattr(np.random, "randint", lambda *a, **k: fixed_idx)
+
+        s_out, pi_out, v_out = buf.sample(len(fixed_idx))
+
+        # 朴素参考实现（旧逐样本赋值）。
+        ref = np.zeros((len(fixed_idx), ACTION_SIZE), dtype=np.float32)
+        for j, si in enumerate(fixed_idx):
+            pidx = buf._pol_indices[si]
+            pprob = buf._pol_probs[si]
+            if pidx is not None and len(pidx) > 0:
+                ref[j, pidx.astype(np.int32)] = pprob
+
+        np.testing.assert_array_equal(pi_out, ref)
+        np.testing.assert_array_equal(s_out, buf._states[fixed_idx].astype(np.float32))
+        np.testing.assert_array_equal(v_out, buf._values[fixed_idx])
 
     def test_state_values_are_float32(self):
         """states 输出为 float32（从 uint8 转换）。"""
@@ -459,6 +504,35 @@ class TestMaterialScore:
             f"对称去掉各一炮后材料分应为 0，实际: {score}"
         )
 
+    def test_board_squares_fastpath_matches_fen_start(self):
+        """Board 对象快路径（遍历 squares）与 FEN 字符串路径在初始局面结果相等。"""
+        board = Board()
+        assert material_score(board) == material_score(board.fen()) == 0.0
+
+    def test_board_squares_fastpath_matches_fen_random(self):
+        """随机走子后的若干局面：快路径（board）与 FEN 路径逐局面结果完全相等。
+
+        覆盖含吃子、过河兵、红黑双方视角的多样局面。两路径取值一致，结果应 bit-exact。
+        """
+        rng = np.random.default_rng(20260702)
+        board = Board()
+        checked = 0
+        for _ in range(400):
+            legal = board.legal_moves()
+            res, _term = board.result_and_termination()
+            if not legal or res is not None:
+                board = Board()  # 终局则重开新局继续采样
+                continue
+            move = legal[int(rng.integers(0, len(legal)))]
+            board.push(move)
+            fast = material_score(board)          # squares 快路径
+            slow = material_score(board.fen())    # FEN 字符串路径
+            assert fast == slow, (
+                f"两路径材料分不一致: fast={fast} slow={slow} fen={board.fen()!r}"
+            )
+            checked += 1
+        assert checked >= 50  # 确保确有足够多样本被比较
+
 
 # ======================================================================
 # 启发式函数测试
@@ -720,3 +794,48 @@ class TestResignTracker:
         for _ in range(4):
             result = tracker.update(RED, -0.921)
         assert result is True, "低于阈值应触发认输"
+
+
+# ======================================================================
+# 优化器参数分组测试（DESIGN §9：L2 正则不应作用于 BN 与 bias）
+# ======================================================================
+
+class TestOptimizerWeightDecay:
+    """weight decay 只能作用于卷积/全连接权重（2D+），BN 与所有 bias 不做 wd。"""
+
+    def _build(self, optimizer_name):
+        from rl.config import Config
+        from rl.model import create_model
+        from rl.train import _build_optimizer
+
+        cfg = Config()
+        cfg.model.se = True  # 连 SE 的 Linear 一起覆盖
+        cfg.train.optimizer = optimizer_name
+        cfg.train.weight_decay = 1e-4
+        model = create_model(cfg.model)
+        return model, _build_optimizer(model, cfg)
+
+    @pytest.mark.parametrize("optimizer_name", ["adamw", "sgd"])
+    def test_bn_and_bias_excluded_from_weight_decay(self, optimizer_name):
+        model, opt = self._build(optimizer_name)
+
+        decay_params, nodecay_params = [], []
+        for g in opt.param_groups:
+            if g["weight_decay"] == 0.0:
+                nodecay_params.extend(g["params"])
+            else:
+                assert g["weight_decay"] == pytest.approx(1e-4)
+                decay_params.extend(g["params"])
+
+        # decay 组必须全是 2D+ 权重张量；no-decay 组必须全是 1D（BN weight/bias、各层 bias）
+        assert decay_params and nodecay_params
+        assert all(p.ndim >= 2 for p in decay_params)
+        assert all(p.ndim <= 1 for p in nodecay_params)
+
+        # 覆盖所有参数，无遗漏无重复
+        total = sum(p.numel() for p in model.parameters())
+        grouped = sum(p.numel() for p in decay_params + nodecay_params)
+        assert grouped == total
+
+        # 至少存在若干 1D 张量（BN），确保测试有意义
+        assert sum(1 for p in model.parameters() if p.ndim <= 1) == len(nodecay_params)

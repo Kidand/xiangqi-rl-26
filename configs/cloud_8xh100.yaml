@@ -2,6 +2,8 @@
 # 预计吞吐：~2000-5000 局/小时（视 CPU 核数），建议先跑 3-5 个迭代观察日志再调参
 model: {blocks: 10, filters: 128, history_steps: 2}
 mcts:
+  # 前 30~50 迭代可先用 num_sims=400 加快出数据（早期网络弱、更多模拟收益低），
+  # 数据规模起来后再升到 600+ 提升棋力。
   num_sims: 600
   c_puct: 1.8
   dirichlet_alpha: 0.2
@@ -9,7 +11,9 @@ mcts:
   batch_size: 96
 selfplay:
   games_per_iteration: 2000
-  workers_per_gpu: 4          # 8 GPU × 4 = 32 个 selfplay 进程；CPU 核少于 64 时调低
+  # 瓶颈在 CPU 端 Python MCTS 而非 GPU，故该值应随 vCPU 数（而非 GPU 数）调整：
+  # 32 vCPU→4，96+ vCPU→8~12。8 GPU × 4 = 32 个 selfplay 进程；CPU 核少于 64 时调低。
+  workers_per_gpu: 4
   games_per_worker: 16
   max_game_plies: 400
   value_blend_init: 0.5

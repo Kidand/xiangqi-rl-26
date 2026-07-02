@@ -79,6 +79,7 @@ class _ModelState:
     filters: int = 0
     params: int = 0
     history_steps: int = 2
+    default_sims: int = 400  # Default MCTS simulations, set from CLI --sims
 
 _model_state = _ModelState()
 
@@ -304,7 +305,7 @@ class NewGameRequest(BaseModel):
     mode: str = "hvh"           # "hvh" | "hva" | "ava"
     human_side: str = "red"     # "red" | "black"
     fen: Optional[str] = None
-    sims: int = 400
+    sims: Optional[int] = None  # 若 None，使用服务器默认值（从 CLI --sims 设置）
 
 
 class MoveRequest(BaseModel):
@@ -342,13 +343,16 @@ async def new_game(req: NewGameRequest):
     except ValueError as e:
         raise HTTPException(400, detail={"error": f"非法 FEN: {e}"})
 
+    # 使用请求中的 sims，若未指定则使用服务器默认值（从 CLI --sims 设置）
+    sims = req.sims if req.sims is not None else _model_state.default_sims
+
     game_id = _new_game_id()
     game = _GameData(
         game_id=game_id,
         board=board,
         mode=mode,
         human_side=req.human_side,
-        sims=req.sims,
+        sims=sims,
     )
     _games[game_id] = game
 
@@ -841,6 +845,9 @@ def main(argv=None):
 
     # 设置设备
     _model_state.device = args.device
+
+    # 设置默认 MCTS 模拟次数（从 CLI --sims 参数）
+    _model_state.default_sims = args.sims
 
     # 启动时加载模型（如果指定）
     if args.model:

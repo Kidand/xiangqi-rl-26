@@ -34,7 +34,7 @@ from xiangqi.constants import (
     move_to_action,
 )
 from rl.config import MCTSConfig
-from rl.encoding import encode_board, move_to_policy_index
+from rl.encoding import encode_board
 
 __all__ = ["SearchTree", "search"]
 
@@ -205,7 +205,9 @@ class SearchTree:
                     self._pop_n(len(path))
                     return ("collision", None)
 
-                result = board.result()
+                # 单次生成合法着法，既用于终局判定又用于展开（消除双次 legal_moves）。
+                legal = board.legal_moves()
+                result, _term = board.status(legal)
                 if result is not None:
                     node.terminal = True
                     node.terminal_value = _terminal_value(result, board.side_to_move)
@@ -215,7 +217,6 @@ class SearchTree:
 
                 # 待展开叶子：记录合法着法与视角，编码当前局面，标记挂起。
                 node.pending = True
-                legal = board.legal_moves()
                 side = board.side_to_move
                 state = encode_board(board, self._history_steps)
                 self._pop_n(len(path))
@@ -294,12 +295,17 @@ class SearchTree:
             probs = policy_probs[k]
 
             n = len(legal)
-            # 按当前走子方视角取每个合法着法的先验。
-            idxs = np.fromiter(
-                (move_to_policy_index(m, side) for m in legal),
-                dtype=np.int64,
-                count=n,
-            )
+            # 按当前走子方视角取每个合法着法的先验（向量化 move_to_policy_index）。
+            # legal 拆成 from/to 两列：action = from*90 + to；BLACK 视角需 flip_action，
+            # 即 flip_sq(from)*90 + flip_sq(to) = (89-from)*90 + (89-to)。与
+            # rl.encoding.move_to_policy_index 逐项等价。
+            lm = np.asarray(legal, dtype=np.int64).reshape(n, 2)
+            frm = lm[:, 0]
+            to = lm[:, 1]
+            if side == BLACK:
+                idxs = (89 - frm) * 90 + (89 - to)
+            else:
+                idxs = frm * 90 + to
             prior = probs[idxs].astype(np.float64)
             s = float(prior.sum())
             if s > 1e-12:
@@ -309,8 +315,7 @@ class SearchTree:
 
             # 根节点 Dirichlet 噪声（仅训练时）。
             if node is self._root and self._add_noise and n > 0:
-                noise = self._rng.dirichlet([self._alpha] * n)
-                prior = (1.0 - self._eps) * prior + self._eps * noise
+                prior = self._mix_noise(prior)
 
             node.child_moves = list(legal)
             node.child_nodes = [None] * n
@@ -322,6 +327,14 @@ class SearchTree:
             node.pending = False
 
             self._backup(path, float(values[k]))
+
+    def _mix_noise(self, prior: np.ndarray) -> np.ndarray:
+        """把 Dirichlet 噪声混入先验（float64 输入，返回 float64）。"""
+        n = len(prior)
+        if n <= 0:
+            return prior
+        noise = self._rng.dirichlet([self._alpha] * n)
+        return (1.0 - self._eps) * prior + self._eps * noise
 
     # ------------------------------------------------------------ 树复用
     def advance(self, move) -> None:
@@ -338,6 +351,12 @@ class SearchTree:
         self._board.push(move)
         if reuse is not None and (reuse.expanded or reuse.terminal):
             self._root = reuse
+            # 树复用后新根需重新混入 Dirichlet 噪声（DESIGN §8：根节点每步加噪）。
+            # 该子节点是在非根位置展开的，先验里尚无噪声，此处补上。
+            if self._add_noise and reuse.expanded and not reuse.terminal:
+                reuse.child_P = self._mix_noise(
+                    reuse.child_P.astype(np.float64)
+                ).astype(np.float32)
         else:
             self._root = _Node()
 

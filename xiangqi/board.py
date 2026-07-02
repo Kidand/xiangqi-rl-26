@@ -120,7 +120,8 @@ class Board:
 
     def _make_snapshot(self) -> bytes:
         # snapshot[sq] = piece_at(sq) + 7（0..14，空=7）
-        return bytes(p + 7 for p in self.squares)
+        # 列表推导比生成器表达式喂给 bytes() 更快（~1.8x，语义不变）。
+        return bytes([p + 7 for p in self.squares])
 
     def zobrist(self) -> int:
         return self._zobrist
@@ -477,8 +478,16 @@ class Board:
     def _winner_result(winner: int) -> str:
         return "1-0" if winner == RED else "0-1"
 
-    def _status(self) -> tuple[str | None, str | None]:
-        moves = self.legal_moves()
+    def status(self, legal: list[tuple[int, int]] | None = None) -> tuple[str | None, str | None]:
+        """终局判定：返回 (result, termination)，进行中为 (None, None)。
+
+        判定优先级（不可变）：将死 / 困毙（即负）> 重复（长将判负 / 否则和）
+        > 120 半回合无吃子 > 超 max_plies。与旧 ``_status`` 逐条一致。
+
+        ``legal`` 可传入预先算好的 ``legal_moves()`` 结果以避免重复生成（MCTS 叶子
+        处已生成一次）；为 None 时内部自行调用，语义完全相同。
+        """
+        moves = self.legal_moves() if legal is None else legal
         if not moves:
             # 无合法着法：将死或困毙，走子方均判负（困毙即负）。
             winner = -self.side_to_move
@@ -500,10 +509,14 @@ class Board:
         return None, None
 
     def result(self) -> str | None:
-        return self._status()[0]
+        return self.status()[0]
 
     def termination(self) -> str | None:
-        return self._status()[1]
+        return self.status()[1]
+
+    def result_and_termination(self) -> tuple[str | None, str | None]:
+        """一次返回 (result, termination)，避免 result()+termination() 双次判定。"""
+        return self.status()
 
     # ------------------------------------------------------------ 杂项
     def __repr__(self) -> str:

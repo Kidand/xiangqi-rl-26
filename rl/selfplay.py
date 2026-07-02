@@ -225,7 +225,8 @@ def _record_sample(
     slot.sample_pol_idx.append(pol_idx)
     slot.sample_pol_prob.append(pol_prob)
     slot.sample_sides.append(board.side_to_move)
-    slot.sample_mat_red.append(material_score(board.fen()))
+    # 直接传 Board 对象走 material_score 快路径（遍历 squares，免 fen() 字符串往返）。
+    slot.sample_mat_red.append(material_score(board))
 
 
 class _WorkerEngine:
@@ -264,10 +265,10 @@ class _WorkerEngine:
             if slot.state == "finished":
                 return
             board = slot.board
-            res = board.result()
+            res, term = board.result_and_termination()
             if res is not None:
                 slot.result = res
-                slot.termination = board.termination()
+                slot.termination = term
                 slot.state = "finished"
                 return
             # 一步杀捷径：直接走将死着，π 记 one-hot，不进搜索。

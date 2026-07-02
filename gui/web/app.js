@@ -57,6 +57,8 @@ let _audioCtx = null;
 
 function getAudioCtx() {
   if (!_audioCtx) _audioCtx = new AudioCtx();
+  // 浏览器策略：非用户手势创建的 AudioContext 初始为 suspended，需显式 resume。
+  if (_audioCtx.state === "suspended") _audioCtx.resume();
   return _audioCtx;
 }
 
@@ -181,20 +183,14 @@ function applyGameState(gs, withSound = true) {
     boardObj.setInCheck(null);
   }
 
-  // 音效
+  // 音效：通过 move_history 最后一条的中文着法判断是否吃子（含"吃"字）
   if (withSound && App.soundEnabled && gs.last_move) {
-    const parsed = parseFen(gs.fen);
-    // 判断是否吃子：对比上一步落点
-    const toSq = ucciToSq(gs.last_move.slice(2, 4));
-    // 简单判断：若当前位置有棋子则可能发生了吃子（实际上落子后目标格有己方棋子）
-    // 我们通过吃子历史来检测：检查 move_history 最后一条
     const hist = gs.move_history || [];
     const lastEntry = hist[hist.length - 1];
-    // 无法直接获知是否吃子，改为在 move_history 的 chinese 中判断（含"吃"字）
     if (lastEntry && lastEntry.chinese && lastEntry.chinese.includes("吃")) {
-      if (App.soundEnabled) playCaptureSound();
+      playCaptureSound();
     } else {
-      if (App.soundEnabled) playMoveSound();
+      playMoveSound();
     }
   }
 
@@ -279,13 +275,13 @@ function updateEvalBar(value) {
     fill.style.height = "50%";
     return;
   }
-  // value ∈ [-1,1]，当前走子方视角 -> 转为红方视角
-  // 若轮到黑方走，value 是黑方期望值，需取反得到红方期望值
-  // 但 API 不直接告知 eval.value 的视角 —— 根据 DESIGN.md §13，
-  // eval.value 在 GameState 中随附，联合 side_to_move 解读。
-  // 根据约定（评估条显示红方胜率视角），我们在 app.js 记录当前走子方然后转换：
+  // value ∈ [-1,1]，MCTS root_val 是 AI 走子前的当前走子方（AI 方）视角。
+  // AI 走子后 side_to_move 已切换到对手（人类），所以：
+  //   - AI=黑 → 走后 side_to_move="red"；value 是黑方期望值 → 红方 POV = -value
+  //   - AI=红 → 走后 side_to_move="black"；value 是红方期望值 → 红方 POV = +value
+  // 故：当 side_to_move 为 "red"（AI 刚以黑方走完）时取反；为 "black" 时不取反。
   let redPov = value;
-  if (App.gameState && App.gameState.side_to_move === "black") {
+  if (App.gameState && App.gameState.side_to_move === "red") {
     redPov = -value;
   }
   // 映射到 0..1 百分比（红在底部）
@@ -404,6 +400,10 @@ async function startNewGame() {
   closeNewGameDialog();
   stopAva();
   stopReplay();
+  // 清空复盘数据，防止方向键仍然导航旧复盘
+  App.replayFens = [];
+  App.replayMoves = [];
+  App.replayChinese = [];
 
   const body = { mode, human_side: humanSide, sims };
   if (customFen) body.fen = customFen;
