@@ -1,0 +1,25 @@
+[project]
+name = "xiangqi-rl"
+version = "0.1.0"
+description = "AlphaZero-style Xiangqi (Chinese Chess) reinforcement learning: self-play training + web GUI"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "torch>=2.4",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "tensorboard>=2.16",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "onnx>=1.16", "onnxruntime>=1.18"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = ["slow: long-running tests (perft depth>=3, e2e)"]
+
+[tool.setuptools.packages.find]
+include = ["xiangqi*", "rl*", "gui*"]

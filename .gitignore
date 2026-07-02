@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+checkpoints/
+logs/
+records/
+!records/.gitkeep
+*.npz
+*.onnx
+*.pt
+.pytest_cache/
+.DS_Store

@@ -1,0 +1,20 @@
+# 笔记本 CPU 小规模试训（验证收敛趋势用，棋力有限）
+model: {blocks: 5, filters: 64, history_steps: 2}
+mcts: {num_sims: 120, batch_size: 16}
+selfplay:
+  games_per_iteration: 40
+  workers_per_gpu: 1
+  games_per_worker: 8
+  max_game_plies: 200
+  resign_start_iter: 5
+train:
+  device: cpu
+  num_gpus: 0
+  batch_size: 256
+  train_steps_per_iteration: 200
+  buffer_window: 200000
+  min_buffer_to_train: 5000
+  total_iterations: 50
+  amp: false
+arena: {arena_games: 10, arena_sims: 60}
+log: {log_interval_sec: 15.0, train_log_interval: 20}

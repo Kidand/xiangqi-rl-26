@@ -1,0 +1,21 @@
+# CPU 冒烟测试：几分钟内跑通完整流水线，验证代码正确性（不追求棋力）
+model: {blocks: 2, filters: 32, history_steps: 2}
+mcts: {num_sims: 24, batch_size: 8, temp_moves: 8}
+selfplay:
+  games_per_iteration: 4
+  workers_per_gpu: 1
+  games_per_worker: 2
+  max_game_plies: 60
+  resign_enabled: false
+  value_blend_iters: 2
+train:
+  device: cpu
+  num_gpus: 0
+  batch_size: 64
+  train_steps_per_iteration: 20
+  buffer_window: 50000
+  min_buffer_to_train: 64
+  total_iterations: 2
+  amp: false
+arena: {arena_games: 2, arena_sims: 16}
+log: {log_interval_sec: 5.0, train_log_interval: 5, tensorboard: false}

@@ -1,0 +1,30 @@
+# 云端 8×H100 正式训练预设（CUDA 12.8）
+# 预计吞吐：~2000-5000 局/小时（视 CPU 核数），建议先跑 3-5 个迭代观察日志再调参
+model: {blocks: 10, filters: 128, history_steps: 2}
+mcts:
+  num_sims: 600
+  c_puct: 1.8
+  dirichlet_alpha: 0.2
+  temp_moves: 24
+  batch_size: 96
+selfplay:
+  games_per_iteration: 2000
+  workers_per_gpu: 4          # 8 GPU × 4 = 32 个 selfplay 进程；CPU 核少于 64 时调低
+  games_per_worker: 16
+  max_game_plies: 400
+  value_blend_init: 0.5
+  value_blend_iters: 30
+  draw_penalty: -0.1
+  resign_start_iter: 10
+train:
+  device: cuda
+  num_gpus: 8
+  batch_size: 4096
+  train_steps_per_iteration: 1000
+  buffer_window: 1500000
+  min_buffer_to_train: 100000
+  lr: 0.001
+  total_iterations: 300
+  amp: true
+arena: {arena_games: 40, arena_sims: 200, gate_threshold: 0.55}
+log: {log_interval_sec: 30.0, train_log_interval: 100, tensorboard: true}
