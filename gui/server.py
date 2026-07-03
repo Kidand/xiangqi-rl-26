@@ -276,6 +276,81 @@ def _apply_move(game: _GameData, mv: tuple) -> None:
 
 
 # ===========================================================================
+# 后台实时日志：AI 对局势的判断（打印到 stdout，供跑 gui.server 的终端观察）
+# ===========================================================================
+def _value_to_red_pct(value_mover: float, side_mover: int) -> float:
+    """走子方视角 value ∈[-1,1] → 红方胜率百分比 ∈[0,100]。
+
+    先把走子方视角转为红方视角（黑方走子取负），再线性映射到 [0,100]。
+    """
+    value_red = value_mover if side_mover == RED else -value_mover
+    return (value_red + 1.0) / 2.0 * 100.0
+
+
+def _log_eval(
+    game: _GameData,
+    tag: str,
+    move_uci: Optional[str],
+    chinese: Optional[str],
+    value_mover: float,
+    side_mover: int,
+    sims: int,
+    elapsed_ms: float,
+    top_moves: Optional[list],
+) -> None:
+    """打印一行 AI 判断日志到 stdout（终端实时可见），失败不得影响接口。
+
+    格式示例：
+    [14:32:07] [对局 3f2a | 第12手] AI落子 炮二平五 | 红方胜率 63.2% (value=+0.264)
+               | sims 400 | 耗时 1.8s | 备选: 马八进七 21% 车九平八 11%
+    """
+    try:
+        pct = _value_to_red_pct(value_mover, side_mover)
+        ts = time.strftime("%H:%M:%S")
+        gid_short = game.game_id[:4]
+        ply = len(game.move_history)
+        move_part = f" {chinese}" if move_uci and chinese else ""
+        elapsed_s = elapsed_ms / 1000.0
+
+        # 备选：top_moves 剔除已落子（若有）后取前 3
+        alts = [tm for tm in (top_moves or []) if tm.get("move") != move_uci][:3]
+        alt_str = " ".join(f"{tm['chinese']} {tm['prob'] * 100:.0f}%" for tm in alts)
+
+        line = (
+            f"[{ts}] [对局 {gid_short} | 第{ply}手] {tag}{move_part} | "
+            f"红方胜率 {pct:.1f}% (value={value_mover:+.3f}) | "
+            f"sims {sims} | 耗时 {elapsed_s:.1f}s"
+        )
+        if alt_str:
+            line += f" | 备选: {alt_str}"
+        print(line, flush=True)
+    except Exception:
+        pass
+
+
+def _log_game_over(game: _GameData) -> None:
+    """对局结束时补一行结果日志（认输/自然终局均覆盖），失败不得影响接口。"""
+    if not _game_is_over(game):
+        return
+    try:
+        ts = time.strftime("%H:%M:%S")
+        gid_short = game.game_id[:4]
+        if game.resigned:
+            result = game.resign_result
+            termination = "resign"
+        else:
+            result = game.board.result()
+            termination = game.board.termination()
+        n = len(game.move_history)
+        print(
+            f"[{ts}] [对局 {gid_short}] 对局结束 result={result} termination={termination} 共{n}手",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+# ===========================================================================
 # FastAPI 应用
 # ===========================================================================
 app = FastAPI(title="Xiangqi GUI Server", version="1.0.0")
@@ -364,18 +439,26 @@ async def new_game(req: NewGameRequest):
         ai_is_red = (req.human_side == "black")
         ai_side = RED if ai_is_red else BLACK
         if game.board.side_to_move == ai_side:
+            t0 = time.monotonic()
             visits, root_val = await asyncio.to_thread(
                 _run_mcts_sync, game.board, game.sims
             )
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
             ai_mv = _pick_best_move(game.board, visits)
             if ai_mv:
                 ai_move_str = move_to_uci(ai_mv)
+                top_moves = _visits_to_top_moves(game.board, visits)
                 eval_info = {
                     "value": float(root_val),   # 当前走子方视角
-                    "top_moves": _visits_to_top_moves(game.board, visits),
+                    "top_moves": top_moves,
                 }
                 _apply_move(game, ai_mv)
+                _log_eval(
+                    game, "AI落子", ai_move_str, game.move_history[-1].chinese,
+                    float(root_val), ai_side, game.sims, elapsed_ms, top_moves,
+                )
 
+    _log_game_over(game)
     return _build_game_state(game, ai_move_str=ai_move_str, eval_info=eval_info)
 
 
@@ -424,18 +507,27 @@ async def make_move(game_id: str, req: MoveRequest):
         human_side_int = RED if game.human_side == "red" else BLACK
         # 轮到 AI 走
         if game.board.side_to_move != human_side_int:
+            ai_side = game.board.side_to_move
+            t0 = time.monotonic()
             visits, root_val = await asyncio.to_thread(
                 _run_mcts_sync, game.board, game.sims
             )
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
             ai_mv = _pick_best_move(game.board, visits)
             if ai_mv:
                 ai_move_str = move_to_uci(ai_mv)
+                top_moves = _visits_to_top_moves(game.board, visits)
                 eval_info = {
                     "value": float(root_val),
-                    "top_moves": _visits_to_top_moves(game.board, visits),
+                    "top_moves": top_moves,
                 }
                 _apply_move(game, ai_mv)
+                _log_eval(
+                    game, "AI落子", ai_move_str, game.move_history[-1].chinese,
+                    float(root_val), ai_side, game.sims, elapsed_ms, top_moves,
+                )
 
+    _log_game_over(game)
     return _build_game_state(game, ai_move_str=ai_move_str, eval_info=eval_info)
 
 
@@ -456,17 +548,27 @@ async def ai_move(game_id: str, req: AiMoveRequest):
 
     sims = req.sims if req.sims is not None else game.sims
 
+    ai_side = game.board.side_to_move
+    t0 = time.monotonic()
     visits, root_val = await asyncio.to_thread(
         _run_mcts_sync, game.board, sims
     )
+    elapsed_ms = (time.monotonic() - t0) * 1000.0
     ai_mv = _pick_best_move(game.board, visits)
+    top_moves = _visits_to_top_moves(game.board, visits)
     eval_info = {
         "value": float(root_val),
-        "top_moves": _visits_to_top_moves(game.board, visits),
+        "top_moves": top_moves,
     }
     if ai_mv:
+        ai_move_str = move_to_uci(ai_mv)
         _apply_move(game, ai_mv)
+        _log_eval(
+            game, "AI落子", ai_move_str, game.move_history[-1].chinese,
+            float(root_val), ai_side, sims, elapsed_ms, top_moves,
+        )
 
+    _log_game_over(game)
     return _build_game_state(game, eval_info=eval_info)
 
 
@@ -517,9 +619,12 @@ async def hint(game_id: str, sims: int = Query(default=400)):
     if _game_is_over(game):
         raise HTTPException(400, detail={"error": "对局已结束"})
 
+    side_mover = game.board.side_to_move
+    t0 = time.monotonic()
     visits, root_val = await asyncio.to_thread(
         _run_mcts_sync, game.board, sims
     )
+    elapsed_ms = (time.monotonic() - t0) * 1000.0
     best = _pick_best_move(game.board, visits)
     if best is None:
         raise HTTPException(400, detail={"error": "无合法着法"})
@@ -531,6 +636,10 @@ async def hint(game_id: str, sims: int = Query(default=400)):
         best_cn = best_uci
 
     top_moves = _visits_to_top_moves(game.board, visits)
+    _log_eval(
+        game, "提示", best_uci, best_cn,
+        float(root_val), side_mover, sims, elapsed_ms, top_moves,
+    )
 
     return {
         "move": best_uci,
@@ -614,6 +723,7 @@ async def resign(game_id: str):
     game.resigned = True
     game.resign_result = "1-0" if winner == RED else "0-1"
 
+    _log_game_over(game)
     return _build_game_state(game)
 
 

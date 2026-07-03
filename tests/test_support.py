@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import csv
+import logging
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -44,10 +46,12 @@ from rl.heuristics import (
     material_score,
     opening_temperature,
 )
+from rl.config import ModelConfig
 from rl.logger import CSV_COLUMNS, TrainLogger
+from rl.model import create_model, save_checkpoint
 from rl.replay_buffer import ReplayBuffer
 from rl.selfplay import sample_action_from_counts
-from rl.train import resolve_train_steps
+from rl.train import load_latest_checkpoint, resolve_train_steps
 
 
 # ======================================================================
@@ -323,6 +327,124 @@ class TestReplayBufferSaveLoad:
         buf.save(save_dir)
         buf2 = ReplayBuffer.load(save_dir)
         assert len(buf2) == 0
+
+
+# ======================================================================
+# ReplayBuffer 原子写盘 + 容错加载（被 Ctrl-C 打断的各窗口可恢复）
+# ======================================================================
+
+def _assert_buf_data_equal(a: ReplayBuffer, b: ReplayBuffer) -> None:
+    """比较两个 buffer 的有效数据（size/pos/states/values/稀疏策略）完全一致。"""
+    assert len(a) == len(b)
+    assert a._pos == b._pos
+    idx = a._ordered_valid_indices()
+    np.testing.assert_array_equal(a._states[idx], b._states[idx])
+    np.testing.assert_array_equal(a._values[idx], b._values[idx])
+    for si in idx:
+        np.testing.assert_array_equal(a._pol_indices[si], b._pol_indices[si])
+        np.testing.assert_allclose(a._pol_probs[si], b._pol_probs[si], atol=1e-6)
+
+
+class TestReplayBufferAtomicSave:
+    def test_save_leaves_no_tmp_or_old(self, tmp_path):
+        """正常保存后不残留 <dir>.tmp / <dir>.old（换名完成并清理）。"""
+        buf = ReplayBuffer(capacity=50, state_shape=(3, 10, 9))
+        states, sp, values = _make_game(20, state_shape=(3, 10, 9))
+        buf.add_game(states, sp, values)
+
+        d = tmp_path / "buf"
+        buf.save(d)
+        buf.save(d)  # 覆盖再存一次
+
+        assert d.exists()
+        assert not (tmp_path / "buf.tmp").exists()
+        assert not (tmp_path / "buf.old").exists()
+
+        buf2 = ReplayBuffer.load(d)
+        _assert_buf_data_equal(buf, buf2)
+
+    def test_roundtrip_still_passes_after_atomic(self, tmp_path):
+        """原子化后普通 save/load 往返数据仍 bit-exact 一致（既有契约不回归）。"""
+        buf = ReplayBuffer(capacity=40, state_shape=(4, 10, 9))
+        states, sp, values = _make_game(25, state_shape=(4, 10, 9))
+        buf.add_game(states, sp, values)
+        d = tmp_path / "rt"
+        buf.save(d)
+        _assert_buf_data_equal(buf, ReplayBuffer.load(d))
+
+    def test_truncated_shard_falls_back_to_old(self, tmp_path, caplog):
+        """主目录分片被截断 → load 回退 <dir>.old，且数据等于上一代。"""
+        state_shape = (3, 10, 9)
+        # 上一代（gen1）与当前代（gen2）内容不同。
+        buf_gen1 = ReplayBuffer(capacity=50, state_shape=state_shape)
+        buf_gen1.add_game(*_make_game(12, state_shape=state_shape))
+        buf_gen2 = ReplayBuffer(capacity=50, state_shape=state_shape)
+        buf_gen2.add_game(*_make_game(18, state_shape=state_shape))
+
+        main = tmp_path / "buf"
+        old = tmp_path / "buf.old"
+        # 先写 gen2 到主目录，再写 gen1 到 .old（避免 save 清掉 .old）。
+        buf_gen2.save(main)
+        buf_gen1.save(old)
+        assert main.exists() and old.exists()
+
+        # 截断主目录的状态分片（只保留前 100 字节，制造解压错误）。
+        shard = main / "states_0000.npz"
+        shard.write_bytes(shard.read_bytes()[:100])
+
+        with caplog.at_level(logging.WARNING):
+            loaded = ReplayBuffer.load(main)
+
+        # 回退到 .old（gen1）。
+        _assert_buf_data_equal(buf_gen1, loaded)
+        assert any("回退" in r.message or "回退" in r.getMessage()
+                   for r in caplog.records), "应打出回退 WARN"
+
+    def test_missing_dir_uses_old(self, tmp_path):
+        """rename 中间态：主目录缺失、.old 完整 → load 用 .old。"""
+        state_shape = (2, 10, 9)
+        buf_gen1 = ReplayBuffer(capacity=30, state_shape=state_shape)
+        buf_gen1.add_game(*_make_game(10, state_shape=state_shape))
+
+        main = tmp_path / "buf"
+        old = tmp_path / "buf.old"
+        buf_gen1.save(main)
+        # 模拟两次 rename 之间被杀：dir 已改名成 .old，新 tmp 尚未就位。
+        os.rename(main, old)
+        assert not main.exists() and old.exists()
+
+        loaded = ReplayBuffer.load(main)
+        _assert_buf_data_equal(buf_gen1, loaded)
+
+    def test_both_corrupt_rebuilds_when_shape_given(self, tmp_path, caplog):
+        """主目录与 .old 都不可用，但给了 capacity/state_shape → 新建空 buffer 并 WARN。"""
+        main = tmp_path / "buf"  # 不存在
+        with caplog.at_level(logging.WARNING):
+            loaded = ReplayBuffer.load(main, capacity=64, state_shape=(2, 10, 9))
+        assert len(loaded) == 0
+        assert loaded.capacity == 64
+        assert loaded.state_shape == (2, 10, 9)
+
+    def test_both_corrupt_raises_without_shape(self, tmp_path):
+        """主目录与 .old 都不可用且未给回退形状 → 抛异常（无法凭空重建）。"""
+        main = tmp_path / "nope"
+        with pytest.raises(Exception):
+            ReplayBuffer.load(main)
+
+    def test_load_cleans_leftover_tmp(self, tmp_path):
+        """加载成功后清理遗留的 <dir>.tmp（上次被打断的半成品）。"""
+        state_shape = (2, 10, 9)
+        buf = ReplayBuffer(capacity=20, state_shape=state_shape)
+        buf.add_game(*_make_game(8, state_shape=state_shape))
+        main = tmp_path / "buf"
+        buf.save(main)
+        # 手工制造遗留 .tmp。
+        leftover = tmp_path / "buf.tmp"
+        leftover.mkdir()
+        (leftover / "garbage").write_text("x", encoding="utf-8")
+
+        ReplayBuffer.load(main)
+        assert not leftover.exists(), "load 后应清理遗留 .tmp"
 
 
 # ======================================================================
@@ -935,3 +1057,51 @@ class TestResolveTrainSteps:
         # ceil(100_000*2/1000)=200 ; ceil(100_000*4/1000)=400
         assert resolve_train_steps(100_000, cfg1) == 200
         assert resolve_train_steps(100_000, cfg2) == 400
+
+
+# ======================================================================
+# load_latest_checkpoint：从新到旧逐个尝试，跳过被 Ctrl-C 截断的检查点
+# ======================================================================
+
+class TestLoadLatestCheckpoint:
+    def _save_ckpt(self, ckpt_dir: Path, iteration: int) -> Path:
+        cfg = ModelConfig(blocks=2, filters=16, se=False, history_steps=2)
+        model = create_model(cfg)
+        path = ckpt_dir / f"iter_{iteration:04d}.pt"
+        save_checkpoint(model, cfg, path, iteration=iteration)
+        return path
+
+    def test_none_when_no_checkpoints(self, tmp_path):
+        """目录中无 iter_*.pt → 返回 (None, None)。"""
+        ckpt, path = load_latest_checkpoint(tmp_path, "cpu")
+        assert ckpt is None and path is None
+
+    def test_returns_latest_good(self, tmp_path):
+        """两份均完好时返回迭代号最大的一份。"""
+        self._save_ckpt(tmp_path, 1)
+        self._save_ckpt(tmp_path, 3)
+        ckpt, path = load_latest_checkpoint(tmp_path, "cpu")
+        assert path.name == "iter_0003.pt"
+        assert ckpt["iteration"] == 3
+
+    def test_skips_corrupt_latest_and_warns(self, tmp_path, caplog):
+        """iter_0001 完好、iter_0002 写入垃圾字节 → 返回 iter_0001 并 WARN。"""
+        self._save_ckpt(tmp_path, 1)
+        bad = tmp_path / "iter_0002.pt"
+        bad.write_bytes(b"\x00\x01garbage-not-a-torch-file\xff\xfe")
+
+        with caplog.at_level(logging.WARNING, logger="rl.train"):
+            ckpt, path = load_latest_checkpoint(tmp_path, "cpu")
+
+        assert path.name == "iter_0001.pt", "损坏的最新检查点应被跳过"
+        assert ckpt["iteration"] == 1
+        assert any("损坏" in r.getMessage() for r in caplog.records), (
+            "应打出 iter_XXXX.pt 损坏 WARN"
+        )
+
+    def test_all_corrupt_raises(self, tmp_path):
+        """有文件但全部损坏 → 抛 RuntimeError。"""
+        (tmp_path / "iter_0001.pt").write_bytes(b"junk-1")
+        (tmp_path / "iter_0002.pt").write_bytes(b"junk-2")
+        with pytest.raises(RuntimeError, match="均损坏"):
+            load_latest_checkpoint(tmp_path, "cpu")

@@ -24,12 +24,13 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import random
 import time
 from pathlib import Path
 from queue import Empty
-from typing import Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -42,7 +43,14 @@ from rl.replay_buffer import ReplayBuffer
 from rl.inference_server import create_shared_buffers, eval_server_proc
 from rl.selfplay import num_eval_servers, num_selfplay_workers, selfplay_worker
 
-__all__ = ["run_training", "main", "resolve_train_steps"]
+__all__ = [
+    "run_training",
+    "main",
+    "resolve_train_steps",
+    "load_latest_checkpoint",
+]
+
+_LOG = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -147,18 +155,53 @@ def _buffer_dir(ckpt_dir: Path) -> Path:
     return ckpt_dir / "buffer"
 
 
-def _find_latest_iter(ckpt_dir: Path) -> Optional[int]:
-    """返回最新 iter_XXXX.pt 的迭代号，无则 None。"""
-    best = None
+def load_latest_checkpoint(
+    ckpt_dir: "str | Path",
+    device: str = "cpu",
+    warn: Optional[Callable[[str], None]] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Path]]:
+    """按迭代号从新到旧逐个尝试加载 iter_XXXX.pt，返回首个可用的 (ckpt_dict, path)。
+
+    容错：某个检查点 torch.load 失败（如迭代末保存时被 Ctrl-C 截断），打 WARN
+    「iter_XXXX.pt 损坏，回退上一个」后继续尝试更旧的一个。
+
+    返回
+    ----
+    - 无任何 iter_*.pt：``(None, None)``（交由调用方决定从头训练）。
+    - 至少一个可加载：``(ckpt_dict, path)``，其中 path 为该检查点文件路径。
+    - 有文件但全部损坏：抛 RuntimeError。
+    """
+    import torch
+
+    if warn is None:
+        warn = _LOG.warning
+    ckpt_dir = Path(ckpt_dir)
+
+    # 收集 (iter_num, path)，按迭代号降序。
+    cands: list[Tuple[int, Path]] = []
     for p in ckpt_dir.glob("iter_*.pt"):
-        stem = p.stem  # iter_0007
         try:
-            n = int(stem.split("_")[1])
+            n = int(p.stem.split("_")[1])
         except (IndexError, ValueError):
             continue
-        if best is None or n > best:
-            best = n
-    return best
+        cands.append((n, p))
+    cands.sort(key=lambda x: x[0], reverse=True)
+
+    if not cands:
+        return None, None
+
+    for n, p in cands:
+        try:
+            ckpt = torch.load(
+                str(p), map_location=torch.device(device), weights_only=False
+            )
+            return ckpt, p
+        except Exception as e:  # 截断/损坏 → 回退更旧的一个
+            warn(f"iter_{n:04d}.pt 损坏，回退上一个: {e}")
+
+    raise RuntimeError(
+        f"所有 iter_*.pt 检查点均损坏（共 {len(cands)} 个），无法续训：{ckpt_dir}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -557,13 +600,10 @@ def run_training(cfg: Config, resume: bool = False) -> Dict[str, object]:
         return path
 
     if resume:
-        latest = _find_latest_iter(ckpt_dir)
-        if latest is not None:
-            ckpt = torch.load(
-                str(_iter_ckpt_path(ckpt_dir, latest)),
-                map_location=torch.device(device),
-                weights_only=False,
-            )
+        # 从新到旧逐个尝试，跳过被 Ctrl-C 截断/损坏的检查点（全坏才报错）。
+        ckpt, ckpt_path = load_latest_checkpoint(ckpt_dir, device, warn=logger.warn)
+        if ckpt is not None and ckpt_path is not None:
+            latest = int(ckpt_path.stem.split("_")[1])
             model.load_state_dict(ckpt["model_state"])
             if ckpt.get("optimizer_state") is not None:
                 try:
@@ -571,16 +611,17 @@ def run_training(cfg: Config, resume: bool = False) -> Dict[str, object]:
                 except Exception as e:  # 优化器结构变更时容错
                     logger.warn(f"optimizer 状态加载失败，重置: {e}")
             start_iter = latest + 1
-            logger.info(f"--resume：从 iter_{latest:04d}.pt 续训，start_iter={start_iter}")
+            logger.info(f"--resume：从 {ckpt_path.name} 续训，start_iter={start_iter}")
         else:
             logger.warn("--resume 但未找到 iter_XXXX.pt，从头开始")
-        if buf_dir.exists() and (buf_dir / "meta.json").exists():
-            try:
-                buffer = ReplayBuffer.load(buf_dir)
-                logger.info(f"buffer 续载，size={len(buffer)}")
-            except Exception as e:
-                logger.warn(f"buffer 加载失败，新建: {e}")
-                buffer = ReplayBuffer(int(cfg.train.buffer_window), state_shape)
+        # buffer 容错加载：主目录损坏时回退 <buffer>.old，都不可用则新建空 buffer。
+        if buf_dir.exists() or (buf_dir.with_name(buf_dir.name + ".old")).exists():
+            buffer = ReplayBuffer.load(
+                buf_dir,
+                capacity=int(cfg.train.buffer_window),
+                state_shape=state_shape,
+            )
+            logger.info(f"buffer 续载，size={len(buffer)}")
         else:
             buffer = ReplayBuffer(int(cfg.train.buffer_window), state_shape)
         if not best_path.exists():

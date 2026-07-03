@@ -181,6 +181,62 @@ class TestCheckpointRoundtrip:
 
 
 # ============================================================
+# 检查点原子写盘（写 .tmp 后 os.replace，覆盖已存在文件、无残留）
+# ============================================================
+
+class TestCheckpointAtomicSave:
+    def test_overwrite_existing_no_tmp_residue(self, tmp_path):
+        """覆盖已存在的 checkpoint 成功，且不留下 .tmp 残留。
+
+        第一次保存 iteration=1，第二次覆盖同一路径 iteration=2；加载后应读到第二次的
+        iteration，且目录中没有 ``*.tmp`` 文件（os.replace 已把 tmp 换名为正式文件）。
+        """
+        cfg = _SMALL_CFG
+        model = create_model(cfg).eval()
+        ckpt_path = tmp_path / "best.pt"
+
+        save_checkpoint(model, cfg, ckpt_path, iteration=1)
+        assert ckpt_path.exists()
+        save_checkpoint(model, cfg, ckpt_path, iteration=2)  # 覆盖
+
+        _, ckpt = load_checkpoint(ckpt_path, device="cpu")
+        assert ckpt["iteration"] == 2, "覆盖后应读到第二次写入的 iteration"
+
+        # 无 .tmp 残留
+        residue = list(tmp_path.glob("*.tmp"))
+        assert residue == [], f"不应残留 .tmp 文件：{residue}"
+
+    def test_existing_file_intact_when_save_interrupted(self, tmp_path, monkeypatch):
+        """写 .tmp 途中崩溃：原有 checkpoint 完整不被破坏（原子性核心保证）。
+
+        先正常保存 iteration=1；再让 torch.save 抛异常模拟被 Ctrl-C 打断，确认：
+        （a）原文件仍可加载且仍是 iteration=1（未被截断）；（b）不残留可被误当正式
+        文件的半成品（残留仅可能是 .tmp）。
+        """
+        import rl.model as model_mod
+
+        cfg = _SMALL_CFG
+        model = create_model(cfg).eval()
+        ckpt_path = tmp_path / "best.pt"
+        save_checkpoint(model, cfg, ckpt_path, iteration=1)
+
+        real_save = model_mod.torch.save
+
+        def boom(*a, **k):
+            # 先真实写出 tmp（模拟已写一部分），再抛异常打断 os.replace 之前。
+            real_save(*a, **k)
+            raise KeyboardInterrupt("模拟迭代末 Ctrl-C")
+
+        monkeypatch.setattr(model_mod.torch, "save", boom)
+        with pytest.raises(KeyboardInterrupt):
+            save_checkpoint(model, cfg, ckpt_path, iteration=2)
+
+        # 原文件未被破坏，仍是 iteration=1。
+        _, ckpt = load_checkpoint(ckpt_path, device="cpu")
+        assert ckpt["iteration"] == 1, "被打断的保存不得破坏原有 checkpoint"
+
+
+# ============================================================
 # TorchScript 导出一致性
 # ============================================================
 

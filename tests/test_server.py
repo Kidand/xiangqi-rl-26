@@ -603,3 +603,113 @@ def test_resign(client: SimpleClient):
     assert gs2["game_over"] is True
     assert gs2["result"] in ("1-0", "0-1")
     assert gs2["termination"] == "resign"
+
+
+# ────────────────────────────────────────────────────────────────
+# 测试：后台实时日志（AI 胜率打印到 stdout）
+# ────────────────────────────────────────────────────────────────
+def test_value_to_red_pct():
+    """胜率换算函数：走子方视角 value → 红方胜率百分比。"""
+    from gui.server import _value_to_red_pct
+    from xiangqi.constants import RED, BLACK
+
+    # value=+0.264 红走 → 红方胜率 63.2%
+    assert abs(_value_to_red_pct(0.264, RED) - 63.2) < 1e-6
+    # value=+0.264 黑走（走子方黑方视角 +0.264 → 红方视角 -0.264）→ 红方胜率 36.8%
+    assert abs(_value_to_red_pct(0.264, BLACK) - 36.8) < 1e-6
+
+    # 边界：value=0 → 50%；value=+1 → 100%；value=-1 → 0%
+    assert abs(_value_to_red_pct(0.0, RED) - 50.0) < 1e-9
+    assert abs(_value_to_red_pct(1.0, RED) - 100.0) < 1e-9
+    assert abs(_value_to_red_pct(-1.0, RED) - 0.0) < 1e-9
+
+
+def test_hva_ai_move_logs_eval_to_stdout(client_with_model: SimpleClient, capsys):
+    """hva 模式 AI 自动回着后，终端应打印一行含「红方胜率」与百分号的日志。"""
+    resp = client_with_model.post(
+        "/api/game/new", body={"mode": "hva", "human_side": "red", "sims": 4}
+    )
+    assert resp.status_code == 200
+    gs0 = resp.json()
+    gid = gs0["game_id"]
+    legal = gs0.get("legal_moves", [])
+    assert legal, "初始局面无合法着法"
+
+    resp2 = client_with_model.post(f"/api/game/{gid}/move", body={"move": legal[0]})
+    assert resp2.status_code == 200
+
+    captured = capsys.readouterr()
+    assert "AI落子" in captured.out, f"日志缺少 AI落子 标签，实际输出: {captured.out!r}"
+    assert "红方胜率" in captured.out, f"日志缺少 红方胜率，实际输出: {captured.out!r}"
+    assert "%" in captured.out, f"日志缺少百分号，实际输出: {captured.out!r}"
+
+
+def test_ava_ai_move_logs_eval_to_stdout(client_with_model: SimpleClient, capsys):
+    """ava 模式 /ai_move 单步推进后，终端应打印 AI 判断日志。"""
+    resp = client_with_model.post(
+        "/api/game/new", body={"mode": "ava", "human_side": "red", "sims": 4}
+    )
+    assert resp.status_code == 200
+    gid = resp.json()["game_id"]
+
+    resp2 = client_with_model.post(f"/api/game/{gid}/ai_move", body={"sims": 4})
+    assert resp2.status_code == 200
+
+    captured = capsys.readouterr()
+    assert "AI落子" in captured.out
+    assert "红方胜率" in captured.out
+    assert "%" in captured.out
+
+
+def test_hint_logs_eval_to_stdout(client_with_model: SimpleClient, capsys):
+    """hint 端点应打印含「提示」标签的判断日志（无落子，只报胜率与推荐着）。"""
+    resp = client_with_model.post(
+        "/api/game/new", body={"mode": "hvh", "human_side": "red", "sims": 4}
+    )
+    assert resp.status_code == 200
+    gid = resp.json()["game_id"]
+
+    resp2 = client_with_model.get(f"/api/game/{gid}/hint", params={"sims": "4"})
+    assert resp2.status_code == 200
+
+    captured = capsys.readouterr()
+    assert "提示" in captured.out, f"日志缺少 提示 标签，实际输出: {captured.out!r}"
+    assert "红方胜率" in captured.out
+    assert "%" in captured.out
+
+
+def test_resign_logs_game_over_to_stdout(client_with_model: SimpleClient, capsys):
+    """认输应触发对局结束日志。"""
+    resp = client_with_model.post(
+        "/api/game/new", body={"mode": "hvh", "human_side": "red", "sims": 4}
+    )
+    gid = resp.json()["game_id"]
+
+    resp2 = client_with_model.post(f"/api/game/{gid}/resign")
+    assert resp2.status_code == 200
+
+    captured = capsys.readouterr()
+    assert "对局结束" in captured.out
+    assert "termination=resign" in captured.out
+
+
+def test_log_eval_never_raises_on_bad_input():
+    """_log_eval 内部异常必须被吞掉（try/except 包裹），不得向外抛出以打断接口响应。"""
+    from gui.server import _log_eval, _GameData
+    from xiangqi.board import Board
+
+    game = _GameData(game_id="deadbeef", board=Board(), mode="hvh", human_side="red", sims=10)
+
+    # 故意传入会在内部触发异常的参数（value_mover=None → 算术 TypeError）
+    _log_eval(game, "AI落子", "h2e2", "炮二平五", None, 1, 10, 100.0, [{"move": "x", "chinese": "y", "prob": 0.1}])  # 不应抛出
+    # top_moves 内含非法结构（非 dict）→ AttributeError（.get 不存在）
+    _log_eval(game, "提示", "h2e2", "炮二平五", 0.1, 1, 10, 5.0, ["not-a-dict"])  # 不应抛出
+
+
+def test_log_game_over_never_raises_when_not_over():
+    """_log_game_over 在对局未结束时应静默返回（不打印、不抛出）。"""
+    from gui.server import _log_game_over, _GameData
+    from xiangqi.board import Board
+
+    game = _GameData(game_id="cafebabe", board=Board(), mode="hvh", human_side="red", sims=10)
+    _log_game_over(game)  # 未结束 → 不应抛出

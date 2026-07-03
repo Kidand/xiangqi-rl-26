@@ -17,8 +17,11 @@ save/load：
 from __future__ import annotations
 
 import json
+import logging
+import os
+import shutil
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -26,6 +29,8 @@ from xiangqi.constants import ACTION_SIZE
 
 # 每个保存分片最多包含的样本数（避免单文件过大）
 _SHARD_SIZE = 100_000
+
+_LOG = logging.getLogger(__name__)
 
 
 class ReplayBuffer:
@@ -151,31 +156,80 @@ class ReplayBuffer:
     # ── 磁盘持久化 ────────────────────────────────────────────────────────
 
     def save(self, dir: "str | Path") -> None:
-        """将 buffer 保存到目录（分片 .npz + meta.json）。
+        """将 buffer 原子地保存到目录（分片 .npz + meta.json）。
 
         文件布局：
-          <dir>/meta.json
+          <dir>/meta.json         （最后写，作为「本份已完整」的完成标记）
           <dir>/states_NNNN.npz    （每片至多 _SHARD_SIZE 条）
           <dir>/values.npy
           <dir>/sparse_policy.npz
+
+        目录级原子换名（多分片必须同代，不能出现新旧分片混装）：
+
+          1. 写入全新 ``<dir>.tmp``（meta.json 最后写，作为完成标记）
+          2. rmtree(``<dir>.old``, ignore_errors)  —— 确保下一步 rename 目标不存在
+          3. 若 ``<dir>`` 存在 → os.rename(dir, ``<dir>.old``)
+          4. os.rename(``<dir>.tmp``, dir)
+          5. rmtree(``<dir>.old``)
+
+        **任意时刻杀进程的四个窗口都能恢复到某份完整 buffer**（load 只看
+        ``<dir>`` 与 ``<dir>.old``，忽略残留 ``<dir>.tmp``）：
+
+          - 窗口 A（步骤 1 写 tmp 途中）：``<dir>`` 仍是上一份完整数据（未被触碰），
+            ``<dir>.tmp`` 不完整但被 load 忽略 → 回到 ``<dir>``。
+          - 窗口 B（步骤 3 与 4 之间，两次 rename 之间）：``<dir>`` 缺失，
+            ``<dir>.old`` = 旧的完整数据，``<dir>.tmp`` = 新的完整数据；load 主目录缺失
+            → 回退 ``<dir>.old`` 完整数据。
+          - 窗口 C（步骤 4 之后、步骤 5 rmtree 之前）：``<dir>`` = 新完整数据，
+            ``<dir>.old`` = 旧完整数据 → 直接用 ``<dir>``。
+          - 窗口 D（步骤 5 rmtree 途中）：``<dir>`` = 新完整数据（已就位），
+            ``<dir>.old`` 正被删；load 主目录即完整 → 用 ``<dir>``。
+
+        因 meta.json 最后写，只要 ``<dir>/meta.json`` 存在且各分片可解压，即视为该份完整。
+        """
+        target = Path(dir)
+        tmp_dir = target.with_name(target.name + ".tmp")
+        old_dir = target.with_name(target.name + ".old")
+
+        # 1) 写入全新 <dir>.tmp（清掉可能残留的上次 .tmp）。
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        self._write_payload(tmp_dir)
+
+        # 2) 清掉旧 .old（保证下一步 rename 目标不存在——Windows 上 rename 到已存在目录会失败）。
+        shutil.rmtree(old_dir, ignore_errors=True)
+
+        # 3) 若主目录存在，先移到 .old。
+        if target.exists():
+            os.rename(target, old_dir)
+
+        # 4) tmp 就位为主目录（此刻主目录必不存在）。
+        os.rename(tmp_dir, target)
+
+        # 5) 删除旧份。
+        shutil.rmtree(old_dir, ignore_errors=True)
+
+    def _write_payload(self, dir: "str | Path") -> None:
+        """把当前 buffer 完整写入给定目录（meta.json 最后写，作为完成标记）。
+
+        供 save() 写 ``<dir>.tmp`` 用；不做任何换名，纯落盘。
         """
         save_dir = Path(dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
         n = self._size
 
-        # meta
         meta = {
             "capacity": self.capacity,
             "state_shape": list(self.state_shape),
             "size": n,
             "pos": self._pos,
         }
-        (save_dir / "meta.json").write_text(
-            json.dumps(meta, indent=2), encoding="utf-8"
-        )
 
         if n == 0:
+            # 空 buffer：只有 meta.json（最后写）。
+            (save_dir / "meta.json").write_text(
+                json.dumps(meta, indent=2), encoding="utf-8"
+            )
             return
 
         # 按环形顺序排列的有效槽位索引
@@ -227,9 +281,64 @@ class ReplayBuffer:
             lengths=pol_lens,
         )
 
+        # meta.json 最后写：它的存在标志本份数据分片已全部落盘（完成标记）。
+        (save_dir / "meta.json").write_text(
+            json.dumps(meta, indent=2), encoding="utf-8"
+        )
+
     @classmethod
-    def load(cls, dir: "str | Path") -> "ReplayBuffer":
-        """从目录加载 buffer（与 save() 对应）。"""
+    def load(
+        cls,
+        dir: "str | Path",
+        capacity: Optional[int] = None,
+        state_shape: Optional[tuple] = None,
+    ) -> "ReplayBuffer":
+        """容错加载 buffer。
+
+        容错链（对应 save() 的原子换名，覆盖被 Ctrl-C 打断的各窗口）：
+
+          1. 优先读 ``<dir>``；
+          2. 失败（缺失 / 解压错 / meta 缺失或损坏）→ 尝试 ``<dir>.old``，
+             成功则打 WARN「主 buffer 损坏，已回退上一份」；
+          3. 两者都失败 → 若给了 ``capacity`` 与 ``state_shape`` 则新建空 buffer 并
+             打 WARN，否则重新抛出主目录的异常（无法凭空重建）。
+
+        加载成功后清理遗留的 ``<dir>.tmp`` / ``<dir>.old``（上次被打断的残留）。
+        """
+        load_dir = Path(dir)
+        old_dir = load_dir.with_name(load_dir.name + ".old")
+        tmp_dir = load_dir.with_name(load_dir.name + ".tmp")
+
+        buf: Optional["ReplayBuffer"] = None
+        try:
+            buf = cls._load_from_dir(load_dir)
+        except Exception as e_primary:
+            # 回退到上一份完整数据 <dir>.old。
+            try:
+                buf = cls._load_from_dir(old_dir)
+                _LOG.warning(
+                    "主 buffer 损坏（%s: %s），已回退上一份 %s",
+                    type(e_primary).__name__, e_primary, old_dir.name,
+                )
+            except Exception as e_old:
+                if capacity is not None and state_shape is not None:
+                    _LOG.warning(
+                        "主 buffer 与备份均不可用（主: %s；备: %s），新建空 buffer",
+                        e_primary, e_old,
+                    )
+                    buf = cls(int(capacity), tuple(state_shape))
+                else:
+                    # 无法重建：抛出主目录的原始异常。
+                    raise e_primary
+
+        # 清理遗留 .tmp / .old（数据已在内存中，下次 save 会原子重建各份）。
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(old_dir, ignore_errors=True)
+        return buf
+
+    @classmethod
+    def _load_from_dir(cls, dir: "str | Path") -> "ReplayBuffer":
+        """严格加载给定目录（任一环节缺失/损坏均抛异常）。供 load() 的容错链调用。"""
         load_dir = Path(dir)
         meta_path = load_dir / "meta.json"
         if not meta_path.exists():

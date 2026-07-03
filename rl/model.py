@@ -17,6 +17,7 @@ forward(x) -> (policy_logits[B, 8100], value[B])
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -208,6 +209,11 @@ def save_checkpoint(
       "optimizer_state" : dict | None,
       "meta"         : dict,
     }
+
+    原子写盘：先写 ``path + ".tmp"``，再 ``os.replace(tmp, path)`` 原地换名
+    （POSIX 与 Windows 上 os.replace 均为原子操作，且可覆盖已存在的目标）。
+    这样即使写 .tmp 途中被 Ctrl-C，旧的 checkpoint 也不会被截断/损坏——最坏只留下
+    一个不完整的 .tmp（下次覆盖或加载时可忽略），永远不会出现「半个 path」。
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -224,4 +230,7 @@ def save_checkpoint(
         "optimizer_state": optimizer_state,
         "meta": meta if meta is not None else {},
     }
-    torch.save(ckpt, path)
+
+    tmp_path = path.with_name(path.name + ".tmp")
+    torch.save(ckpt, tmp_path)
+    os.replace(tmp_path, path)  # 原子换名（可覆盖已存在文件）
