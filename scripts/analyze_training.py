@@ -11,8 +11,9 @@
     # 加终局类型分布（采样 records/selfplay/*.jsonl，约几十秒）
     python scripts/analyze_training.py --records
 
-    # 加 checkpoint 天梯（加载模型实打对局，较慢；衡量 Elo 增益斜率）
-    python scripts/analyze_training.py --ladder --ladder-games 60 --ladder-sims 400
+    # 加 checkpoint 天梯（多进程吃满全部 GPU 实打对局；衡量 Elo 增益斜率）
+    python scripts/analyze_training.py --ladder --ladder-games 200 --ladder-sims 400 \
+        --config configs/cloud_8xh100.yaml
 
     # 全量 + 存文件
     python scripts/analyze_training.py --records --ladder --out report.md
@@ -224,12 +225,85 @@ def report_records(records_dir: Path, n_files: int, n_lines: int, lines: list[st
 
 
 # ────────────────────────────────────────────────────────────────
-# checkpoint 天梯
+# checkpoint 天梯（多进程多 GPU 并行）
 # ────────────────────────────────────────────────────────────────
+_WORKER_DEVICE = None
+
+
+def _ladder_init(dev_queue) -> None:
+    """Pool initializer：每个 worker 进程启动时领取一个固定设备。
+
+    设备绑定在进程而非任务上——每进程只在一张卡上建 CUDA 上下文，
+    避免 48 worker × 8 卡交叉产生大量冗余上下文显存。
+    """
+    global _WORKER_DEVICE
+    _WORKER_DEVICE = dev_queue.get()
+    import torch
+
+    torch.set_num_threads(1)  # 瓶颈在 Python MCTS，防多 worker CPU 超订
+
+
+def _ladder_worker(task: dict) -> dict:
+    """子进程：加载两个 checkpoint，在本 worker 绑定的设备上打一块对局，返回计数。"""
+    from rl.evaluate import _play_one
+    from rl.model import load_checkpoint
+    from rl.selfplay import build_eval_fn
+
+    dev = _WORKER_DEVICE or "cpu"
+    new_model, new_ck = load_checkpoint(task["new_ckpt"], device=dev)
+    old_model, _ = load_checkpoint(task["old_ckpt"], device=dev)
+    new_model.eval()
+    old_model.eval()
+    new_eval = build_eval_fn(new_model, dev)
+    old_eval = build_eval_fn(old_model, dev)
+
+    cfg = task["cfg"]
+    # history_steps 以 checkpoint 实际值为准（防止 cfg 与权重不一致）
+    hist = (new_ck.get("model_config") or {}).get("history_steps")
+    if hist is not None:
+        cfg.model.history_steps = int(hist)
+
+    import numpy as np
+
+    rng = np.random.default_rng(task["seed"])
+    w = d = l = 0
+    rw = rd = rl_ = bw = bd = bl = 0
+    for new_is_red in [True] * task["n_red"] + [False] * task["n_black"]:
+        result = _play_one(new_eval, old_eval, new_is_red, cfg, rng)
+        if result == "1/2-1/2":
+            d += 1
+            rd, bd = (rd + 1, bd) if new_is_red else (rd, bd + 1)
+        elif (result == "1-0") == new_is_red:
+            w += 1
+            rw, bw = (rw + 1, bw) if new_is_red else (rw, bw + 1)
+        else:
+            l += 1
+            rl_, bl = (rl_ + 1, bl) if new_is_red else (rl_, bl + 1)
+    return {"pair": task["pair"], "wins": w, "draws": d, "losses": l,
+            "red_w": rw, "red_d": rd, "red_l": rl_,
+            "black_w": bw, "black_d": bd, "black_l": bl}
+
+
+def _elo_ci95(wins: int, draws: int, losses: int) -> float:
+    """Elo 差的 ±95% 置信半径（对局得分 1/0.5/0 的经验方差 + delta 法）。"""
+    n = wins + draws + losses
+    if n < 2:
+        return float("inf")
+    s = (wins + 0.5 * draws) / n
+    var = (wins * (1 - s) ** 2 + draws * (0.5 - s) ** 2 + losses * s ** 2) / n
+    se = math.sqrt(var / n)
+    eps = 1.0 / (2.0 * n)
+    s_c = min(max(s, eps), 1.0 - eps)
+    # dElo/ds = 400 / (ln10 · s(1-s))
+    return 1.96 * se * 400.0 / (math.log(10) * s_c * (1.0 - s_c))
+
+
 def report_ladder(ckpt_dir: Path, offsets: list[int], games: int, sims: int,
-                  device: str, lines: list[str]) -> None:
+                  device: str, workers: int, config_yaml: str | None,
+                  lines: list[str]) -> None:
+    import multiprocessing as mp
+
     lines.append("")
-    lines.append(f"## 6. checkpoint 天梯（每对 {games} 盘 × {sims} sims）")
     ckpts = {}
     for p in sorted(ckpt_dir.glob("iter_*.pt")):
         try:
@@ -237,44 +311,89 @@ def report_ladder(ckpt_dir: Path, offsets: list[int], games: int, sims: int,
         except (IndexError, ValueError):
             continue
     if not ckpts:
+        lines.append("## 6. checkpoint 天梯")
         lines.append(f"- 未找到 {ckpt_dir}/iter_*.pt，跳过")
         return
 
     from rl.config import Config          # 延迟导入（需要 torch）
-    from rl.evaluate import arena
+    import torch
 
-    latest = max(ckpts)
-    cfg = Config()
+    # 设备列表与 worker 数：默认吃满全部 GPU，每卡多 worker（瓶颈在 CPU 端 MCTS）
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device.startswith("cuda"):
+        devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+    else:
+        devices = ["cpu"]
+    cpu_n = mp.cpu_count()
+    if workers <= 0:
+        workers = min(max(4, cpu_n - 4), len(devices) * 6 if devices[0] != "cpu" else 8)
+
+    cfg = Config.from_yaml(config_yaml) if config_yaml else Config()
     cfg.arena.arena_games = games
     cfg.arena.arena_sims = sims
-    if device == "auto":
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg.train.num_gpus = 1 if device == "cuda" else 0
+    cfg.train.num_gpus = len(devices) if devices[0] != "cpu" else 0
 
-    lines.append(f"- 基准：iter_{latest:04d}（最新）为\"新\"方；score>0.5 即最新更强")
-    lines.append("| 对阵 | 新胜 | 和 | 新负 | score | Elo 增益估计 | 耗时 |")
-    lines.append("|" + "---|" * 7)
+    latest = max(ckpts)
+    pairs = []
     for off in offsets:
-        target = latest - off
-        # 找不大于 target 的最近存在的 checkpoint
-        cands = [k for k in ckpts if k <= target]
-        if not cands or max(cands) == latest:
-            lines.append(f"| iter_{latest:04d} vs iter_{target:04d} | - | - | - | 无该检查点 | - | - |")
-            continue
-        old = max(cands)
-        cfg.seed = 20260704 + off
-        t0 = time.monotonic()
-        st = arena(str(ckpts[latest]), str(ckpts[old]), cfg, device=device)
-        dt = time.monotonic() - t0
-        elo = _elo_from_score(st["score"], games)
+        cands = [k for k in ckpts if k <= latest - off]
+        if cands and max(cands) != latest:
+            pairs.append((off, max(cands)))
+
+    # 全局任务池：所有配对的对局切成 ~4 盘的小块混合调度，避免尾部 GPU 闲置
+    tasks = []
+    for pi, (off, old) in enumerate(pairs):
+        red_total = games - games // 2
+        black_total = games // 2
+        n_chunks = max(1, min(workers, math.ceil(games / 4)))
+        for c in range(n_chunks):
+            n_red = red_total * (c + 1) // n_chunks - red_total * c // n_chunks
+            n_black = black_total * (c + 1) // n_chunks - black_total * c // n_chunks
+            if n_red + n_black == 0:
+                continue
+            tasks.append({
+                "pair": (latest, old), "new_ckpt": str(ckpts[latest]), "old_ckpt": str(ckpts[old]),
+                "n_red": n_red, "n_black": n_black,
+                "seed": 20260704 + off * 1000 + c, "cfg": cfg,
+            })
+
+    lines.append(f"## 6. checkpoint 天梯（每对 {games} 盘 × {sims} sims，"
+                 f"{workers} workers × {len(devices)} 设备并行）")
+    lines.append(f"- 基准：iter_{latest:04d}（最新）为\"新\"方；score>0.5 即最新更强")
+    print(f"[ladder] {len(pairs)} 对 × {games} 盘 → {len(tasks)} 个任务块，"
+          f"workers={workers}，devices={devices}", file=sys.stderr)
+
+    t0 = time.monotonic()
+    ctx = mp.get_context("spawn")
+    dev_queue = ctx.Queue()
+    for i in range(workers):
+        dev_queue.put(devices[i % len(devices)])   # worker 均匀铺满各卡
+    agg: dict = {}
+    with ctx.Pool(processes=workers, initializer=_ladder_init, initargs=(dev_queue,)) as pool:
+        for i, r in enumerate(pool.imap_unordered(_ladder_worker, tasks), 1):
+            a = agg.setdefault(r["pair"], {k: 0 for k in r if k != "pair"})
+            for k in a:
+                a[k] += r[k]
+            print(f"[ladder] {i}/{len(tasks)} 块完成", file=sys.stderr)
+    wall = time.monotonic() - t0
+
+    lines.append("| 对阵 | 新胜 | 和 | 新负 | score | 执红分 | 执黑分 | Elo 增益 (±95%CI) |")
+    lines.append("|" + "---|" * 8)
+    for (new_it, old_it), a in sorted(agg.items(), key=lambda kv: -kv[0][1]):
+        n = a["wins"] + a["draws"] + a["losses"]
+        s = (a["wins"] + 0.5 * a["draws"]) / n if n else 0.0
+        red_n = a["red_w"] + a["red_d"] + a["red_l"]
+        black_n = a["black_w"] + a["black_d"] + a["black_l"]
+        red_s = (a["red_w"] + 0.5 * a["red_d"]) / red_n if red_n else 0.0
+        black_s = (a["black_w"] + 0.5 * a["black_d"]) / black_n if black_n else 0.0
+        elo = _elo_from_score(s, n)
+        ci = _elo_ci95(a["wins"], a["draws"], a["losses"])
         lines.append(
-            f"| iter_{latest:04d} vs iter_{old:04d} | {st['wins']} | {st['draws']} | {st['losses']} "
-            f"| {st['score']:.3f} | {elo:+.0f} | {dt:.0f}s |"
+            f"| iter_{new_it:04d} vs iter_{old_it:04d} | {a['wins']} | {a['draws']} | {a['losses']} "
+            f"| {s:.3f} | {red_s:.3f} | {black_s:.3f} | {elo:+.0f} (±{ci:.0f}) |"
         )
-        print(f"[ladder] iter_{latest:04d} vs iter_{old:04d}: "
-              f"{st['wins']}W/{st['draws']}D/{st['losses']}L score={st['score']:.3f} ({dt:.0f}s)",
-              file=sys.stderr)
+    lines.append(f"- 总耗时 {wall:.0f}s（{len(tasks)} 块并行）")
 
 
 # ────────────────────────────────────────────────────────────────
@@ -330,10 +449,14 @@ def main(argv=None) -> int:
     ap.add_argument("--records", action="store_true", help="采样 records 统计终局类型（较慢）")
     ap.add_argument("--records-files", type=int, default=8)
     ap.add_argument("--records-lines", type=int, default=500)
-    ap.add_argument("--ladder", action="store_true", help="checkpoint 天梯实战（慢，需 torch）")
+    ap.add_argument("--ladder", action="store_true", help="checkpoint 天梯实战（多进程多 GPU 并行，需 torch）")
     ap.add_argument("--ladder-offsets", default="50,100,200", help="与最新 checkpoint 的迭代差，逗号分隔")
-    ap.add_argument("--ladder-games", type=int, default=60)
+    ap.add_argument("--ladder-games", type=int, default=200, help="每对局数（并行后可放心加大以缩 CI）")
     ap.add_argument("--ladder-sims", type=int, default=400)
+    ap.add_argument("--ladder-workers", type=int, default=0,
+                    help="并行 worker 进程数；0=自动（GPU 数×6，受 CPU 核数约束）")
+    ap.add_argument("--config", default=None,
+                    help="训练 yaml（如 configs/cloud_8xh100.yaml），使天梯的 c_puct/draw_penalty 等与训练一致")
     ap.add_argument("--device", default="auto", help="ladder 推理设备 auto/cuda/cpu")
     ap.add_argument("--out", default=None, help="同时写入文件")
     args = ap.parse_args(argv)
@@ -355,7 +478,8 @@ def main(argv=None) -> int:
     if args.ladder:
         offsets = [int(x) for x in args.ladder_offsets.split(",") if x.strip()]
         report_ladder(Path(args.ckpt_dir), offsets, args.ladder_games,
-                      args.ladder_sims, args.device, lines)
+                      args.ladder_sims, args.device, args.ladder_workers,
+                      args.config, lines)
     report_flags(rows, lines)
     lines.append("")
     lines.append("（请把以上完整报告粘贴回来，用于制定后续训练计划。）")
