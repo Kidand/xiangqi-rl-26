@@ -1,4 +1,11 @@
-/* 中国象棋 Web GUI 样式 — 无外部依赖，支持系统深浅色 */
+/* 中国象棋 Web GUI 样式 — 无外部依赖，支持系统深浅色
+ *
+ * 响应式契约（DESIGN §14）：
+ *   桌面 ≥900px         双栏（左棋盘区 + 右 320px 面板），评估条纵向（红在下）
+ *   <900px 竖屏         单列纵向滚动（顶栏→横向评估条→满宽棋盘→操作栏→页签），评估条横向（红在左）
+ *   <900px 横屏 ≤540px  棋盘按高定尺寸 + 面板并列，评估条恢复纵向
+ * 评估条填充只读 CSS 变量 --eval-pct（JS 写入，50% = 均势），方向锚定由断点决定。
+ */
 
 :root {
   --bg: #f5f0e8;
@@ -29,6 +36,13 @@
   --board-wood: #d4a96a;
   --board-line: #8b6914;
   --scrollbar: #c8b89a;
+
+  /* 布局常量（顶栏高度参与多处 calc，集中定义） */
+  --topbar-h: 44px;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -72,14 +86,27 @@ html, body {
   overflow: hidden;
 }
 
-/* ── 顶栏 ─────────────────────────────────────── */
+/* ── 触控基础（全局） ─────────────────────────────── */
+.btn, .tab-btn, .ctrl-btn, .radio-btn label, .toggle,
+select, input[type="range"], #board-svg,
+.move-item, .record-item, .hint-move-item {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ── 顶栏（含 iOS 刘海安全区） ────────────────────── */
 #topbar {
-  height: 44px;
+  height: 44px;   /* 无 env() 支持的兜底 */
+  height: calc(var(--topbar-h) + var(--safe-top));
+  padding: 0 16px;
+  padding-top: var(--safe-top);
+  /* 刘海屏横屏时左右安全区（竖屏时 env 为 0，等价于基础内边距） */
+  padding-left: max(16px, var(--safe-left));
+  padding-right: max(16px, var(--safe-right));
   background: var(--panel-bg);
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
-  padding: 0 16px;
   gap: 12px;
   box-shadow: var(--shadow);
   z-index: 10;
@@ -120,45 +147,65 @@ html, body {
 .spinner.active { display: block; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ── 主布局 ──────────────────────────────────── */
+/* ── 主布局（桌面双栏基线） ───────────────────────── */
 #main {
   display: flex;
-  height: calc(100vh - 44px);
+  height: calc(100vh - 44px);   /* 无 env() 支持的兜底 */
+  height: calc(100vh - var(--topbar-h) - var(--safe-top));
+  height: calc(100dvh - var(--topbar-h) - var(--safe-top));
   overflow: hidden;
 }
 
-/* ── 棋盘区 ──────────────────────────────────── */
+/* ── 棋盘区：评估条+棋盘 在上，操作栏紧贴其下 ────── */
 #board-area {
   flex: 1 1 auto;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 10px;
   padding: 12px;
   min-width: 0;
   overflow: hidden;
 }
+#board-with-eval {
+  display: flex;
+  align-items: stretch;   /* 评估条随棋盘高度伸展 */
+}
 #board-container {
   position: relative;
   user-select: none;
+  -webkit-user-select: none;
+  /* 桌面：同时受宽（视口 - 面板 - 评估条 - 边距）与高（视口 - 顶栏 - 操作栏 - 边距）约束 */
+  width: min(calc(100vw - 400px),
+             max(220px, calc((100vh - var(--topbar-h) - 96px) * 476 / 524)));
+  width: min(calc(100vw - 400px),
+             max(220px, calc((100dvh - var(--topbar-h) - var(--safe-top) - 96px) * 476 / 524)));
+  max-width: 100%;
 }
 #board-svg {
   display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 476 / 524;   /* 兜底：与 board.js 构造的 viewBox W/H 一致 */
   cursor: pointer;
   filter: drop-shadow(0 4px 12px rgba(0,0,0,0.2));
 }
 
-/* 评估条 */
+/* ── 评估条（桌面：纵向，红在下） ─────────────────── */
 #eval-bar-wrap {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
   margin-right: 10px;
+  padding: 4px 0;
 }
 #eval-bar {
-  width: 18px;
-  height: 340px;
-  border-radius: 9px;
+  width: 16px;
+  flex: 1;
+  min-height: 160px;
+  border-radius: 8px;
   background: var(--eval-black);
   position: relative;
   overflow: hidden;
@@ -169,16 +216,50 @@ html, body {
   bottom: 0;
   left: 0;
   right: 0;
+  height: var(--eval-pct, 50%);   /* JS 只写 --eval-pct，方向由断点锚定 */
   background: var(--eval-red);
-  transition: height 0.4s ease;
-  height: 50%;
+  transition: height 0.4s ease, width 0.4s ease;
 }
 #eval-label {
   font-size: 11px;
   color: var(--text-muted);
   writing-mode: vertical-rl;
   text-orientation: mixed;
+  flex-shrink: 0;
 }
+
+/* ── 操作按钮栏（棋盘正下方） ─────────────────────── */
+#action-btns {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.btn {
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  background: var(--btn-bg);
+  color: var(--text);
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: inherit;
+  transition: background 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+.btn:hover { background: var(--btn-bg-hover); }
+.btn:active { transform: translateY(1px); }
+.btn.primary {
+  background: var(--btn-primary);
+  color: #fff;
+  border-color: var(--btn-primary);
+}
+.btn.primary:hover { background: var(--btn-primary-hover); border-color: var(--btn-primary-hover); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn.danger { border-color: #e74c3c; color: #e74c3c; }
+.btn.danger:hover { background: #fdecea; }
+.btn.btn-compact { padding: 2px 8px; font-size: 11px; }
 
 /* ── 右侧面板 ────────────────────────────────── */
 #panel {
@@ -225,39 +306,6 @@ html, body {
   overflow: hidden;
 }
 
-/* 操作按钮区 */
-#action-btns {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 10px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-.btn {
-  padding: 6px 12px;
-  border: 1px solid var(--border);
-  background: var(--btn-bg);
-  color: var(--text);
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 13px;
-  font-family: inherit;
-  transition: background 0.15s, border-color 0.15s;
-  white-space: nowrap;
-}
-.btn:hover { background: var(--btn-bg-hover); }
-.btn:active { transform: translateY(1px); }
-.btn.primary {
-  background: var(--btn-primary);
-  color: #fff;
-  border-color: var(--btn-primary);
-}
-.btn.primary:hover { background: var(--btn-primary-hover); border-color: var(--btn-primary-hover); }
-.btn:disabled { opacity: 0.45; cursor: not-allowed; }
-.btn.danger { border-color: #e74c3c; color: #e74c3c; }
-.btn.danger:hover { background: #fdecea; }
-
 /* 着法列表 */
 #moves-header {
   padding: 6px 10px;
@@ -270,6 +318,7 @@ html, body {
 #moves-list {
   flex: 1;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 4px 0;
 }
 #moves-list::-webkit-scrollbar { width: 6px; }
@@ -381,6 +430,7 @@ html, body {
 }
 #records-list {
   overflow-y: auto;
+  overscroll-behavior: contain;
   flex: 1;
 }
 #records-list::-webkit-scrollbar { width: 6px; }
@@ -413,6 +463,7 @@ html, body {
 #replay-moves-list {
   flex: 1;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 4px 0;
 }
 #replay-moves-list::-webkit-scrollbar { width: 6px; }
@@ -456,6 +507,7 @@ html, body {
 }
 #replay-speed {
   flex: 1;
+  min-width: 0;
   accent-color: var(--accent);
 }
 #replay-pos-label {
@@ -468,6 +520,7 @@ html, body {
 /* ── 设置页签 ────────────────────────────────── */
 #tab-settings {
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 10px;
   gap: 10px;
 }
@@ -476,6 +529,7 @@ html, body {
   align-items: center;
   justify-content: space-between;
   padding: 6px 0;
+  min-height: 40px;
   border-bottom: 1px solid var(--border);
   font-size: 13px;
 }
@@ -488,6 +542,12 @@ html, body {
   cursor: pointer;
 }
 .toggle input { display: none; }
+/* 触控热区扩展（不改变滑块视觉尺寸） */
+.toggle::before {
+  content: "";
+  position: absolute;
+  inset: -11px -8px;
+}
 .toggle-slider {
   position: absolute;
   inset: 0;
@@ -518,6 +578,7 @@ html, body {
   color: var(--text-muted);
   line-height: 1.6;
   margin-top: 4px;
+  overflow-wrap: break-word;
 }
 .model-load-row {
   display: flex;
@@ -526,6 +587,7 @@ html, body {
 }
 #model-path-input {
   flex: 1;
+  min-width: 0;
   font-size: 12px;
   background: var(--input-bg);
   color: var(--text);
@@ -535,13 +597,12 @@ html, body {
   font-family: monospace;
 }
 
-/* ── 对话框 ──────────────────────────────────── */
+/* ── 对话框（桌面：居中模态） ──────────────────── */
 .dialog-overlay {
   position: fixed;
   inset: 0;
   background: var(--dialog-overlay);
   z-index: 100;
-  display: flex;
   align-items: center;
   justify-content: center;
   display: none;
@@ -550,10 +611,14 @@ html, body {
 
 .dialog {
   background: var(--panel-bg);
-  border-radius: 8px;
+  border-radius: 10px;
   padding: 20px;
-  width: 360px;
+  width: 380px;
   max-width: 95vw;
+  max-height: 90vh;
+  max-height: 90dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   box-shadow: 0 8px 32px rgba(0,0,0,0.3);
 }
 .dialog h2 {
@@ -584,11 +649,13 @@ html, body {
 }
 .radio-btn input { display: none; }
 .radio-btn label {
-  display: block;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   text-align: center;
   padding: 6px 8px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: 5px;
   cursor: pointer;
   font-size: 13px;
   font-weight: normal;
@@ -626,14 +693,16 @@ html, body {
 /* ── Toast 通知 ──────────────────────────────── */
 #toast-container {
   position: fixed;
-  bottom: 20px;
+  bottom: calc(20px + var(--safe-bottom));
   left: 50%;
   transform: translateX(-50%);
   z-index: 200;
   display: flex;
   flex-direction: column;
+  align-items: center;
   gap: 6px;
   pointer-events: none;
+  max-width: calc(100vw - 24px);
 }
 .toast {
   background: var(--toast-bg);
@@ -645,7 +714,7 @@ html, body {
   transform: translateY(10px);
   transition: opacity 0.25s, transform 0.25s;
   pointer-events: auto;
-  max-width: 360px;
+  max-width: 100%;
   text-align: center;
   box-shadow: var(--shadow);
 }
@@ -660,13 +729,6 @@ html, body {
 .mt4 { margin-top: 4px; }
 .mt8 { margin-top: 8px; }
 .hidden { display: none !important; }
-
-/* 棋盘周围区域布局 */
-#board-with-eval {
-  display: flex;
-  align-items: center;
-  gap: 0;
-}
 
 /* 将军动画 */
 @keyframes check-flash {
@@ -702,3 +764,254 @@ html, body {
   display: none;
 }
 #records-game-select.visible { display: block; }
+
+/* ═══════════════════════════════════════════════════════════════
+   触控设备：可点目标 ≥44px（与断点无关，跟随输入方式）
+   ═══════════════════════════════════════════════════════════════ */
+@media (pointer: coarse) {
+  .btn { min-height: 44px; padding: 8px 14px; }
+  .btn.btn-compact { min-height: 44px; padding: 4px 12px; }
+  .tab-btn { min-height: 44px; }
+  .ctrl-btn { width: 44px; height: 44px; font-size: 16px; }
+  .radio-btn label { min-height: 44px; }
+  .setting-row { min-height: 48px; }
+  #records-game-select, .form-input { min-height: 44px; }
+  .record-item { min-height: 44px; }
+  .move-row { min-height: 44px; }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   移动竖屏（<900px）：单列纵向滚动
+   顶栏 → 横向评估条 → 满宽棋盘 → 操作栏 → 页签 → 页签内容
+   ═══════════════════════════════════════════════════════════════ */
+@media (max-width: 899.98px) {
+  body { overscroll-behavior-y: none; }
+
+  #topbar {
+    padding-left: max(12px, var(--safe-left));
+    padding-right: max(12px, var(--safe-right));
+  }
+  #topbar h1 { font-size: 15px; }
+
+  /* #main 变为纵向滚动容器（棋盘+操作栏占首屏，列表自然下移） */
+  #main {
+    flex-direction: column;
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior-y: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  #board-area {
+    flex: 0 0 auto;
+    overflow: visible;
+    padding: 10px 10px 12px;
+    gap: 10px;
+  }
+
+  /* 评估条移到棋盘上方：整体转纵向堆叠，宽度与棋盘一致 */
+  #board-with-eval {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    /* 满宽优先；异形矮屏时退让给高度预算（顶栏+评估条+操作栏+页签 ≈ 260px） */
+    width: min(100%, max(220px, calc((100vh - 260px) * 476 / 524)));
+    width: min(100%, max(220px, calc((100dvh - var(--safe-top) - 260px) * 476 / 524)));
+  }
+  #board-container {
+    width: 100%;
+  }
+
+  /* 横向评估条：高 8px，红在左 */
+  #eval-bar-wrap {
+    flex-direction: column;
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    gap: 0;
+  }
+  #eval-bar {
+    width: 100%;
+    height: 8px;
+    min-height: 8px;
+    flex: none;
+    border-radius: 4px;
+  }
+  #eval-fill {
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: auto;
+    height: auto;
+    width: var(--eval-pct, 50%);
+  }
+  #eval-label { display: none; }
+
+  /* 操作栏：等分网格，主按钮红色自然突出 */
+  #action-btns {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    width: min(100%, 520px);
+  }
+  #action-btns .btn { min-height: 44px; font-size: 14px; padding: 8px 6px; }
+
+  /* 面板改为全宽块，内容自然展开（由 #main 统一滚动） */
+  #panel {
+    width: 100%;
+    flex: 0 0 auto;
+    border-left: none;
+    border-top: 1px solid var(--border);
+    overflow: visible;
+    padding-bottom: calc(8px + var(--safe-bottom));
+  }
+
+  /* 页签吸顶（相对 #main 滚动容器），三等分 44px */
+  #tabs {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: var(--panel-bg);
+  }
+  .tab-btn { min-height: 44px; font-size: 14px; }
+
+  .tab-pane { flex: none; overflow: visible; }
+
+  /* 长列表限高内部滚动（约 35vh），其余内容自然下移 */
+  #moves-list,
+  #replay-moves-list {
+    flex: none;
+    max-height: 35vh;
+    max-height: 35dvh;
+    min-height: 72px;
+  }
+
+  /* 新对局对话框 → 底部弹层（bottom sheet） */
+  .dialog-overlay {
+    align-items: flex-end;
+    justify-content: center;
+  }
+  .dialog {
+    width: 100%;
+    max-width: 100%;
+    border-radius: 16px 16px 0 0;
+    padding: 18px 16px calc(16px + var(--safe-bottom));
+    box-shadow: 0 -8px 32px rgba(0,0,0,0.35);
+    animation: sheet-up 0.22s ease;
+  }
+  .radio-group { gap: 8px; }
+  .radio-btn label { min-height: 44px; font-size: 14px; }
+  .dialog-btns .btn { flex: 1; min-height: 46px; font-size: 14px; }
+
+  /* Toast：底部居中避开安全区 */
+  #toast-container { bottom: calc(16px + var(--safe-bottom)); }
+}
+
+@keyframes sheet-up {
+  from { transform: translateY(24px); opacity: 0.5; }
+  to   { transform: none; opacity: 1; }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   横屏矮屏（<900px 且 landscape 且 高≤540px）：
+   棋盘按高定尺寸完整可见，操作栏纵列贴棋盘右侧，面板并列内部滚动
+   ═══════════════════════════════════════════════════════════════ */
+@media (max-width: 899.98px) and (orientation: landscape) and (max-height: 540px) {
+  #main {
+    flex-direction: row;
+    overflow: hidden;
+    /* 刘海屏横屏：内容避开左右安全区（竖屏时 env 为 0，无影响） */
+    padding-left: var(--safe-left);
+    padding-right: var(--safe-right);
+  }
+
+  #board-area {
+    flex: 1 1 auto;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 8px;
+    overflow: hidden;
+    min-width: 0;
+  }
+
+  /* 恢复：纵向评估条贴棋盘左侧 */
+  #board-with-eval {
+    flex-direction: row;
+    align-items: stretch;
+    gap: 0;
+    width: auto;
+  }
+  #eval-bar-wrap {
+    flex-direction: column;
+    width: auto;
+    margin-right: 8px;
+    padding: 2px 0;
+  }
+  #eval-bar {
+    width: 12px;
+    height: auto;
+    min-height: 120px;
+    flex: 1;
+    border-radius: 6px;
+  }
+  #eval-fill {
+    top: auto;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    width: auto;
+    height: var(--eval-pct, 50%);
+  }
+  #eval-label { display: none; }
+
+  /* 棋盘按可用高度定宽（顶栏 + 上下边距） */
+  #board-container {
+    width: max(220px, calc((100vh - var(--topbar-h) - 20px) * 476 / 524));
+    width: max(220px, calc((100dvh - var(--topbar-h) - var(--safe-top) - 20px) * 476 / 524));
+    max-width: 100%;
+  }
+
+  /* 操作栏：纵向按钮列（视觉归入右侧区域） */
+  #action-btns {
+    display: flex;
+    flex-direction: column;
+    flex-wrap: nowrap;
+    width: auto;
+    gap: 6px;
+    align-self: center;
+    max-height: 100%;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  #action-btns .btn {
+    min-height: 40px;
+    font-size: 12px;
+    padding: 6px 10px;
+  }
+
+  /* 面板并列：compact 化，内部滚动 */
+  #panel {
+    width: auto;
+    flex: 1 1 260px;
+    min-width: 200px;
+    max-width: 320px;
+    border-top: none;
+    border-left: 1px solid var(--border);
+    overflow: hidden;
+    padding-bottom: 0;
+  }
+  #tabs { position: static; }
+  .tab-btn { min-height: 40px; }
+  .tab-pane { flex: 1; overflow: hidden; }
+  #moves-list,
+  #replay-moves-list {
+    flex: 1;
+    max-height: none;
+    min-height: 0;
+  }
+
+  /* 横屏下弹层高度受限：保持底部弹层但限高滚动（继承移动断点样式即可） */
+  .dialog { max-height: 92vh; max-height: 92dvh; }
+}

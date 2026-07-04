@@ -87,13 +87,15 @@ class XiangqiBoard {
     this.cellSize = opts.cellSize || 52;
     this.onMove = opts.onMove || null;
 
-    // 布局参数
+    // 布局参数（内部坐标系，默认 cellSize=52 → W/H = 476/524，与 CSS aspect-ratio 兜底一致）
     this.margin = { left: 36, top: 28, right: 24, bottom: 28 };
     this.W = this.margin.left + 8 * this.cellSize + this.margin.right;
     this.H = this.margin.top  + 9 * this.cellSize + this.margin.bottom;
 
-    this.svg.setAttribute("width",  this.W);
-    this.svg.setAttribute("height", this.H);
+    // 不设固定 width/height 像素属性：显示尺寸由 CSS 约束（#board-container），
+    // SVG 按 viewBox 等比缩放；点击换算在 _onClick 里按 getBoundingClientRect 缩放。
+    this.svg.removeAttribute("width");
+    this.svg.removeAttribute("height");
     this.svg.setAttribute("viewBox", `0 0 ${this.W} ${this.H}`);
 
     // 状态

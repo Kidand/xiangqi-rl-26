@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -91,6 +92,24 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+@pytest.fixture(autouse=True)
+def records_dir(tmp_path, monkeypatch):
+    """把 gui.server._RECORDS_DIR 指向每个用例独立的临时目录。
+
+    硬要求：多个用例会把对局下到终局/认输，从而触发终局自动落盘（§12）；
+    没有本 fixture 它们会往仓库真实 records/ 写文件。服务器在请求处理时经模块
+    全局 _RECORDS_DIR 取路径，故此 monkeypatch 对后台 uvicorn 线程同样生效。
+    records 浏览相关用例（records_get 等）统一改写到本临时目录，方案一致不冲突。
+    返回临时 records 根目录，供自动落盘用例定位 records/gui 下的文件。
+    """
+    import gui.server as srv
+
+    rec_dir = tmp_path / "records"
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(srv, "_RECORDS_DIR", rec_dir)
+    return rec_dir
 
 
 @pytest.fixture(scope="module")
@@ -301,15 +320,14 @@ def test_records_list(client: SimpleClient):
 # ────────────────────────────────────────────────────────────────
 # 测试：records/get — 基本功能（动态创建测试文件）
 # ────────────────────────────────────────────────────────────────
-def test_records_get(client: SimpleClient, tmp_path: Path):
-    """在 records/ 下写入一个测试记录文件后通过 API 读取。"""
+def test_records_get(client: SimpleClient, records_dir: Path):
+    """在（已被 monkeypatch 到临时目录的）records/ 下写入一个测试记录文件后通过 API 读取。"""
     import xiangqi.records as rmod
     from xiangqi.constants import START_FEN
 
-    # 确保 records/ 目录存在
-    repo_root = Path(__file__).resolve().parent.parent
-    rec_dir = repo_root / "records"
-    rec_dir.mkdir(exist_ok=True)
+    # 使用 autouse fixture 指向的临时 records/ 目录（服务器读的是同一路径）
+    rec_dir = records_dir
+    rec_dir.mkdir(parents=True, exist_ok=True)
 
     test_file = rec_dir / "_test_api_get.json"
     record = {
@@ -397,6 +415,22 @@ def test_get_game_state(client: SimpleClient):
     gs2 = resp.json()
     assert gs2["game_id"] == gid
     _assert_gamestate_shape(gs2)
+
+
+# ────────────────────────────────────────────────────────────────
+# 测试：无模型时 with_eval=true 不报错、eval 为 null
+# （置于无模型区段：client_with_model 会把模型加载进共享的 _model_state 全局，
+#   一旦加载后 client 服务器也可见，故此用例必须在任何模型用例之前运行。）
+# ────────────────────────────────────────────────────────────────
+def test_with_eval_no_model_returns_null(client: SimpleClient):
+    """无模型时 with_eval=true 不报错，eval 为 null。"""
+    gs0 = _new_hvh(client)
+    gid = gs0["game_id"]
+    resp = client.get(f"/api/game/{gid}", params={"with_eval": "true"})
+    assert resp.status_code == 200
+    gs = resp.json()
+    _assert_gamestate_shape(gs)
+    assert gs.get("eval") is None, f"无模型时 eval 应为 null，实际 {gs.get('eval')}"
 
 
 # ────────────────────────────────────────────────────────────────
@@ -500,17 +534,15 @@ def client_with_model(tmp_path_factory):
 
 
 # ────────────────────────────────────────────────────────────────
-# 测试：hva eval.value 语义（评估条符号契约）
-# DESIGN §13: eval.value 随 GameState 附带，联合 side_to_move 解读。
-# 约定：AI 走子前 MCTS 以 AI 方视角运算，walk_val 为 AI 期望值；
-#        AI 走子后 side_to_move 切到人类侧：
-#          - AI=黑 → side_to_move="red"  → 红方 POV = -eval.value
-#          - AI=红 → side_to_move="black" → 红方 POV = +eval.value
-# 该契约决定前端 updateEvalBar 必须在 side_to_move=="red" 时取反（而非"black"）。
+# 测试：hva eval 语义（评估条符号契约，DESIGN §13）
+# 新契约：eval 对象带显式 "side"（"red"|"black"），声明 value 是哪一方视角
+#   （= MCTS 运行时的走子方）。AI 落子附带的 eval：side = 落子前的走子方（AI 方）。
+#   前端据 eval.side 换算红方视角（side=="red" 取 value，否则取 -value），
+#   不再靠 side_to_move 反推（历史上出过符号颠倒 bug 的推断链）。
 # ────────────────────────────────────────────────────────────────
 
-def test_hva_eval_value_in_range_human_red(client_with_model: SimpleClient):
-    """hva human=red：AI（黑）回着后 eval.value ∈ [-1,1]，side_to_move 应回到 "red"。"""
+def test_hva_eval_side_is_ai_human_red(client_with_model: SimpleClient):
+    """hva human=red：AI 执黑，回着后 eval.side 恒为 "black"（AI 方），value ∈ [-1,1]。"""
     resp = client_with_model.post("/api/game/new",
                                   body={"mode": "hva", "human_side": "red", "sims": 4})
     assert resp.status_code == 200
@@ -537,14 +569,13 @@ def test_hva_eval_value_in_range_human_red(client_with_model: SimpleClient):
     assert v is not None, "eval 缺少 value 字段"
     assert -1.0 <= float(v) <= 1.0, f"eval.value={v} 超出 [-1,1]"
 
-    # 约定：AI=黑走后 side_to_move="red"；前端应对 eval.value 取反得红方 POV
-    # （见 app.js updateEvalBar：negate when side_to_move === "red"）
-    # 此处只验证符号约定可推导：不测具体值，只确认字段存在且在范围内。
+    # 核心断言：eval.side 恒等于 AI 方（黑），与 side_to_move（已切回红）无关。
+    assert ev.get("side") == "black", f"预期 eval.side=black（AI 方），实际 {ev.get('side')}"
     assert ev.get("top_moves") is not None, "eval 缺少 top_moves 字段"
 
 
-def test_hva_eval_value_in_range_human_black(client_with_model: SimpleClient):
-    """hva human=black：AI（红）先走，eval.value ∈ [-1,1]，side_to_move 应为 "black"。"""
+def test_hva_eval_side_is_ai_human_black(client_with_model: SimpleClient):
+    """hva human=black：AI 执红先走，eval.side 恒为 "red"（AI 方），value ∈ [-1,1]。"""
     resp = client_with_model.post("/api/game/new",
                                   body={"mode": "hva", "human_side": "black", "sims": 4})
     assert resp.status_code == 200
@@ -562,13 +593,53 @@ def test_hva_eval_value_in_range_human_black(client_with_model: SimpleClient):
     assert v is not None, "eval 缺少 value 字段"
     assert -1.0 <= float(v) <= 1.0, f"eval.value={v} 超出 [-1,1]"
 
-    # 约定：AI=红走后 side_to_move="black"；前端不应对 eval.value 取反（eval 已是红方视角）
+    # 核心断言：eval.side 恒等于 AI 方（红），与 side_to_move（黑）无关。
+    assert ev.get("side") == "red", f"预期 eval.side=red（AI 方），实际 {ev.get('side')}"
+
     top = ev.get("top_moves", [])
     # top_moves 应按概率降序排列
     for i in range(len(top) - 1):
         assert top[i]["prob"] >= top[i+1]["prob"] - 1e-9, (
             f"top_moves 未降序：[{i}].prob={top[i]['prob']} > [{i+1}].prob={top[i+1]['prob']}"
         )
+
+
+def test_with_eval_side_is_side_to_move(client_with_model: SimpleClient):
+    """GET /api/game/{id}?with_eval=true：eval.side == 当前 side_to_move，value ∈ [-1,1]。"""
+    resp = client_with_model.post("/api/game/new",
+                                  body={"mode": "hvh", "human_side": "red", "sims": 4})
+    assert resp.status_code == 200
+    gs0 = resp.json()
+    gid = gs0["game_id"]
+
+    resp2 = client_with_model.get(f"/api/game/{gid}",
+                                  params={"with_eval": "true", "sims": "4"})
+    assert resp2.status_code == 200
+    gs = resp2.json()
+    ev = gs.get("eval")
+    assert ev is not None, "with_eval=true 有模型未终局时 eval 不应为 null"
+    v = ev.get("value")
+    assert v is not None and -1.0 <= float(v) <= 1.0, f"eval.value={v} 超出 [-1,1]"
+    # 未走子 → side_to_move 仍为 red；eval.side 应等于当前 side_to_move
+    assert ev.get("side") == gs["side_to_move"], (
+        f"eval.side={ev.get('side')} 应等于 side_to_move={gs['side_to_move']}"
+    )
+    assert gs["side_to_move"] == "red"
+
+    # 走一步后轮到黑方，eval.side 必须跟着变为 black——
+    # 防止实现硬编码 side="red" 仍能通过初始局面的断言
+    resp3 = client_with_model.post(f"/api/game/{gid}/move", body={"move": "h2e2"})
+    assert resp3.status_code == 200
+    resp4 = client_with_model.get(f"/api/game/{gid}",
+                                  params={"with_eval": "true", "sims": "4"})
+    assert resp4.status_code == 200
+    gs2 = resp4.json()
+    ev2 = gs2.get("eval")
+    assert ev2 is not None
+    assert gs2["side_to_move"] == "black"
+    assert ev2.get("side") == "black", (
+        f"黑方待走时 eval.side={ev2.get('side')} 应为 black"
+    )
 
 
 def test_hint_value_in_range(client_with_model: SimpleClient):
@@ -583,6 +654,8 @@ def test_hint_value_in_range(client_with_model: SimpleClient):
     h = resp2.json()
     assert "move" in h and "value" in h and "top_moves" in h
     assert -1.0 <= float(h["value"]) <= 1.0, f"hint value={h['value']} out of range"
+    # DESIGN §13：hint 的 value 必带 side 声明视角（初始局面红方待走）
+    assert h.get("side") == "red", f"hint.side={h.get('side')} 应为当前走子方 red"
     tops = h["top_moves"]
     for i in range(len(tops) - 1):
         assert tops[i]["prob"] >= tops[i+1]["prob"] - 1e-9, (
@@ -603,6 +676,98 @@ def test_resign(client: SimpleClient):
     assert gs2["game_over"] is True
     assert gs2["result"] in ("1-0", "0-1")
     assert gs2["termination"] == "resign"
+
+
+# ────────────────────────────────────────────────────────────────
+# 测试：终局自动落盘（DESIGN §12）
+# records_dir fixture（autouse）已把 gui.server._RECORDS_DIR 指向临时目录。
+# ────────────────────────────────────────────────────────────────
+_RESULT_ZH = {"1-0": "红胜", "0-1": "黑胜", "1/2-1/2": "和棋"}
+
+
+def test_autosave_on_resign_creates_one_file(client: SimpleClient, records_dir: Path):
+    """(a) hvh 认输 → records/gui 下恰好一个文件；文件名格式正确、胜负与认输方相反、与 result 一致。"""
+    gs = _new_hvh(client)   # human_side=red，初始红方待走
+    gid = gs["game_id"]
+
+    resp = client.post(f"/api/game/{gid}/resign")
+    assert resp.status_code == 200
+    result = resp.json()["result"]
+    # 红方（初始走子方）认输 → 黑胜
+    assert result == "0-1", f"预期红方认输→黑胜(0-1)，实际 {result}"
+
+    gui_dir = records_dir / "gui"
+    files = sorted(gui_dir.glob("*.json"))
+    assert len(files) == 1, f"认输后应恰好一个文件，实际 {files}"
+
+    name = files[0].name
+    m = re.match(r"^\d{8}-\d{6}_hvh_(红胜|黑胜)\.json$", name)
+    assert m, f"文件名不匹配约定格式: {name!r}"
+    zh = m.group(1)
+    # 胜负与认输方相反（红认输→黑胜）且与 GameState.result 一致
+    assert zh == "黑胜", f"红方认输文件名应为黑胜，实际 {zh}"
+    assert zh == _RESULT_ZH[result], f"文件名胜负 {zh} 与 result {result} 不一致"
+
+
+def test_autosave_content_readable_and_matches_history(client: SimpleClient, records_dir: Path):
+    """(b) 落盘文件能被 read_records 读回，moves 与 move_history 一致，format 正确。"""
+    from xiangqi.records import read_records
+
+    gs = _new_hvh(client)
+    gid = gs["game_id"]
+    client.post(f"/api/game/{gid}/move", body={"move": "h2e2"})
+    client.post(f"/api/game/{gid}/move", body={"move": "h9g7"})
+    resp = client.post(f"/api/game/{gid}/resign")
+    assert resp.status_code == 200
+    gs_final = resp.json()
+
+    gui_dir = records_dir / "gui"
+    files = sorted(gui_dir.glob("*.json"))
+    assert len(files) == 1, f"应恰好一个文件，实际 {files}"
+
+    recs = read_records(files[0])
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec["format"] == "xiangqi-record-v1"
+    expected_moves = [e["move"] for e in gs_final["move_history"]]
+    assert rec["moves"] == expected_moves, f"落盘 moves {rec['moves']} != 历史 {expected_moves}"
+    assert rec["moves"] == ["h2e2", "h9g7"]
+
+
+def test_autosave_undo_then_resign_replaces_file(client: SimpleClient, records_dir: Path):
+    """(c) 悔棋（撤销认输）后再认输 → 仍只有一个文件（旧文件被替换）。"""
+    gs = _new_hvh(client)
+    gid = gs["game_id"]
+
+    resp1 = client.post(f"/api/game/{gid}/resign")
+    assert resp1.status_code == 200
+    gui_dir = records_dir / "gui"
+    assert len(list(gui_dir.glob("*.json"))) == 1
+
+    # 悔棋：撤销认输，对局恢复未终局
+    resp2 = client.post(f"/api/game/{gid}/undo")
+    assert resp2.status_code == 200
+    assert resp2.json()["game_over"] is False
+
+    # 再次认输
+    resp3 = client.post(f"/api/game/{gid}/resign")
+    assert resp3.status_code == 200
+
+    files = list(gui_dir.glob("*.json"))
+    assert len(files) == 1, f"再次认输后应仍只有一个文件（旧文件被替换），实际 {files}"
+
+
+def test_autosave_not_written_when_game_not_over(client: SimpleClient, records_dir: Path):
+    """(d) 未终局的对局不产生任何落盘文件。"""
+    gs = _new_hvh(client)
+    gid = gs["game_id"]
+    resp = client.post(f"/api/game/{gid}/move", body={"move": "h2e2"})
+    assert resp.status_code == 200
+    assert resp.json()["game_over"] is False
+
+    gui_dir = records_dir / "gui"
+    files = list(gui_dir.glob("*.json")) if gui_dir.exists() else []
+    assert files == [], f"未终局不应产生文件，实际 {files}"
 
 
 # ────────────────────────────────────────────────────────────────
@@ -659,6 +824,25 @@ def test_ava_ai_move_logs_eval_to_stdout(client_with_model: SimpleClient, capsys
     assert "AI落子" in captured.out
     assert "红方胜率" in captured.out
     assert "%" in captured.out
+
+
+def test_ava_export_both_sides_ai(client_with_model: SimpleClient):
+    """ava 模式导出：双方均应标为 "ai"（历史 bug：红方残留 "human"）。"""
+    resp = client_with_model.post(
+        "/api/game/new", body={"mode": "ava", "human_side": "red", "sims": 4}
+    )
+    assert resp.status_code == 200
+    gid = resp.json()["game_id"]
+
+    # 推进一步（不是必须，但更贴近真实导出场景）
+    client_with_model.post(f"/api/game/{gid}/ai_move", body={"sims": 4})
+
+    resp2 = client_with_model.get(f"/api/game/{gid}/export")
+    assert resp2.status_code == 200
+    record = resp2.json()
+    assert record["red"] == "ai", f"ava 红方应为 ai，实际 {record['red']}"
+    assert record["black"] == "ai", f"ava 黑方应为 ai，实际 {record['black']}"
+    assert record["meta"]["mode"] == "ava"
 
 
 def test_hint_logs_eval_to_stdout(client_with_model: SimpleClient, capsys):

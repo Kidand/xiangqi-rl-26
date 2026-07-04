@@ -2,7 +2,9 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#f5f0e8" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#1a1a1a" media="(prefers-color-scheme: dark)" />
   <title>中国象棋 AlphaZero</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -20,10 +22,10 @@
 <!-- ═══ 主体 ════════════════════════════════════════════════════════════ -->
 <div id="main">
 
-  <!-- ── 棋盘区 ──────────────────────────────────────────────────── -->
+  <!-- ── 棋盘区（评估条 + 棋盘 + 操作栏） ─────────────────────────── -->
   <div id="board-area">
     <div id="board-with-eval">
-      <!-- 评估条 -->
+      <!-- 评估条（方向随断点切换：桌面纵向红在下，移动横向红在左） -->
       <div id="eval-bar-wrap">
         <div id="eval-bar">
           <div id="eval-fill"></div>
@@ -31,14 +33,26 @@
         <div id="eval-label">红方胜率</div>
       </div>
 
-      <!-- 棋盘 -->
+      <!-- 棋盘（SVG 按 viewBox 等比缩放，尺寸由 #board-container 约束） -->
       <div id="board-container">
         <svg id="board-svg"></svg>
       </div>
     </div>
+
+    <!-- 操作按钮（紧贴棋盘下方，桌面与移动端统一） -->
+    <div id="action-btns">
+      <button class="btn primary" id="btn-new-game">新对局</button>
+      <button class="btn" id="btn-undo">悔棋</button>
+      <button class="btn danger" id="btn-resign">认输</button>
+      <button class="btn" id="btn-flip">翻转</button>
+      <button class="btn" id="btn-hint">提示</button>
+      <button class="btn" id="btn-export">导出</button>
+      <button class="btn" id="btn-return-live" style="display:none">↩ 返回</button>
+      <button class="btn" id="btn-ava-toggle" style="display:none">▶ 继续</button>
+    </div>
   </div>
 
-  <!-- ── 右侧面板 ─────────────────────────────────────────────────── -->
+  <!-- ── 侧面板（桌面右栏 / 移动端棋盘下方） ─────────────────────── -->
   <div id="panel">
 
     <!-- 页签按钮 -->
@@ -50,18 +64,6 @@
 
     <!-- ══ 对局页签 ══════════════════════════════════════════════ -->
     <div class="tab-pane active" id="tab-game">
-
-      <!-- 操作按钮 -->
-      <div id="action-btns">
-        <button class="btn primary" id="btn-new-game">新对局</button>
-        <button class="btn" id="btn-undo">悔棋</button>
-        <button class="btn danger" id="btn-resign">认输</button>
-        <button class="btn" id="btn-flip">翻转</button>
-        <button class="btn" id="btn-hint">提示</button>
-        <button class="btn" id="btn-export">导出</button>
-        <button class="btn" id="btn-return-live" style="display:none">↩ 返回</button>
-        <button class="btn" id="btn-ava-toggle" style="display:none">▶ 继续</button>
-      </div>
 
       <!-- 着法列表 -->
       <div id="moves-header">着法记录</div>
@@ -98,7 +100,7 @@
       <div id="records-section">
         <div class="section-title" style="display:flex;align-items:center;justify-content:space-between;padding-right:10px">
           <span>自对弈记录</span>
-          <button class="btn" id="btn-records-refresh" style="padding:2px 8px;font-size:11px">刷新</button>
+          <button class="btn btn-compact" id="btn-records-refresh">刷新</button>
         </div>
         <div id="records-list">
           <div class="text-sm text-muted" style="padding:6px 10px">点击刷新加载</div>
@@ -169,7 +171,7 @@
 <!-- Toast 容器 -->
 <div id="toast-container"></div>
 
-<!-- ═══ 新对局对话框 ══════════════════════════════════════════════════ -->
+<!-- ═══ 新对局对话框（桌面居中模态 / 移动端底部弹层） ══════════════════ -->
 <div class="dialog-overlay" id="dialog-new-game" role="dialog" aria-modal="true" aria-labelledby="dlg-title">
   <div class="dialog">
     <h2 id="dlg-title">新对局</h2>
@@ -240,38 +242,6 @@
 <!-- 加载脚本（board.js 先于 app.js） -->
 <script src="board.js"></script>
 <script src="app.js"></script>
-
-<!-- 启动后隐藏/显示相关按钮的补丁逻辑 -->
-<script>
-// 根据模式显隐 AVA 按钮和返回按钮
-document.addEventListener("DOMContentLoaded", () => {
-  // 监听 App 状态变化（通过 applyGameState 触发）
-  const origApply = window._origApplyGameState = applyGameState;
-  // 返回按钮：历史跳转时显示
-  const btnReturn = document.getElementById("btn-return-live");
-  const btnAva    = document.getElementById("btn-ava-toggle");
-
-  // 监听对局模式切换，动态显隐 AVA 按钮
-  const modeRadios = document.querySelectorAll("input[name='new-mode']");
-  modeRadios.forEach(r => {
-    r.addEventListener("change", () => {
-      const sideGroup = document.getElementById("side-group");
-      sideGroup.style.display = r.value === "ava" ? "none" : "";
-    });
-  });
-
-  // 重写部分 App 流程以更新按钮可见性
-  // 此处通过轮询 App.viewingHistory / App.mode 更新按钮状态
-  function updateBtns() {
-    if (btnReturn) btnReturn.style.display = App.viewingHistory ? "" : "none";
-    if (btnAva)    btnAva.style.display    = App.mode === "ava"  ? "" : "none";
-  }
-
-  // 每 200ms 检查一次（足够，不涉及性能问题）
-  setInterval(updateBtns, 200);
-  updateBtns();
-});
-</script>
 
 </body>
 </html>

@@ -246,6 +246,8 @@ JSON 一局一条；文件为 `.jsonl`（多局）或 `.json`（单局）。GUI 
 
 回放时逐着重演得到每步 FEN。GUI 导出时额外提供含每步 FEN 的 `fens` 数组（可选字段）。GUI 还兼容导入纯文本格式：首行 FEN（或省略=初始局面），其后每行/空格分隔的 UCCI 着法。
 
+**GUI 对局自动落盘**：GUI 对局（hva/hvh/ava）到达终局（自然终局或认输）时由服务端自动保存单局 `.json`（v1 格式，含 `fens`，内容与导出端点一致）到仓库根目录 `records/gui/`，无需用户点导出。文件名 `YYYYMMDD-HHMMSS_<mode>_<胜负>.json`，胜负 ∈ `红胜|黑胜|和棋`（对应 result `1-0|0-1|1/2-1/2`），时间戳为终局时刻；同名冲突追加 `-2`、`-3` 序号。每局至多一份记录：悔棋后再次终局以新文件替换旧文件。records 浏览器（`/api/records/list` 递归扫描）自然可见这些文件。
+
 ## 13. GUI API 契约（FastAPI，前后端共同遵守）
 
 Base: `http://127.0.0.1:8000`。静态页面挂 `/`。所有响应 JSON；错误 `{"error": "..."}`
@@ -256,18 +258,18 @@ Base: `http://127.0.0.1:8000`。静态页面挂 `/`。所有响应 JSON；错误
  "legal_moves": ["a0a1", "..."], "last_move": "h2e2",
  "in_check": false, "game_over": false, "result": null, "termination": null,
  "move_history": [{"move": "h2e2", "chinese": "炮二平五", "fen_after": "..."}],
- "eval": {"value": 0.12, "top_moves": [{"move": "b2e2", "prob": 0.31, "visits": 124}]} }
+ "eval": {"value": 0.12, "side": "red", "top_moves": [{"move": "b2e2", "prob": 0.31, "visits": 124}]} }
 ```
-`eval` 仅在有模型且请求带 `with_eval=true` 或走完 AI 着法后附带。
+`eval` 仅在有模型且请求带 `with_eval=true` 或走完 AI 着法后附带。`eval.side`（`"red"|"black"`）显式声明 `value` 是哪一方视角（= MCTS 运行时的走子方，`value` 恒为该方期望）：AI 落子附带的 eval 其 `side` 为落子前的走子方（AI 方）；`with_eval` 请求返回的 `side` 为当前待走方（`side_to_move`）。前端据 `eval.side` 换算红方胜率（`side=="red"` 取 `value`，否则取 `-value`），不得再靠 `side_to_move` 反推。
 
 | 方法/路径 | 请求体 | 响应 |
 |---|---|---|
 | `POST /api/game/new` | `{"mode":"hva"\|"ava"\|"hvh", "human_side":"red"\|"black", "fen":可选, "sims":400}` | GameState（若 AI 执红先走，响应已含 AI 首着） |
-| `GET /api/game/{id}` | – | GameState |
+| `GET /api/game/{id}?with_eval=true[&sims=N]` | – | GameState；`with_eval=true` 且有模型且未终局时在该局锁内跑一次 MCTS，`eval.side`=当前 `side_to_move`（`sims` 默认 400），否则 `eval` 为 null |
 | `POST /api/game/{id}/move` | `{"move":"h2e2"}` | GameState；hva 模式下已包含 AI 回着（`ai_move` 字段同时单列） |
 | `POST /api/game/{id}/ai_move` | `{"sims":可选}` | GameState（ava 单步推进用） |
 | `POST /api/game/{id}/undo` | – | GameState（hva 撤销一整回合两步） |
-| `GET /api/game/{id}/hint?sims=400` | – | `{"move","chinese","value","top_moves":[...]}` |
+| `GET /api/game/{id}/hint?sims=400` | – | `{"move","chinese","value","side","top_moves":[...]}`（`value` 为 `side` 方即当前走子方视角） |
 | `GET /api/game/{id}/export` | – | xiangqi-record-v1 JSON（含 fens 数组） |
 | `POST /api/replay/load` | `{"record": <v1 JSON>}` 或 `{"text": "FEN\n着法..."}` | `{"fens":[逐步FEN], "moves":[...], "chinese":[...], "result", "start_fen"}` |
 | `GET /api/records/list` | – | `{"files":[{"path","games","mtime"}]}`（扫描 records/ 递归） |
@@ -276,14 +278,16 @@ Base: `http://127.0.0.1:8000`。静态页面挂 `/`。所有响应 JSON；错误
 | `GET /api/model/info` | – | `{"loaded":bool,"path","params","blocks","filters","device"}` |
 | `POST /api/game/{id}/resign` | – | GameState（人认输） |
 
-无模型加载时 hva/ava 返回 400（提示先加载模型）；hvh 与回放不需要模型。AI 走子在线程池执行避免阻塞事件循环。启动参数：`python -m gui.server --model ckpts/best.pt --port 8000 --sims 400 --device cpu`。
+无模型加载时 hva/ava 返回 400（提示先加载模型）；hvh 与回放不需要模型。AI 走子在线程池执行避免阻塞事件循环。终局自动落盘（§12）是服务端行为、非端点，在该局锁内完成。启动参数：`python -m gui.server --model ckpts/best.pt --port 8000 --sims 400 --device cpu`；手机/局域网对战加 `--host 0.0.0.0` 后用手机浏览器访问 `http://<电脑IP>:8000`。
 
 ## 14. GUI 前端功能清单（gui/web/，原生 JS，无构建）
 
+- 响应式布局（纯 CSS，无构建）：桌面 ≥900px 双栏（左棋盘区+右侧 320px 面板）；<900px 单列纵向滚动（顶栏 → 横向评估条 → 满宽棋盘 → 触控操作栏 → 页签内容），横屏矮屏（高 ≤540px）棋盘按高定尺寸、面板并列。棋盘 SVG 按 viewBox 等比缩放；触控目标 ≥44px（`pointer: coarse`）；`touch-action: manipulation` 消除双击缩放延迟；iOS 安全区适配（`viewport-fit=cover` + `env(safe-area-inset-*)`）；视口高度用 `dvh`（`vh` 回退）。
+- 评估条方向随布局切换：桌面纵向（红在下），移动端横向（红在左）。JS 只写 CSS 变量 `--eval-pct`（50% = 均势），填充方向与轴向由 CSS 按断点决定，JS 不感知布局。
 - SVG/Canvas 棋盘：木纹配色、楚河汉界、九宫斜线、圆形棋子（中文字），红黑分色。
 - 交互：点选走子（选中高亮 + 合法落点圆点提示）、最后一着高亮、将军红光提示、吃子/走子音效可关。
 - 对战：新对局对话框（模式 hva/ava/hvh、执红/执黑、难度=sims 档位：快 100/标准 400/强 1200、自定义 FEN 开局）。
-- 辅助：评估条（红方胜率视角）、提示按钮（箭头显示 AI 推荐着 + top-5 列表）、悔棋、认输、翻转棋盘、着法列表（中文纵队记法，点击跳转局面）。
+- 辅助：评估条（红方胜率视角，按 `eval.side` 换算；hvh 模式若已加载模型，每步局面更新后台请求 `with_eval=true` 刷新）、提示按钮（箭头显示 AI 推荐着 + top-5 列表）、悔棋、认输、翻转棋盘、着法列表（中文纵队记法，点击跳转局面）。
 - 复盘：导入（文件选择 .json/.jsonl/.txt 或粘贴文本）、records/ 浏览器（列出自我博弈记录选局）、播放控制（|< < 播放/暂停 > >|、速度）、导出当前对局（下载 .json）。
 - AI vs AI 观战：自动逐步推进 + 暂停。
 - 状态栏：模型信息、当前评估值、思考中指示。

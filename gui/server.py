@@ -123,6 +123,13 @@ class _GameData:
     # 认输状态（规则引擎不支持认输，在数据层处理）
     resigned: bool = False
     resign_result: Optional[str] = None  # "1-0" or "0-1"
+    # 终局自动落盘的记录文件路径（每局至多一份；悔棋后再次终局以新文件替换旧文件）
+    record_file: Optional[Path] = None
+    # 每局一把异步锁：所有读写该局 board 的端点在锁内完成"读-算-写"全链路
+    # （含跨 await asyncio.to_thread 的 MCTS 窗口），避免工作线程 copy()/MCTS 与
+    # 事件循环线程 push/pop 交错撕裂局面；不同 game_id 之间互不阻塞。
+    # 只在端点层获取；内部辅助函数（_apply_move/_get_game_start_fen 等）不得重复获取。
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, compare=False, repr=False)
 
 
 # 内存 store
@@ -351,6 +358,108 @@ def _log_game_over(game: _GameData) -> None:
 
 
 # ===========================================================================
+# 对局记录构造与终局自动落盘（DESIGN §12）
+# ===========================================================================
+# 胜负中文映射（result → 文件名片段），用于自动落盘文件名。
+_RESULT_ZH = {"1-0": "红胜", "0-1": "黑胜", "1/2-1/2": "和棋"}
+
+
+def _build_record(game: _GameData) -> dict:
+    """把当前对局构造为 xiangqi-record-v1 记录 dict（含 fens）。
+
+    导出端点与终局自动落盘共用本函数，保证两处内容逐字一致：
+    起始 FEN 逆推、逐步重演得 fens、result/termination（认输优先）、
+    red/black 身份三分支（ava→ai/ai，hvh→human/human，hva 按人执方）。
+    """
+    board = game.board
+    moves = [e.move for e in game.move_history]
+    start_fen = _get_game_start_fen(game)
+
+    # 从头重演得到每步 FEN（失败时退回 move_history 里的 fen_after）
+    fens: list = []
+    try:
+        replay = replay_record({
+            "format": RECORD_FORMAT,
+            "start_fen": start_fen,
+            "moves": moves,
+        })
+        fens = replay["fens"]
+    except Exception:
+        fens = [e.fen_after for e in game.move_history]
+
+    # 结果优先取认输，其次取规则引擎
+    final_result = game.resign_result if game.resigned else board.result()
+    final_term = "resign" if game.resigned else (board.termination() if board.result() else None)
+
+    # 双方身份：ava 两方均为 ai；hvh 两方均为 human；hva 按人执方区分。
+    if game.mode == "ava":
+        red_who, black_who = "ai", "ai"
+    elif game.mode == "hvh":
+        red_who, black_who = "human", "human"
+    else:  # hva
+        red_who = "human" if game.human_side == "red" else "ai"
+        black_who = "human" if game.human_side == "black" else "ai"
+
+    return {
+        "format": RECORD_FORMAT,
+        "start_fen": start_fen,
+        "moves": moves,
+        "result": final_result,
+        "termination": final_term,
+        "plies": len(moves),
+        "red": red_who,
+        "black": black_who,
+        "meta": {
+            "mode": game.mode,
+            "sims": game.sims,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        },
+        "fens": fens,
+    }
+
+
+def _maybe_autosave_record(game: _GameData) -> None:
+    """对局终局时自动把单局记录落盘到 ``records/gui/``（DESIGN §12）。
+
+    - 未终局直接返回；
+    - 运行时经模块全局 ``_RECORDS_DIR`` 取根目录（便于测试 monkeypatch）；
+    - 文件名 ``YYYYMMDD-HHMMSS_<mode>_<胜负>.json``，同名冲突追加 -2/-3 序号；
+    - 每局至多一份：悔棋后再次终局若新路径与旧文件不同，先删旧文件再写新文件；
+    - 写入用 tmp + os.replace 原子换名；落盘失败不得让端点 5xx，仅打印警告。
+    """
+    if not _game_is_over(game):
+        return
+    try:
+        record = _build_record(game)
+        zh = _RESULT_ZH.get(record.get("result"), "未知")
+        gui_dir = _RECORDS_DIR / "gui"
+        gui_dir.mkdir(parents=True, exist_ok=True)
+
+        base = f"{time.strftime('%Y%m%d-%H%M%S')}_{game.mode}_{zh}"
+        # 同名冲突追加 -2/-3 序号；若冲突文件正是本局旧记录则复用（原地覆盖）。
+        target = gui_dir / f"{base}.json"
+        seq = 2
+        while target.exists() and target != game.record_file:
+            target = gui_dir / f"{base}-{seq}.json"
+            seq += 1
+
+        # 每局至多一份：新路径与旧文件不同则先删除旧文件。
+        old = game.record_file
+        if old is not None and old != target:
+            old.unlink(missing_ok=True)
+
+        # 原子写：tmp + os.replace（与仓库 checkpoint 保存习惯一致）。
+        data = json.dumps(record, ensure_ascii=False, indent=2)
+        tmp = target.with_name(target.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp, target)
+        game.record_file = target
+    except Exception as e:
+        print(f"[WARNING] 自动落盘对局记录失败: {e}", file=sys.stderr)
+
+
+# ===========================================================================
 # FastAPI 应用
 # ===========================================================================
 app = FastAPI(title="Xiangqi GUI Server", version="1.0.0")
@@ -431,46 +540,71 @@ async def new_game(req: NewGameRequest):
     )
     _games[game_id] = game
 
-    ai_move_str = None
-    eval_info = None
+    # game_id 在响应返回前对客户端不可见，理论上无并发；但发布到 _games 之后
+    # 仍统一持锁完成"AI 首着 + 终局落盘"，与 DESIGN §13"锁内完成"的声明一致。
+    async with game.lock:
+        ai_move_str = None
+        eval_info = None
 
-    # hva：若 AI 执红且初始局面红先，AI 先走
-    if mode == "hva" and game.board.result() is None:
-        ai_is_red = (req.human_side == "black")
-        ai_side = RED if ai_is_red else BLACK
-        if game.board.side_to_move == ai_side:
-            t0 = time.monotonic()
-            visits, root_val = await asyncio.to_thread(
-                _run_mcts_sync, game.board, game.sims
-            )
-            elapsed_ms = (time.monotonic() - t0) * 1000.0
-            ai_mv = _pick_best_move(game.board, visits)
-            if ai_mv:
-                ai_move_str = move_to_uci(ai_mv)
-                top_moves = _visits_to_top_moves(game.board, visits)
-                eval_info = {
-                    "value": float(root_val),   # 当前走子方视角
-                    "top_moves": top_moves,
-                }
-                _apply_move(game, ai_mv)
-                _log_eval(
-                    game, "AI落子", ai_move_str, game.move_history[-1].chinese,
-                    float(root_val), ai_side, game.sims, elapsed_ms, top_moves,
+        # hva：若 AI 执红且初始局面红先，AI 先走
+        if mode == "hva" and game.board.result() is None:
+            ai_is_red = (req.human_side == "black")
+            ai_side = RED if ai_is_red else BLACK
+            if game.board.side_to_move == ai_side:
+                t0 = time.monotonic()
+                visits, root_val = await asyncio.to_thread(
+                    _run_mcts_sync, game.board, game.sims
                 )
+                elapsed_ms = (time.monotonic() - t0) * 1000.0
+                ai_mv = _pick_best_move(game.board, visits)
+                if ai_mv:
+                    ai_move_str = move_to_uci(ai_mv)
+                    top_moves = _visits_to_top_moves(game.board, visits)
+                    eval_info = {
+                        "value": float(root_val),   # AI 方（落子前的走子方）视角
+                        "side": side_name(ai_side),  # 显式声明 value 是哪一方视角
+                        "top_moves": top_moves,
+                    }
+                    _apply_move(game, ai_mv)
+                    _log_eval(
+                        game, "AI落子", ai_move_str, game.move_history[-1].chinese,
+                        float(root_val), ai_side, game.sims, elapsed_ms, top_moves,
+                    )
 
-    _log_game_over(game)
-    return _build_game_state(game, ai_move_str=ai_move_str, eval_info=eval_info)
+        _log_game_over(game)
+        _maybe_autosave_record(game)
+        return _build_game_state(game, ai_move_str=ai_move_str, eval_info=eval_info)
 
 
 # ===========================================================================
 # GET /api/game/{id}
 # ===========================================================================
 @app.get("/api/game/{game_id}")
-async def get_game(game_id: str):
+async def get_game(
+    game_id: str,
+    with_eval: bool = Query(default=False),
+    sims: int = Query(default=400),
+):
     game = _games.get(game_id)
     if game is None:
         raise HTTPException(404, detail={"error": "游戏不存在"})
-    return _build_game_state(game)
+
+    # 全链路持锁：with_eval 的 MCTS 会 board.copy() + 数秒计算，须与 /move、/undo 等互斥。
+    async with game.lock:
+        eval_info = None
+        # with_eval=true 且有模型且未终局时，跑一次 MCTS 得到当前走子方视角的评估。
+        if with_eval and _is_model_loaded() and not _game_is_over(game):
+            side_mover = game.board.side_to_move
+            visits, root_val = await asyncio.to_thread(
+                _run_mcts_sync, game.board, sims
+            )
+            top_moves = _visits_to_top_moves(game.board, visits)
+            eval_info = {
+                "value": float(root_val),      # 当前走子方视角
+                "side": side_name(side_mover),  # = 当前 side_to_move
+                "top_moves": top_moves,
+            }
+        return _build_game_state(game, eval_info=eval_info)
 
 
 # ===========================================================================
@@ -482,53 +616,58 @@ async def make_move(game_id: str, req: MoveRequest):
     if game is None:
         raise HTTPException(404, detail={"error": "游戏不存在"})
 
-    if _game_is_over(game):
-        raise HTTPException(400, detail={"error": "对局已结束"})
+    # 全链路持锁：人类走子 + 可能的 AI 回着（含 to_thread 的数秒 MCTS）须原子完成，
+    # 否则窗口内被 /undo 等改动局面会导致用旧 visits 匹配新局面而错配着法。
+    async with game.lock:
+        if _game_is_over(game):
+            raise HTTPException(400, detail={"error": "对局已结束"})
 
-    # 解析着法
-    try:
-        mv = uci_to_move(req.move)
-    except ValueError:
-        raise HTTPException(400, detail={"error": f"着法格式错误: {req.move!r}"})
+        # 解析着法
+        try:
+            mv = uci_to_move(req.move)
+        except ValueError:
+            raise HTTPException(400, detail={"error": f"着法格式错误: {req.move!r}"})
 
-    # 合法性校验
-    legal = game.board.legal_moves()
-    if mv not in legal:
-        raise HTTPException(400, detail={"error": f"非法着法: {req.move}"})
+        # 合法性校验
+        legal = game.board.legal_moves()
+        if mv not in legal:
+            raise HTTPException(400, detail={"error": f"非法着法: {req.move}"})
 
-    # 应用人类走子
-    _apply_move(game, mv)
+        # 应用人类走子
+        _apply_move(game, mv)
 
-    ai_move_str = None
-    eval_info = None
+        ai_move_str = None
+        eval_info = None
 
-    # hva 模式：AI 自动回着
-    if game.mode == "hva" and game.board.result() is None:
-        human_side_int = RED if game.human_side == "red" else BLACK
-        # 轮到 AI 走
-        if game.board.side_to_move != human_side_int:
-            ai_side = game.board.side_to_move
-            t0 = time.monotonic()
-            visits, root_val = await asyncio.to_thread(
-                _run_mcts_sync, game.board, game.sims
-            )
-            elapsed_ms = (time.monotonic() - t0) * 1000.0
-            ai_mv = _pick_best_move(game.board, visits)
-            if ai_mv:
-                ai_move_str = move_to_uci(ai_mv)
-                top_moves = _visits_to_top_moves(game.board, visits)
-                eval_info = {
-                    "value": float(root_val),
-                    "top_moves": top_moves,
-                }
-                _apply_move(game, ai_mv)
-                _log_eval(
-                    game, "AI落子", ai_move_str, game.move_history[-1].chinese,
-                    float(root_val), ai_side, game.sims, elapsed_ms, top_moves,
+        # hva 模式：AI 自动回着
+        if game.mode == "hva" and game.board.result() is None:
+            human_side_int = RED if game.human_side == "red" else BLACK
+            # 轮到 AI 走
+            if game.board.side_to_move != human_side_int:
+                ai_side = game.board.side_to_move
+                t0 = time.monotonic()
+                visits, root_val = await asyncio.to_thread(
+                    _run_mcts_sync, game.board, game.sims
                 )
+                elapsed_ms = (time.monotonic() - t0) * 1000.0
+                ai_mv = _pick_best_move(game.board, visits)
+                if ai_mv:
+                    ai_move_str = move_to_uci(ai_mv)
+                    top_moves = _visits_to_top_moves(game.board, visits)
+                    eval_info = {
+                        "value": float(root_val),
+                        "side": side_name(ai_side),  # AI 方（落子前的走子方）视角
+                        "top_moves": top_moves,
+                    }
+                    _apply_move(game, ai_mv)
+                    _log_eval(
+                        game, "AI落子", ai_move_str, game.move_history[-1].chinese,
+                        float(root_val), ai_side, game.sims, elapsed_ms, top_moves,
+                    )
 
-    _log_game_over(game)
-    return _build_game_state(game, ai_move_str=ai_move_str, eval_info=eval_info)
+        _log_game_over(game)
+        _maybe_autosave_record(game)
+        return _build_game_state(game, ai_move_str=ai_move_str, eval_info=eval_info)
 
 
 # ===========================================================================
@@ -543,33 +682,37 @@ async def ai_move(game_id: str, req: AiMoveRequest):
     if not _is_model_loaded():
         raise HTTPException(400, detail={"error": "未加载模型"})
 
-    if _game_is_over(game):
-        raise HTTPException(400, detail={"error": "对局已结束"})
+    # 全链路持锁：MCTS 计算与落子须原子完成，避免 visits 匹配到被改动后的局面。
+    async with game.lock:
+        if _game_is_over(game):
+            raise HTTPException(400, detail={"error": "对局已结束"})
 
-    sims = req.sims if req.sims is not None else game.sims
+        sims = req.sims if req.sims is not None else game.sims
 
-    ai_side = game.board.side_to_move
-    t0 = time.monotonic()
-    visits, root_val = await asyncio.to_thread(
-        _run_mcts_sync, game.board, sims
-    )
-    elapsed_ms = (time.monotonic() - t0) * 1000.0
-    ai_mv = _pick_best_move(game.board, visits)
-    top_moves = _visits_to_top_moves(game.board, visits)
-    eval_info = {
-        "value": float(root_val),
-        "top_moves": top_moves,
-    }
-    if ai_mv:
-        ai_move_str = move_to_uci(ai_mv)
-        _apply_move(game, ai_mv)
-        _log_eval(
-            game, "AI落子", ai_move_str, game.move_history[-1].chinese,
-            float(root_val), ai_side, sims, elapsed_ms, top_moves,
+        ai_side = game.board.side_to_move
+        t0 = time.monotonic()
+        visits, root_val = await asyncio.to_thread(
+            _run_mcts_sync, game.board, sims
         )
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        ai_mv = _pick_best_move(game.board, visits)
+        top_moves = _visits_to_top_moves(game.board, visits)
+        eval_info = {
+            "value": float(root_val),
+            "side": side_name(ai_side),  # AI 方（落子前的走子方）视角
+            "top_moves": top_moves,
+        }
+        if ai_mv:
+            ai_move_str = move_to_uci(ai_mv)
+            _apply_move(game, ai_mv)
+            _log_eval(
+                game, "AI落子", ai_move_str, game.move_history[-1].chinese,
+                float(root_val), ai_side, sims, elapsed_ms, top_moves,
+            )
 
-    _log_game_over(game)
-    return _build_game_state(game, eval_info=eval_info)
+        _log_game_over(game)
+        _maybe_autosave_record(game)
+        return _build_game_state(game, eval_info=eval_info)
 
 
 # ===========================================================================
@@ -581,27 +724,29 @@ async def undo(game_id: str):
     if game is None:
         raise HTTPException(404, detail={"error": "游戏不存在"})
 
-    board = game.board
+    # 全链路持锁：pop 会改动 board，须与工作线程里的 copy()/MCTS 互斥。
+    async with game.lock:
+        board = game.board
 
-    # 认输后可撤销（还原认输状态，继续对局）
-    if game.resigned:
-        game.resigned = False
-        game.resign_result = None
+        # 认输后可撤销（还原认输状态，继续对局）
+        if game.resigned:
+            game.resigned = False
+            game.resign_result = None
+            return _build_game_state(game)
+
+        if not game.move_history:
+            raise HTTPException(400, detail={"error": "没有可撤销的着法"})
+
+        # hva：撤两步（AI + 人），hvh：撤一步
+        steps = 2 if game.mode == "hva" else 1
+        steps = min(steps, len(game.move_history))
+
+        for _ in range(steps):
+            if game.move_history:
+                board.pop()
+                game.move_history.pop()
+
         return _build_game_state(game)
-
-    if not game.move_history:
-        raise HTTPException(400, detail={"error": "没有可撤销的着法"})
-
-    # hva：撤两步（AI + 人），hvh：撤一步
-    steps = 2 if game.mode == "hva" else 1
-    steps = min(steps, len(game.move_history))
-
-    for _ in range(steps):
-        if game.move_history:
-            board.pop()
-            game.move_history.pop()
-
-    return _build_game_state(game)
 
 
 # ===========================================================================
@@ -616,37 +761,41 @@ async def hint(game_id: str, sims: int = Query(default=400)):
     if not _is_model_loaded():
         raise HTTPException(400, detail={"error": "未加载模型"})
 
-    if _game_is_over(game):
-        raise HTTPException(400, detail={"error": "对局已结束"})
+    # 全链路持锁：MCTS 用 board.copy() 起算，须与改动 board 的端点互斥，
+    # 否则 await 返回后用旧局面的 visits 匹配新局面会给出错误提示。
+    async with game.lock:
+        if _game_is_over(game):
+            raise HTTPException(400, detail={"error": "对局已结束"})
 
-    side_mover = game.board.side_to_move
-    t0 = time.monotonic()
-    visits, root_val = await asyncio.to_thread(
-        _run_mcts_sync, game.board, sims
-    )
-    elapsed_ms = (time.monotonic() - t0) * 1000.0
-    best = _pick_best_move(game.board, visits)
-    if best is None:
-        raise HTTPException(400, detail={"error": "无合法着法"})
+        side_mover = game.board.side_to_move
+        t0 = time.monotonic()
+        visits, root_val = await asyncio.to_thread(
+            _run_mcts_sync, game.board, sims
+        )
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        best = _pick_best_move(game.board, visits)
+        if best is None:
+            raise HTTPException(400, detail={"error": "无合法着法"})
 
-    best_uci = move_to_uci(best)
-    try:
-        best_cn = move_to_chinese(game.board, best)
-    except Exception:
-        best_cn = best_uci
+        best_uci = move_to_uci(best)
+        try:
+            best_cn = move_to_chinese(game.board, best)
+        except Exception:
+            best_cn = best_uci
 
-    top_moves = _visits_to_top_moves(game.board, visits)
-    _log_eval(
-        game, "提示", best_uci, best_cn,
-        float(root_val), side_mover, sims, elapsed_ms, top_moves,
-    )
+        top_moves = _visits_to_top_moves(game.board, visits)
+        _log_eval(
+            game, "提示", best_uci, best_cn,
+            float(root_val), side_mover, sims, elapsed_ms, top_moves,
+        )
 
-    return {
-        "move": best_uci,
-        "chinese": best_cn,
-        "value": float(root_val),
-        "top_moves": top_moves,
-    }
+        return {
+            "move": best_uci,
+            "chinese": best_cn,
+            "value": float(root_val),
+            "side": side_name(side_mover),  # value 为该走子方视角
+            "top_moves": top_moves,
+        }
 
 
 # ===========================================================================
@@ -658,47 +807,10 @@ async def export_game(game_id: str):
     if game is None:
         raise HTTPException(404, detail={"error": "游戏不存在"})
 
-    board = game.board
-    moves = [e.move for e in game.move_history]
-
-    # 从头重演得到每步 FEN
-    start_fen = START_FEN  # 当前无法追溯初始 FEN，用标准开局
-    # 实际上我们需要保存初始 FEN，重建以获得 fens 列表
-    # 利用已有的 move_history 中的 fen_after（含起始 FEN）
-    fens: list = []
-    # 初始 FEN = 执行第一步之前的局面 = 逆推
-    # 通过从头 replay 获取
-    try:
-        replay = replay_record({
-            "format": RECORD_FORMAT,
-            "start_fen": _get_game_start_fen(game),
-            "moves": moves,
-        })
-        fens = replay["fens"]
-    except Exception:
-        fens = [e.fen_after for e in game.move_history]
-
-    # 结果优先取认输，其次取规则引擎
-    final_result = game.resign_result if game.resigned else board.result()
-    final_term = "resign" if game.resigned else (board.termination() if board.result() else None)
-
-    record = {
-        "format": RECORD_FORMAT,
-        "start_fen": _get_game_start_fen(game),
-        "moves": moves,
-        "result": final_result,
-        "termination": final_term,
-        "plies": len(moves),
-        "red": "human" if game.human_side == "red" else ("ai" if game.mode != "hvh" else "human"),
-        "black": "human" if game.human_side == "black" else ("ai" if game.mode != "hvh" else "human"),
-        "meta": {
-            "mode": game.mode,
-            "sims": game.sims,
-            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        },
-        "fens": fens,
-    }
-    return record
+    # 全链路持锁：_build_record 内 _get_game_start_fen 会对 board.copy() 逐步 pop
+    # 逆推起始局面，且读取 board.result()/termination()，须与改动 board 的端点互斥。
+    async with game.lock:
+        return _build_record(game)
 
 
 # ===========================================================================
@@ -710,21 +822,24 @@ async def resign(game_id: str):
     if game is None:
         raise HTTPException(404, detail={"error": "游戏不存在"})
 
-    if _game_is_over(game):
-        raise HTTPException(400, detail={"error": "对局已结束"})
+    # 全链路持锁：读取 side_to_move 并写认输状态，须与改动 board 的端点互斥。
+    async with game.lock:
+        if _game_is_over(game):
+            raise HTTPException(400, detail={"error": "对局已结束"})
 
-    # 确定认输方：hvh 当前走子方认输，hva 人类方认输
-    if game.mode == "hva":
-        resigning_side = RED if game.human_side == "red" else BLACK
-    else:
-        resigning_side = game.board.side_to_move
+        # 确定认输方：hvh 当前走子方认输，hva 人类方认输
+        if game.mode == "hva":
+            resigning_side = RED if game.human_side == "red" else BLACK
+        else:
+            resigning_side = game.board.side_to_move
 
-    winner = -resigning_side
-    game.resigned = True
-    game.resign_result = "1-0" if winner == RED else "0-1"
+        winner = -resigning_side
+        game.resigned = True
+        game.resign_result = "1-0" if winner == RED else "0-1"
 
-    _log_game_over(game)
-    return _build_game_state(game)
+        _log_game_over(game)
+        _maybe_autosave_record(game)
+        return _build_game_state(game)
 
 
 # ===========================================================================

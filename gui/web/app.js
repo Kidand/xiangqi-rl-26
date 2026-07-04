@@ -9,7 +9,8 @@
 // ═══════════════════════════════════════════════════════════════
 //  常量与工具
 // ═══════════════════════════════════════════════════════════════
-const API_BASE = "http://127.0.0.1:8000";
+// 同源相对路径：支持 --host 0.0.0.0 后手机/局域网直接访问（DESIGN §13）
+const API_BASE = "";
 const START_FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1";
 
 // ── Toast 通知 ──────────────────────────────────────────────────
@@ -82,6 +83,17 @@ function playBeep(freq, dur, type = "triangle", gainVal = 0.12) {
 function playMoveSound()    { playBeep(660, 0.08, "sine", 0.1); }
 function playCaptureSound() { playBeep(330, 0.15, "triangle", 0.15); }
 
+/** 统计 FEN 棋盘段的棋子数（字母=棋子，数字=空格，'/'=行分隔）。 */
+function countFenPieces(fen) {
+  if (!fen) return 0;
+  const boardPart = String(fen).trim().split(/\s+/)[0];
+  let n = 0;
+  for (const ch of boardPart) {
+    if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z")) n++;
+  }
+  return n;
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  应用状态
 // ═══════════════════════════════════════════════════════════════
@@ -96,6 +108,11 @@ const App = {
   // 设置
   soundEnabled: true,
   autoFlipEnabled: false,
+
+  // 模型是否已加载（用于 hvh 模式后台请求 with_eval 刷新评估条）
+  modelLoaded: false,
+  // 上一次渲染局面的棋子数（用于按 FEN 棋子数差判定吃子音效）
+  lastPieceCount: null,
 
   // 复盘
   replayFens: [],
@@ -130,38 +147,11 @@ function $id(id) { return document.getElementById(id); }
 //  棋盘初始化
 // ═══════════════════════════════════════════════════════════════
 function initBoard() {
+  // cellSize 固定 52（内部坐标系不变），SVG 按 viewBox 由 CSS 等比缩放，
+  // 窗口尺寸变化无需重建棋盘（点击换算按 getBoundingClientRect 缩放，见 board.js）。
   const svgEl = $id("board-svg");
-  boardObj = new XiangqiBoard(svgEl, {
-    cellSize: computeCellSize(),
-    onMove: handleBoardMove
-  });
+  boardObj = new XiangqiBoard(svgEl, { onMove: handleBoardMove });
   boardObj.setFen(START_FEN);
-
-  window.addEventListener("resize", () => {
-    const cs = computeCellSize();
-    if (Math.abs(cs - boardObj.cellSize) > 2) {
-      const wasFlipped = boardObj.flipped;
-      const svg = $id("board-svg");
-      // 重建棋盘
-      boardObj = new XiangqiBoard(svg, { cellSize: cs, onMove: handleBoardMove });
-      boardObj.flipped = wasFlipped;
-      if (App.gameState) {
-        applyGameState(App.gameState, false);
-      } else {
-        boardObj.setFen(START_FEN);
-      }
-    }
-  });
-}
-
-function computeCellSize() {
-  const bArea = $id("board-area");
-  const bRect  = bArea.getBoundingClientRect();
-  const availW = bRect.width  - 80;   // 评估条 + 边距
-  const availH = bRect.height - 40;
-  const byW = Math.floor(availW / 8);
-  const byH = Math.floor(availH / 9);
-  return Math.max(36, Math.min(70, Math.min(byW, byH)));
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -183,19 +173,23 @@ function applyGameState(gs, withSound = true) {
     boardObj.setInCheck(null);
   }
 
-  // 音效：通过 move_history 最后一条的中文着法判断是否吃子（含"吃"字）
+  // 音效：用前后两个局面的棋子数差判定吃子（notation 不含"吃"字，无法从中文判断）。
+  // 仅在"走了一步"（withSound=true 且有 last_move）时触发；悔棋/返回/复盘等以
+  // withSound=false 调用，只更新基线不发声，避免误播。
+  const newPieceCount = countFenPieces(gs.fen);
   if (withSound && App.soundEnabled && gs.last_move) {
-    const hist = gs.move_history || [];
-    const lastEntry = hist[hist.length - 1];
-    if (lastEntry && lastEntry.chinese && lastEntry.chinese.includes("吃")) {
+    if (App.lastPieceCount !== null && newPieceCount < App.lastPieceCount) {
       playCaptureSound();
     } else {
+      // 基线未知（如 hva 执黑时新局响应已含 AI 首着）至少播走子音，
+      // 不会误播吃子音（吃子判定要求基线已知）。
       playMoveSound();
     }
   }
+  App.lastPieceCount = newPieceCount;
 
-  // 评估条
-  updateEvalBar(gs.eval ? gs.eval.value : null);
+  // 评估条：统一按 eval.side 换算红方视角（见 updateEvalBar）
+  updateEvalBar(gs.eval || null);
 
   // 着法列表
   renderMoveList(gs.move_history || []);
@@ -217,6 +211,25 @@ function applyGameState(gs, withSound = true) {
   boardObj.setHint(null, []);
   App.hintVisible = false;
   $id("hint-area").classList.remove("visible");
+
+  // 按钮显隐随状态更新（返回按钮 / AVA 播放按钮）
+  updateModeButtons();
+
+  // hvh 模式且已加载模型：后台异步请求 with_eval 刷新评估条（不阻塞交互）。
+  // hva/ava 的 eval 已随 AI 落子附带，无需轮询。
+  maybeRefreshEval();
+}
+
+/**
+ * 按 App 状态显隐操作栏按钮（取代早期 index.html 内联轮询补丁）：
+ * - btn-return-live：仅在查看历史局面时显示；
+ * - btn-ava-toggle：仅在 AI 观战（ava）模式显示。
+ * 状态变化点（applyGameState / startNewGame / returnToLive / jumpToHistoryMove）
+ * 均显式调用本函数，无任何轮询。
+ */
+function updateModeButtons() {
+  $id("btn-return-live").style.display = App.viewingHistory ? "" : "none";
+  $id("btn-ava-toggle").style.display  = App.mode === "ava"  ? "" : "none";
 }
 
 function ucciToSq(s) {
@@ -269,24 +282,52 @@ function onGameOver(gs) {
 // ═══════════════════════════════════════════════════════════════
 //  评估条
 // ═══════════════════════════════════════════════════════════════
-function updateEvalBar(value) {
+function updateEvalBar(evalObj) {
+  // 只写 CSS 变量 --eval-pct（DESIGN §14）：填充轴向与锚定方向由 CSS 按断点决定
+  // （桌面纵向红在下 / 移动横向红在左），JS 不感知布局。
   const fill = $id("eval-fill");
-  if (value === null || value === undefined) {
-    fill.style.height = "50%";
+  const v = evalObj ? evalObj.value : null;
+  if (v === null || v === undefined) {
+    fill.style.setProperty("--eval-pct", "50%");
     return;
   }
-  // value ∈ [-1,1]，MCTS root_val 是 AI 走子前的当前走子方（AI 方）视角。
-  // AI 走子后 side_to_move 已切换到对手（人类），所以：
-  //   - AI=黑 → 走后 side_to_move="red"；value 是黑方期望值 → 红方 POV = -value
-  //   - AI=红 → 走后 side_to_move="black"；value 是红方期望值 → 红方 POV = +value
-  // 故：当 side_to_move 为 "red"（AI 刚以黑方走完）时取反；为 "black" 时不取反。
-  let redPov = value;
-  if (App.gameState && App.gameState.side_to_move === "red") {
-    redPov = -value;
-  }
-  // 映射到 0..1 百分比（红在底部）
+  // eval.side（"red"|"black"）显式声明 value 是哪一方视角（= MCTS 运行时的走子方）。
+  // 统一换算到红方视角：side==="red" 取 value，否则取 -value。
+  // （不再靠 side_to_move 反推，那是历史上出过符号颠倒 bug 的推断链。）
+  const redPov = evalObj.side === "red" ? v : -v;
+  // 映射到 0..1 百分比（红方占比）
   const pct = (redPov + 1) / 2 * 100;
-  fill.style.height = Math.max(2, Math.min(98, pct)) + "%";
+  fill.style.setProperty("--eval-pct", Math.max(2, Math.min(98, pct)) + "%");
+}
+
+/**
+ * hvh 模式且模型已加载时，后台请求 with_eval 刷新评估条。
+ * 用原生 fetch（而非 apiFetch）以避免后台失败时弹出错误 toast。
+ * 请求返回后校验仍是同一局、非历史查看态才更新，避免竞态覆盖。
+ */
+async function maybeRefreshEval() {
+  if (App.mode !== "hvh" || !App.modelLoaded || !App.gameId) return;
+  const gs = App.gameState;
+  if (!gs || gs.game_over || App.viewingHistory) return;
+  const gid = App.gameId;
+  // 评估条刷新是后台装饰功能，但服务端计算期间持有本局锁，
+  // 会让紧随其后的 /move、/undo 排队——sims 封顶以限制持锁时长。
+  const evalSims = Math.min(App.sims, 400);
+  try {
+    const res = await fetch(
+      `${API_BASE}/api/game/${gid}?with_eval=true&sims=${evalSims}`,
+      { headers: { "Content-Type": "application/json" } }
+    );
+    if (!res.ok) return;
+    const data = await res.json();
+    // 竞态守卫：除同局/非历史态外，还要求响应局面与当前局面一致，
+    // 防止连走两步时先发请求的响应后到、用滞后一步的评估覆盖新值。
+    const cur = App.gameState;
+    if (App.gameId === gid && !App.viewingHistory &&
+        cur && !cur.game_over && data.fen === cur.fen) {
+      updateEvalBar(data.eval || null);
+    }
+  } catch (_) { /* 后台刷新失败静默 */ }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -366,6 +407,7 @@ function jumpToHistoryMove(idx, fenAfter) {
   if (cur) { cur.classList.add("current"); cur.scrollIntoView({ block: "nearest" }); }
 
   setStatus(`查看历史 第${idx+1}步`);
+  updateModeButtons();   // 显示「↩ 返回」按钮
 }
 
 function returnToLive() {
@@ -373,6 +415,7 @@ function returnToLive() {
   App.viewingHistory = false;
   App.historyPos = -1;
   applyGameState(App.gameState, false);
+  updateModeButtons();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -404,6 +447,8 @@ async function startNewGame() {
   App.replayFens = [];
   App.replayMoves = [];
   App.replayChinese = [];
+  // 重置吃子音效基线：新局第一次 applyGameState 不与上一局棋子数比较，避免误播
+  App.lastPieceCount = null;
 
   const body = { mode, human_side: humanSide, sims };
   if (customFen) body.fen = customFen;
@@ -413,6 +458,7 @@ async function startNewGame() {
     const gs = await apiFetch("/api/game/new", { method: "POST", body });
     App.gameId = gs.game_id;
     applyGameState(gs);
+    updateModeButtons();
 
     // AVA 模式：开始自动推进
     if (mode === "ava") {
@@ -887,6 +933,7 @@ async function loadRecordGame(path, index) {
 async function refreshModelInfo() {
   try {
     const info = await apiFetch("/api/model/info");
+    App.modelLoaded = !!info.loaded;
     const box = $id("model-info-box");
     if (info.loaded) {
       box.innerHTML =
@@ -908,8 +955,11 @@ async function loadModel() {
   try {
     const res = await apiFetch("/api/model/load", { method: "POST", body: { path } });
     if (res.ok) {
+      App.modelLoaded = true;
       showToast("模型加载成功");
       await refreshModelInfo();
+      // 若当前正处于 hvh 对局，立即刷新一次评估条
+      maybeRefreshEval();
     }
   } catch (_) {}
 }
@@ -1030,6 +1080,13 @@ document.addEventListener("DOMContentLoaded", () => {
     if (e.target === $id("dialog-new-game")) closeNewGameDialog();
   });
 
+  // 对战模式单选：AI 观战（ava）不需要选边，隐藏执子方选项
+  document.querySelectorAll('input[name="new-mode"]').forEach(r => {
+    r.addEventListener("change", () => {
+      $id("side-group").style.display = getRadioValue("new-mode") === "ava" ? "none" : "";
+    });
+  });
+
   // AVA 按钮
   const avaToggle = $id("btn-ava-toggle");
   if (avaToggle) avaToggle.addEventListener("click", toggleAva);
@@ -1041,6 +1098,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $id("btn-return-live").addEventListener("click", returnToLive);
 
   // 初始状态
+  updateModeButtons();
   setStatus("就绪 — 点击「新对局」开始");
   refreshModelInfo();
 });
