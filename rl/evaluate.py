@@ -147,11 +147,12 @@ def _resolve_workers(cfg, games: int, dev: str) -> int:
     if w <= 0:
         if not dev.startswith("cuda") or games < 16:
             return 1
-        import multiprocessing as mp
         import torch
 
+        from rl.selfplay import effective_cpu_count  # 容器感知（cgroup 配额/亲和性）
+
         gpus = max(1, torch.cuda.device_count())
-        w = min(max(1, mp.cpu_count() - 4), gpus * 4)
+        w = min(max(1, effective_cpu_count() - 4), gpus * 4)
     return max(1, min(w, games))
 
 

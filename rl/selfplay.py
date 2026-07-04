@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import math
 import os
+from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
@@ -95,19 +97,79 @@ def num_eval_servers(cfg: Config) -> int:
     return 1
 
 
+def _read_cgroup_cpu_quota() -> Optional[int]:
+    """读 cgroup CPU 配额（向上取整到核数）；无限额或不可读返回 None。
+
+    K8s pod 的 limits.cpu 走 CFS 带宽限制：os.cpu_count() 与 sched_getaffinity
+    都看不到它（返回宿主核数），只有 cgroup 配额文件是权威。兼容 v2 与 v1。
+    """
+    try:
+        p = Path("/sys/fs/cgroup/cpu.max")                    # cgroup v2
+        if p.exists():
+            parts = p.read_text().split()
+            if len(parts) >= 2 and parts[0] != "max":
+                quota, period = int(parts[0]), int(parts[1])
+                if quota > 0 and period > 0:
+                    return max(1, math.ceil(quota / period))
+            return None
+        q = Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")       # cgroup v1
+        pd = Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+        if q.exists() and pd.exists():
+            quota, period = int(q.read_text().strip()), int(pd.read_text().strip())
+            if quota > 0 and period > 0:
+                return max(1, math.ceil(quota / period))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def effective_cpu_count() -> int:
+    """容器感知的有效核数：cpu_count / 调度亲和性 / cgroup CFS 配额三信号取最小。
+
+    背景：曾在 192 核宿主 + 小 CFS 配额的 K8s pod 上因 os.cpu_count() 失真而
+    spawn 180 个 worker（严重超订：CFS 节流 + 上下文切换烧掉配额本身）。
+    裸机/本地（Windows/macOS 无 sched_getaffinity、无 cgroup 文件）自动回退 cpu_count。
+    """
+    signals = [os.cpu_count() or 1]
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            signals.append(len(os.sched_getaffinity(0)))
+        except OSError:
+            pass
+    quota = _read_cgroup_cpu_quota()
+    if quota is not None:
+        signals.append(quota)
+    return max(1, min(signals))
+
+
+def cpu_budget_summary() -> str:
+    """人读的核数信号一览（写进日志，一眼看穿容器限额环境）。"""
+    aff = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None
+    return (
+        f"cpu_count={os.cpu_count()} affinity={aff} "
+        f"cgroup_quota={_read_cgroup_cpu_quota()} -> effective={effective_cpu_count()}"
+    )
+
+
 def num_selfplay_workers(cfg: Config) -> int:
     """本次自博弈的纯 CPU worker 进程总数。
 
-    - ``num_workers > 0``：直接使用该值。
-    - ``num_workers == 0``：自动 ``max(8, cpu_count - num_gpus - 4)``；cpu 设备
-      ``num_gpus`` 按 0 算。
+    - ``num_workers > 0``：直接使用该值（最高优先级）。
+    - ``num_workers == 0``：自动，基于容器感知的有效核数 eff（effective_cpu_count）：
+        - 核充裕（eff ≥ 4×(num_gpus+4)）：``max(8, eff - num_gpus - 4)``——裸机语义
+          不变，为 EvalServer 与主进程留核；
+        - 核受限（小配额容器）：``clamp(ceil(eff × 1.5), 8, 64)``——固定预留会吃掉
+          大半预算；1.5× 轻度超订恰好覆盖 worker 同步等待 GPU 响应的空窗。
+      cpu 设备 ``num_gpus`` 按 0 算。
     """
     n = int(cfg.selfplay.num_workers)
     if n > 0:
         return n
     ngpu = int(cfg.train.num_gpus) if str(cfg.train.device).startswith("cuda") else 0
-    cpu = os.cpu_count() or 1
-    return max(8, cpu - ngpu - 4)
+    eff = effective_cpu_count()
+    if eff >= 4 * (ngpu + 4):
+        return max(8, eff - ngpu - 4)
+    return max(8, min(64, math.ceil(eff * 1.5)))
 
 
 def worker_game_quota(total_games: int, worker_id: int, n_workers: int) -> int:

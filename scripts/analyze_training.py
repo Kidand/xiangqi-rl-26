@@ -330,7 +330,9 @@ def report_ladder(ckpt_dir: Path, offsets: list[int], games: int, sims: int,
         devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
     else:
         devices = ["cpu"]
-    cpu_n = mp.cpu_count()
+    from rl.selfplay import effective_cpu_count  # 容器感知（cgroup 配额/亲和性）
+
+    cpu_n = effective_cpu_count()
     if workers <= 0:
         workers = min(max(4, cpu_n - 4), len(devices) * 6 if devices[0] != "cpu" else 8)
 
