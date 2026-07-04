@@ -124,9 +124,20 @@ const App = {
   replayTimer: null,
   replaySpeedMs: 1000,
 
+  // 复盘胜率（DESIGN §12 evals：与 replayFens 等长，项为 null 或 {value_red,sims,source}）
+  replayEvals: [],
+  replayPath: null,        // records/ 内相对路径；文件/粘贴导入为 null（无法补算回写）
+  replayIndex: 0,
+  replayEvalToken: 0,      // 补算循环守卫：切换棋谱/开新对局时自增使旧循环退出
+  replayEvalBusy: false,
+  replayEvalPending: 0,
+
   // AVA 自动推进
   avaPlaying: false,
   avaTimer: null,
+
+  // hva 两段式：AI 回着请求防重入
+  aiReplyInFlight: false,
 
   // 提示
   hintVisible: false,
@@ -157,7 +168,7 @@ function initBoard() {
 // ═══════════════════════════════════════════════════════════════
 //  GameState 应用
 // ═══════════════════════════════════════════════════════════════
-function applyGameState(gs, withSound = true) {
+function applyGameState(gs, withSound = true, opts = {}) {
   App.gameState = gs;
   App.viewingHistory = false;
   App.historyPos = -1;
@@ -188,8 +199,13 @@ function applyGameState(gs, withSound = true) {
   }
   App.lastPieceCount = newPieceCount;
 
-  // 评估条：统一按 eval.side 换算红方视角（见 updateEvalBar）
-  updateEvalBar(gs.eval || null);
+  // 评估条归属守卫：只在「对局」页签激活时写（复盘页由 updateReplayEvalDisplay 接管，
+  // 防止 AVA 后台推进/滞后响应覆盖复盘胜率显示）。
+  // opts.keepEvalBar：两段式走子中人类落子响应无 eval，保持上次评估不回弹 50%。
+  if ($id("tab-game").classList.contains("active")) {
+    if (gs.eval) updateEvalBar(gs.eval);
+    else if (!opts.keepEvalBar) updateEvalBar(null);
+  }
 
   // 着法列表
   renderMoveList(gs.move_history || []);
@@ -324,6 +340,7 @@ async function maybeRefreshEval() {
     // 防止连走两步时先发请求的响应后到、用滞后一步的评估覆盖新值。
     const cur = App.gameState;
     if (App.gameId === gid && !App.viewingHistory &&
+        $id("tab-game").classList.contains("active") &&
         cur && !cur.game_over && data.fen === cur.fen) {
       updateEvalBar(data.eval || null);
     }
@@ -443,15 +460,24 @@ async function startNewGame() {
   closeNewGameDialog();
   stopAva();
   stopReplay();
-  // 清空复盘数据，防止方向键仍然导航旧复盘
+  // 清空复盘数据，防止方向键仍然导航旧复盘；token 自增终止后台补算循环
+  App.replayEvalToken++;
+  App.replayEvalBusy = false;
+  App.replayEvalPending = 0;
   App.replayFens = [];
   App.replayMoves = [];
   App.replayChinese = [];
+  App.replayEvals = [];
+  App.replayPath = null;
+  $id("replay-eval-text").textContent = "—";
   // 重置吃子音效基线：新局第一次 applyGameState 不与上一局棋子数比较，避免误播
   App.lastPieceCount = null;
 
   const body = { mode, human_side: humanSide, sims };
   if (customFen) body.fen = customFen;
+
+  // 两段式（DESIGN §13/§14）：新局立即返回渲染，AI 首着（若有）随后单独请求
+  body.ai_reply = false;
 
   setThinking(true);
   try {
@@ -464,6 +490,9 @@ async function startNewGame() {
     if (mode === "ava") {
       $id("tab-game-btn").click();
       scheduleAva();
+    } else if (mode === "hva" && !gs.game_over && gs.side_to_move !== humanSide) {
+      // AI 执红先行：棋盘已上屏，再取 AI 首着
+      await requestAiReply();
     }
   } catch (_) {
     // 错误已由 apiFetch 处理
@@ -490,23 +519,92 @@ async function handleBoardMove(fromSq, toSq) {
 
   boardObj.setInteractive(false);
   setThinking(true);
+  let gs;
   try {
-    const gs = await apiFetch(`/api/game/${App.gameId}/move`, {
+    // 两段式（DESIGN §13/§14）：ai_reply=false 只落人类子立即返回
+    gs = await apiFetch(`/api/game/${App.gameId}/move`, {
       method: "POST",
-      body: { move }
+      body: { move, ai_reply: false }
     });
-    applyGameState(gs);
-
-    // hva 模式：AI 已经在 gs 中回着，无需再请求
-    // ava 模式不应出现人工走子
   } catch (_) {
     // 恢复交互
     if (App.gameState) {
       boardObj.setInteractive(isHumanTurn(App.gameState));
     }
-  } finally {
+    setThinking(false);
+    return;
+  }
+
+  // 玩家落子立即上屏；AI 思考期间棋盘已是新局面
+  applyGameState(gs, true, { keepEvalBar: true });
+
+  if (App.mode === "hva" && !gs.game_over) {
+    await requestAiReply();
+  } else {
     setThinking(false);
   }
+}
+
+/**
+ * hva 两段式：请求 AI 回着（玩家落子已先行渲染）。
+ * - 网络/5xx 等瞬时错误重试一次；
+ * - 400/409 是终态（终局/悔棋竞态被轮次守卫拦下），不重试、不覆盖状态栏，
+ *   改为拉取服务器最新局面同步显示；
+ * - gameId 变化（开了新局）随时中止；in-flight 防重入。
+ */
+async function requestAiReply() {
+  const gid = App.gameId;
+  if (!gid || App.aiReplyInFlight) return;
+  App.aiReplyInFlight = true;
+  setThinking(true);
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (App.gameId !== gid) return;
+      let res;
+      try {
+        res = await fetch(`${API_BASE}/api/game/${gid}/ai_move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sims: App.sims }),
+        });
+      } catch (_) {
+        if (attempt === 0) { await new Promise(r => setTimeout(r, 800)); continue; }
+        showToast("网络错误：AI 走子失败", true);
+        if (App.gameId === gid) setStatus("AI 走子失败：点「悔棋」撤回后重走");
+        return;
+      }
+      if (App.gameId !== gid) return;
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        applyGameState(data);
+        return;
+      }
+      if (res.status === 400 || res.status === 409) {
+        // 终态拒绝：undo/resign 已抢先改变局面，以服务器状态为准，不打扰用户
+        await refreshGameState(gid);
+        return;
+      }
+      if (attempt === 0) { await new Promise(r => setTimeout(r, 800)); continue; }
+      showToast("错误：" + (data.error || `HTTP ${res.status}`), true);
+      if (App.gameId === gid) setStatus("AI 走子失败：点「悔棋」撤回后重走");
+      return;
+    }
+  } finally {
+    App.aiReplyInFlight = false;
+    if (App.gameId === gid) setThinking(false);
+  }
+}
+
+/** 以服务器为准同步一次对局状态（终态 4xx 后恢复一致显示）。 */
+async function refreshGameState(gid) {
+  try {
+    const res = await fetch(`${API_BASE}/api/game/${gid}`, {
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!res.ok) return;
+    const gs = await res.json();
+    if (App.gameId === gid) applyGameState(gs, false, { keepEvalBar: true });
+  } catch (_) { /* 同步失败静默，界面维持现状 */ }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -571,6 +669,13 @@ async function doUndo() {
     const gs = await apiFetch(`/api/game/${App.gameId}/undo`, { method: "POST" });
     applyGameState(gs, false);
   } catch (_) {}
+  // hva 兜底：若撤后（或撤失败但本就）轮到 AI 且未终局，重新取 AI 着，
+  // 覆盖「AI 回着失败后悔棋」「人执黑撤掉 AI 首着」等恢复路径。
+  const cur = App.gameState;
+  if (App.mode === "hva" && cur && !cur.game_over &&
+      cur.side_to_move !== App.humanSide) {
+    await requestAiReply();
+  }
 }
 
 async function doResign() {
@@ -728,13 +833,21 @@ async function loadReplayFromText(text, filename) {
   } catch (_) {}
 }
 
-function loadReplayData(data) {
+function loadReplayData(data, srcPath = null, srcIndex = 0) {
   stopReplay();
+  App.replayEvalToken++;           // 终止上一份棋谱的补算循环
+  App.replayEvalBusy = false;
+  App.replayEvalPending = 0;
   App.replayFens    = data.fens || [];
   App.replayMoves   = data.moves || [];
   App.replayChinese = data.chinese || [];
   App.replayResult  = data.result || null;
   App.replayPos     = 0;
+  App.replayEvals   = (Array.isArray(data.evals) && data.evals.length === App.replayFens.length)
+                        ? data.evals.slice()
+                        : new Array(App.replayFens.length).fill(null);
+  App.replayPath    = srcPath;
+  App.replayIndex   = srcIndex;
 
   // 显示信息
   const info = $id("replay-info");
@@ -744,6 +857,7 @@ function loadReplayData(data) {
 
   renderReplayMoveList();
   gotoReplayPos(0);
+  maybeStartReplayEvalLoop();
 }
 
 function renderReplayMoveList() {
@@ -808,6 +922,76 @@ function gotoReplayPos(pos) {
   if (App.replayPos > 0) {
     const cur = $id("replay-moves-list").querySelector(`[data-idx="${App.replayPos}"]`);
     if (cur) { cur.classList.add("current"); cur.scrollIntoView({ block: "nearest" }); }
+  }
+
+  // 当前局面的红黑胜率
+  updateReplayEvalDisplay();
+}
+
+// ── 复盘胜率显示与后台补算 ──────────────────────────────────
+function updateReplayEvalDisplay() {
+  const el = $id("replay-eval-text");
+  if (!App.replayFens.length) { el.textContent = "—"; return; }
+
+  // 评估条只在复盘页签激活时接管（避免覆盖对局页的实时评估）
+  const replayActive = $id("tab-replay").classList.contains("active");
+  const ev = App.replayEvals[App.replayPos] || null;
+  let txt;
+  if (ev && typeof ev.value_red === "number") {
+    // value_red 恒为红方视角（DESIGN §12），以 side:"red" 复用评估条换算
+    if (replayActive) updateEvalBar({ value: ev.value_red, side: "red" });
+    const red = (ev.value_red + 1) / 2 * 100;
+    const srcMap = { play: "对局实时", replay: "复盘补算", result: "终局" };
+    txt = `红 ${red.toFixed(1)}% ｜ 黑 ${(100 - red).toFixed(1)}%`
+        + `（${srcMap[ev.source] || "已计算"}${ev.sims ? `·${ev.sims}模拟` : ""}）`;
+  } else {
+    if (replayActive) updateEvalBar(null);
+    if (App.replayEvalBusy) txt = "该局面胜率计算中…";
+    else if (!App.replayPath) txt = "导入棋谱无此局面胜率（从自对弈记录打开可自动补算）";
+    else if (!App.modelLoaded) txt = "未加载模型，无法计算胜率";
+    else txt = "该局面胜率未计算";
+  }
+  if (App.replayEvalBusy && App.replayEvalPending > 0) {
+    txt += ` ｜ 后台补算中，剩余 ${App.replayEvalPending} 个局面`;
+  }
+  el.textContent = txt;
+}
+
+/**
+ * records/ 打开的棋谱若 evals 有缺失且模型已加载，后台循环调
+ * /api/records/eval 分批补算（服务端每批算完即回写文件），随算随刷新。
+ * token 守卫：切换棋谱/开新对局时 App.replayEvalToken 自增，旧循环退出。
+ */
+async function maybeStartReplayEvalLoop() {
+  if (!App.replayPath || !App.modelLoaded) return;
+  if (!App.replayEvals.some(e => !e)) return;
+
+  const token = ++App.replayEvalToken;
+  App.replayEvalBusy = true;
+  App.replayEvalPending = App.replayEvals.filter(e => !e).length;
+  updateReplayEvalDisplay();
+  try {
+    while (true) {
+      const res = await apiFetch("/api/records/eval", {
+        method: "POST",
+        body: { path: App.replayPath, index: App.replayIndex, sims: 128, max_positions: 8 },
+      });
+      if (token !== App.replayEvalToken) return;   // 已切换棋谱，结果作废
+      if (Array.isArray(res.evals) && res.evals.length === App.replayFens.length) {
+        App.replayEvals = res.evals;
+      }
+      App.replayEvalPending = res.pending || 0;
+      updateReplayEvalDisplay();
+      if (!res.pending) break;
+    }
+  } catch (_) {
+    /* apiFetch 已弹 toast；停止本轮补算 */
+  } finally {
+    if (token === App.replayEvalToken) {
+      App.replayEvalBusy = false;
+      App.replayEvalPending = 0;
+      updateReplayEvalDisplay();
+    }
   }
 }
 
@@ -922,7 +1106,7 @@ async function loadRecordGame(path, index) {
   try {
     const record = await apiFetch(`/api/records/get?path=${encodeURIComponent(path)}&index=${index}`);
     const data   = await apiFetch("/api/replay/load", { method: "POST", body: { record } });
-    loadReplayData(data);
+    loadReplayData(data, path, index);   // 带上来源路径，缺失胜率可补算回写
     showToast(`已加载第 ${index + 1} 局`);
   } catch (_) {}
 }
@@ -960,6 +1144,9 @@ async function loadModel() {
       await refreshModelInfo();
       // 若当前正处于 hvh 对局，立即刷新一次评估条
       maybeRefreshEval();
+      // 复盘已打开且缺胜率：模型就绪后启动补算（并刷新提示文案）
+      updateReplayEvalDisplay();
+      maybeStartReplayEvalLoop();
     }
   } catch (_) {}
 }
@@ -985,8 +1172,14 @@ function setupTabs() {
 
       if (pane === "tab-replay") {
         loadRecordsList();
+        // 复盘页接管评估条：显示当前复盘局面的胜率
+        if (App.replayFens.length) updateReplayEvalDisplay();
       } else if (pane === "tab-settings") {
         refreshModelInfo();
+      } else if (pane === "tab-game") {
+        // 回到对局页：评估条恢复为当前对局的实时评估
+        updateEvalBar((App.gameState && App.gameState.eval) || null);
+        maybeRefreshEval();
       }
     });
   });

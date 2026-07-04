@@ -409,3 +409,66 @@ class TestReadRecordsList:
         loaded = records.read_records(path)
         assert isinstance(loaded, list)
         assert len(loaded) == 1
+
+
+# ─────────────────────────────────────────────────────── evals（DESIGN §12）
+def test_normalize_evals_missing_field_all_none():
+    """无 evals 字段的旧记录 → 全 None，长度 = 着法数 + 1。"""
+    rec = {"format": records.RECORD_FORMAT, "start_fen": START_FEN,
+           "moves": ["h2e2", "h9g7"]}
+    evals = records.normalize_evals(rec)
+    assert evals == [None, None, None]
+
+
+def test_normalize_evals_pads_truncates_and_rejects_bad_items():
+    """超长截断、不足补 None、非法项（缺 value_red 数值 / bool）置 None。"""
+    good = {"value_red": 0.25, "sims": 128, "source": "replay"}
+    rec = {"moves": ["h2e2", "h9g7"],
+           "evals": [good, {"sims": 4}, {"value_red": True}, good, good]}
+    evals = records.normalize_evals(rec)
+    assert len(evals) == 3
+    assert evals[0] == good
+    assert evals[1] is None          # 缺 value_red
+    assert evals[2] is None          # bool 不算数值
+    # 不足补 None
+    rec2 = {"moves": ["h2e2", "h9g7"], "evals": [good]}
+    assert records.normalize_evals(rec2) == [good, None, None]
+
+
+def test_update_record_json_single(tmp_path):
+    """.json 单局：update_record 原地替换并保持单条 dict 结构。"""
+    p = tmp_path / "one.json"
+    rec = {"format": records.RECORD_FORMAT, "start_fen": START_FEN,
+           "moves": ["h2e2"], "result": "1-0"}
+    records.write_record(p, rec)
+    rec2 = dict(rec)
+    rec2["evals"] = [{"value_red": 0.1, "sims": 4, "source": "replay"}, None]
+    records.update_record(p, 0, rec2)
+    back = records.read_records(p)
+    assert len(back) == 1
+    assert back[0]["evals"][0]["value_red"] == 0.1
+    # 结构仍是单条 dict（非 list）
+    import json as _json
+    assert isinstance(_json.loads(p.read_text(encoding="utf-8")), dict)
+    # 索引越界报错
+    with pytest.raises(IndexError):
+        records.update_record(p, 1, rec2)
+
+
+def test_update_record_jsonl_multi(tmp_path):
+    """.jsonl 多局：只更新目标行，其余行逐字保留。"""
+    p = tmp_path / "many.jsonl"
+    base = {"format": records.RECORD_FORMAT, "start_fen": START_FEN, "moves": ["h2e2"]}
+    for i in range(3):
+        rec = dict(base)
+        rec["meta"] = {"i": i}
+        records.append_jsonl(p, rec)
+    target = dict(base)
+    target["meta"] = {"i": 1}
+    target["evals"] = [None, {"value_red": -0.5, "sims": 8, "source": "replay"}]
+    records.update_record(p, 1, target)
+    back = records.read_records(p)
+    assert len(back) == 3
+    assert back[0].get("evals") is None and back[2].get("evals") is None
+    assert back[1]["evals"][1]["value_red"] == -0.5
+    assert back[0]["meta"] == {"i": 0} and back[2]["meta"] == {"i": 2}

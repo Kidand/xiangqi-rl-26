@@ -278,15 +278,15 @@ Base: `http://127.0.0.1:8000`。静态页面挂 `/`。所有响应 JSON；错误
 |---|---|---|
 | `POST /api/game/new` | `{"mode":"hva"\|"ava"\|"hvh", "human_side":"red"\|"black", "fen":可选, "sims":400, "ai_reply":true 默认}` | GameState；`ai_reply=true`（默认，兼容旧客户端）且 AI 执红先走时响应已含 AI 首着；`ai_reply=false` 时不含，客户端随后自行调 `/ai_move`（两段式渲染） |
 | `GET /api/game/{id}?with_eval=true[&sims=N]` | – | GameState；`with_eval=true` 且有模型且未终局时在该局锁内跑一次 MCTS，`eval.side`=当前 `side_to_move`（`sims` 默认 400），否则 `eval` 为 null |
-| `POST /api/game/{id}/move` | `{"move":"h2e2", "ai_reply":true 默认}` | GameState；hva 且 `ai_reply=true`（默认，兼容旧客户端）时已包含 AI 回着（`ai_move` 字段同时单列）；`ai_reply=false` 时只落人类子立即返回，客户端随后调 `/ai_move` 取回着——**前端走两段式**：先渲染玩家落子，AI 思考期间棋盘已更新 |
+| `POST /api/game/{id}/move` | `{"move":"h2e2", "ai_reply":true 默认}` | GameState；hva 且 `ai_reply=true`（默认，兼容旧客户端）时已包含 AI 回着（`ai_move` 字段同时单列）；`ai_reply=false` 时只落人类子立即返回，客户端随后调 `/ai_move` 取回着——**前端走两段式**：先渲染玩家落子，AI 思考期间棋盘已更新。hva 下轮到 AI 时人类走子返回 409（轮次守卫，防两段式窗口内替 AI 落子） |
 | `POST /api/game/{id}/ai_move` | `{"sims":可选}` | GameState（ava 单步推进 + hva 两段式取 AI 回着）。hva 下仅当轮到 AI 方时允许，否则 409——防止两段式窗口内 `/undo` 抢先使 AI 代人走子 |
-| `POST /api/game/{id}/undo` | – | GameState（hva 撤销一整回合两步） |
+| `POST /api/game/{id}/undo` | – | GameState。hva 撤到**轮到人类为止**：AI 已回着撤一整回合两步；两段式窗口（人类刚落子、AI 未回着）只撤人类这一步——固定撤两步会把局面留在 AI 轮次使前端无法恢复。hvh 撤一步 |
 | `GET /api/game/{id}/hint?sims=400` | – | `{"move","chinese","value","side","top_moves":[...]}`（`value` 为 `side` 方即当前走子方视角） |
 | `GET /api/game/{id}/export` | – | xiangqi-record-v1 JSON（含 fens 数组） |
 | `POST /api/replay/load` | `{"record": <v1 JSON>}` 或 `{"text": "FEN\n着法..."}` | `{"fens":[逐步FEN], "moves":[...], "chinese":[...], "result", "start_fen", "evals":[规范化后与 fens 等长，缺失项为 null]}` |
 | `GET /api/records/list` | – | `{"files":[{"path","games","mtime"}]}`（扫描 records/ 递归） |
 | `GET /api/records/get?path=...&index=0` | – | 该文件第 index 局的 v1 JSON（路径必须限制在 records/ 内） |
-| `POST /api/records/eval` | `{"path":"gui/x.json", "index":0, "sims":128, "max_positions":8}` | 复盘胜率补算：对该局 `evals` 缺失的局面从前往后最多补算 `max_positions` 个（每个跑 `sims` 次 MCTS 得走子方视角 value 再转红方视角写入 `source="replay"`；从 FEN 即可判定终局的局面及记录 result 已知的末局面按 result 映射 `source="result"`、不计额度），把更新后的 `evals` **原子回写**记录文件，返回 `{"evals":[...], "pending":剩余缺失数, "total":局面数}`。前端循环调用直到 `pending=0`（分批以避免 CPU 长阻塞与代理超时）。无模型 400；path 校验与 records/get 相同；同一文件的补算在服务端按文件锁串行化 |
+| `POST /api/records/eval` | `{"path":"gui/x.json", "index":0, "sims":128, "max_positions":8}` | 复盘胜率补算：对该局 `evals` 缺失的局面从前往后最多补算 `max_positions` 个（每个跑 `sims` 次 MCTS 得走子方视角 value 再转红方视角写入 `source="replay"`；从 FEN 即可判定终局的局面及记录 result 已知的末局面按 result 映射 `source="result"`、不计额度），把更新后的 `evals` **原子回写**记录文件，返回 `{"evals":[...], "pending":剩余缺失数, "total":局面数}`。前端循环调用直到 `pending=0`（分批以避免 CPU 长阻塞与代理超时）。无模型 400；path 校验与 records/get 相同；同一文件的补算在服务端按文件锁串行化；写回前校验文件未被其他进程改动（如训练进程 append），冲突返回 409、前端停止循环 |
 | `POST /api/model/load` | `{"path":"ckpts/best.pt"}` | `{"ok":true,"info":{...}}` |
 | `GET /api/model/info` | – | `{"loaded":bool,"path","params","blocks","filters","device"}` |
 | `POST /api/game/{id}/resign` | – | GameState（人认输） |
@@ -298,7 +298,7 @@ Base: `http://127.0.0.1:8000`。静态页面挂 `/`。所有响应 JSON；错误
 - 响应式布局（纯 CSS，无构建）：桌面 ≥900px 双栏（左棋盘区+右侧 320px 面板）；<900px 单列纵向滚动（顶栏 → 横向评估条 → 满宽棋盘 → 触控操作栏 → 页签内容），横屏矮屏（高 ≤540px）棋盘按高定尺寸、面板并列。棋盘 SVG 按 viewBox 等比缩放；触控目标 ≥44px（`pointer: coarse`）；`touch-action: manipulation` 消除双击缩放延迟；iOS 安全区适配（`viewport-fit=cover` + `env(safe-area-inset-*)`）；视口高度用 `dvh`（`vh` 回退）。
 - 评估条方向随布局切换：桌面纵向（红在下），移动端横向（红在左）。JS 只写 CSS 变量 `--eval-pct`（50% = 均势），填充方向与轴向由 CSS 按断点决定，JS 不感知布局。
 - SVG/Canvas 棋盘：木纹配色、楚河汉界、九宫斜线、圆形棋子（中文字），红黑分色。
-- 交互：点选走子（选中高亮 + 合法落点圆点提示）、最后一着高亮、将军红光提示、吃子/走子音效可关。hva 两段式走子：`/move` 带 `ai_reply=false` 先渲染玩家落子，再调 `/ai_move` 等 AI 回着（失败自动重试一次）；AI 执红的新局同理先出棋盘再取首着。评估条归属守卫：对局侧只在「对局」页签激活时写评估条，复盘侧只在「复盘」页签激活时写，防止 AVA 后台推进/滞后响应覆盖对方显示。
+- 交互：点选走子（选中高亮 + 合法落点圆点提示）、最后一着高亮、将军红光提示、吃子/走子音效可关。hva 两段式走子：`/move` 带 `ai_reply=false` 先渲染玩家落子，再调 `/ai_move` 等 AI 回着（瞬时错误自动重试一次；400/409 为终态不重试，改为拉取服务器最新局面同步显示）；AI 执红的新局同理先出棋盘再取首着；悔棋后（或 AI 回着失败后悔棋）若轮到 AI 且未终局，前端自动重新请求 `/ai_move` 兜底恢复。评估条归属守卫：对局侧只在「对局」页签激活时写评估条，复盘侧只在「复盘」页签激活时写，防止 AVA 后台推进/滞后响应覆盖对方显示。
 - 对战：新对局对话框（模式 hva/ava/hvh、执红/执黑、难度=sims 档位：快 100/标准 400/强 1200、自定义 FEN 开局）。
 - 辅助：评估条（红方胜率视角，按 `eval.side` 换算；hvh 模式若已加载模型，每步局面更新后台请求 `with_eval=true` 刷新）、提示按钮（箭头显示 AI 推荐着 + top-5 列表）、悔棋、认输、翻转棋盘、着法列表（中文纵队记法，点击跳转局面）。
 - 复盘：导入（文件选择 .json/.jsonl/.txt 或粘贴文本）、records/ 浏览器（列出自我博弈记录选局）、播放控制（|< < 播放/暂停 > >|、速度）、导出当前对局（下载 .json）。

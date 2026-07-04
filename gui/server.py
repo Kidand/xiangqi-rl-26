@@ -50,9 +50,11 @@ from xiangqi.constants import (
 from xiangqi.notation import move_to_chinese
 from xiangqi.records import (
     RECORD_FORMAT,
+    normalize_evals,
     read_records,
     replay_record,
     parse_text_record,
+    update_record,
 )
 
 # RL 模块（延迟 import 以免模型未装时报错）
@@ -125,6 +127,9 @@ class _GameData:
     resign_result: Optional[str] = None  # "1-0" or "0-1"
     # 终局自动落盘的记录文件路径（每局至多一份；悔棋后再次终局以新文件替换旧文件）
     record_file: Optional[Path] = None
+    # 每个局面一个胜率槽位（DESIGN §12 evals）：长度恒 = len(move_history)+1，
+    # evals[i] 对应第 i 个局面（fens[i]），为 None 或 {"value_red","sims","source"}。
+    evals: List[Optional[dict]] = field(default_factory=lambda: [None])
     # 每局一把异步锁：所有读写该局 board 的端点在锁内完成"读-算-写"全链路
     # （含跨 await asyncio.to_thread 的 MCTS 窗口），避免工作线程 copy()/MCTS 与
     # 事件循环线程 push/pop 交错撕裂局面；不同 game_id 之间互不阻塞。
@@ -280,6 +285,26 @@ def _apply_move(game: _GameData, mv: tuple) -> None:
         cn = uci
     board.push(mv)
     game.move_history.append(_MoveEntry(move=uci, chinese=cn, fen_after=board.fen()))
+    # 新局面尚无评估；保持 evals 与局面序列等长（DESIGN §12）
+    game.evals.append(None)
+
+
+def _record_position_eval(
+    game: _GameData, value_mover: float, side_mover: int, sims: int
+) -> None:
+    """把一次 MCTS 评估写入当前局面的胜率槽位（须在 _apply_move 之前调用）。
+
+    value 从走子方视角转为红方视角存储（DESIGN §12：value_red 恒红方视角）。
+    已有更高 sims 的评估时不覆盖（hint/with_eval 可能用不同 sims 重评同一局面）。
+    """
+    idx = len(game.move_history)
+    if idx >= len(game.evals):  # 防御性：理论上恒等长
+        game.evals.extend([None] * (idx + 1 - len(game.evals)))
+    old = game.evals[idx]
+    if old is not None and old.get("sims", 0) >= sims:
+        return
+    value_red = float(value_mover) if side_mover == RED else -float(value_mover)
+    game.evals[idx] = {"value_red": value_red, "sims": int(sims), "source": "play"}
 
 
 # ===========================================================================
@@ -363,6 +388,9 @@ def _log_game_over(game: _GameData) -> None:
 # 胜负中文映射（result → 文件名片段），用于自动落盘文件名。
 _RESULT_ZH = {"1-0": "红胜", "0-1": "黑胜", "1/2-1/2": "和棋"}
 
+# result → 红方视角 value（evals 终局槽位直接映射，DESIGN §12 source="result"）。
+_RESULT_VALUE_RED = {"1-0": 1.0, "0-1": -1.0, "1/2-1/2": 0.0}
+
 
 def _build_record(game: _GameData) -> dict:
     """把当前对局构造为 xiangqi-record-v1 记录 dict（含 fens）。
@@ -400,6 +428,17 @@ def _build_record(game: _GameData) -> dict:
         red_who = "human" if game.human_side == "red" else "ai"
         black_who = "human" if game.human_side == "black" else "ai"
 
+    # evals：与局面序列等长（防御性对齐）；终局局面若无评估按 result 直接映射。
+    n_positions = len(moves) + 1
+    evals: List[Optional[dict]] = list(game.evals[:n_positions])
+    evals.extend([None] * (n_positions - len(evals)))
+    if final_result in _RESULT_VALUE_RED and evals[-1] is None:
+        evals[-1] = {
+            "value_red": _RESULT_VALUE_RED[final_result],
+            "sims": 0,
+            "source": "result",
+        }
+
     return {
         "format": RECORD_FORMAT,
         "start_fen": start_fen,
@@ -415,6 +454,7 @@ def _build_record(game: _GameData) -> dict:
             "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
         },
         "fens": fens,
+        "evals": evals,
     }
 
 
@@ -449,8 +489,10 @@ def _maybe_autosave_record(game: _GameData) -> None:
             old.unlink(missing_ok=True)
 
         # 原子写：tmp + os.replace（与仓库 checkpoint 保存习惯一致）。
+        # tmp 名含随机后缀：与 /api/records/eval 写回（update_record 的 pid 后缀）
+        # 及并发终局的其他对局互不冲突。
         data = json.dumps(record, ensure_ascii=False, indent=2)
-        tmp = target.with_name(target.name + ".tmp")
+        tmp = target.with_name(f"{target.name}.tmp-a{uuid.uuid4().hex[:8]}")
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(data)
         os.replace(tmp, target)
@@ -490,10 +532,12 @@ class NewGameRequest(BaseModel):
     human_side: str = "red"     # "red" | "black"
     fen: Optional[str] = None
     sims: Optional[int] = None  # 若 None，使用服务器默认值（从 CLI --sims 设置）
+    ai_reply: bool = True       # False：即使 AI 先行也不含首着，客户端随后调 /ai_move
 
 
 class MoveRequest(BaseModel):
     move: str                   # UCCI 着法如 "h2e2"
+    ai_reply: bool = True       # False：hva 不自动回着（两段式渲染），客户端随后调 /ai_move
 
 
 class AiMoveRequest(BaseModel):
@@ -507,6 +551,13 @@ class ReplayLoadRequest(BaseModel):
 
 class ModelLoadRequest(BaseModel):
     path: str
+
+
+class RecordsEvalRequest(BaseModel):
+    path: str                 # records/ 内的相对路径（同 /api/records/get）
+    index: int = 0            # 文件内第几局
+    sims: int = 128           # 每个局面的 MCTS 模拟次数（复盘补算默认低于对局）
+    max_positions: int = 8    # 本批最多补算的局面数（分批防长阻塞/代理超时）
 
 
 # ===========================================================================
@@ -546,8 +597,8 @@ async def new_game(req: NewGameRequest):
         ai_move_str = None
         eval_info = None
 
-        # hva：若 AI 执红且初始局面红先，AI 先走
-        if mode == "hva" and game.board.result() is None:
+        # hva：若 AI 执红且初始局面红先，AI 先走（ai_reply=false 时留给客户端 /ai_move）
+        if mode == "hva" and req.ai_reply and game.board.result() is None:
             ai_is_red = (req.human_side == "black")
             ai_side = RED if ai_is_red else BLACK
             if game.board.side_to_move == ai_side:
@@ -565,6 +616,7 @@ async def new_game(req: NewGameRequest):
                         "side": side_name(ai_side),  # 显式声明 value 是哪一方视角
                         "top_moves": top_moves,
                     }
+                    _record_position_eval(game, float(root_val), ai_side, game.sims)
                     _apply_move(game, ai_mv)
                     _log_eval(
                         game, "AI落子", ai_move_str, game.move_history[-1].chinese,
@@ -604,6 +656,7 @@ async def get_game(
                 "side": side_name(side_mover),  # = 当前 side_to_move
                 "top_moves": top_moves,
             }
+            _record_position_eval(game, float(root_val), side_mover, sims)
         return _build_game_state(game, eval_info=eval_info)
 
 
@@ -622,6 +675,12 @@ async def make_move(game_id: str, req: MoveRequest):
         if _game_is_over(game):
             raise HTTPException(400, detail={"error": "对局已结束"})
 
+        # hva 轮次守卫：两段式窗口内轮到 AI 时人类不得走子（否则会替 AI 落子）。
+        if game.mode == "hva":
+            human_side_int = RED if game.human_side == "red" else BLACK
+            if game.board.side_to_move != human_side_int:
+                raise HTTPException(409, detail={"error": "轮到 AI 走子，请等待 AI 回着"})
+
         # 解析着法
         try:
             mv = uci_to_move(req.move)
@@ -639,8 +698,8 @@ async def make_move(game_id: str, req: MoveRequest):
         ai_move_str = None
         eval_info = None
 
-        # hva 模式：AI 自动回着
-        if game.mode == "hva" and game.board.result() is None:
+        # hva 模式：AI 自动回着（ai_reply=false 时留给客户端 /ai_move，两段式渲染）
+        if game.mode == "hva" and req.ai_reply and game.board.result() is None:
             human_side_int = RED if game.human_side == "red" else BLACK
             # 轮到 AI 走
             if game.board.side_to_move != human_side_int:
@@ -659,6 +718,7 @@ async def make_move(game_id: str, req: MoveRequest):
                         "side": side_name(ai_side),  # AI 方（落子前的走子方）视角
                         "top_moves": top_moves,
                     }
+                    _record_position_eval(game, float(root_val), ai_side, game.sims)
                     _apply_move(game, ai_mv)
                     _log_eval(
                         game, "AI落子", ai_move_str, game.move_history[-1].chinese,
@@ -687,6 +747,13 @@ async def ai_move(game_id: str, req: AiMoveRequest):
         if _game_is_over(game):
             raise HTTPException(400, detail={"error": "对局已结束"})
 
+        # hva 两段式竞态守卫：/undo 若抢在 /ai_move 之前执行，轮次会回到人类方，
+        # 此时 AI 不得代人走子（DESIGN §13）。
+        if game.mode == "hva":
+            human_side_int = RED if game.human_side == "red" else BLACK
+            if game.board.side_to_move == human_side_int:
+                raise HTTPException(409, detail={"error": "轮到人类走子，AI 不能代走"})
+
         sims = req.sims if req.sims is not None else game.sims
 
         ai_side = game.board.side_to_move
@@ -704,6 +771,7 @@ async def ai_move(game_id: str, req: AiMoveRequest):
         }
         if ai_mv:
             ai_move_str = move_to_uci(ai_mv)
+            _record_position_eval(game, float(root_val), ai_side, sims)
             _apply_move(game, ai_mv)
             _log_eval(
                 game, "AI落子", ai_move_str, game.move_history[-1].chinese,
@@ -737,14 +805,23 @@ async def undo(game_id: str):
         if not game.move_history:
             raise HTTPException(400, detail={"error": "没有可撤销的着法"})
 
-        # hva：撤两步（AI + 人），hvh：撤一步
-        steps = 2 if game.mode == "hva" else 1
+        # hva：撤到轮到人类为止——AI 已回着时撤一整回合两步；两段式窗口
+        # （人类刚落子、AI 未回着）只撤人类这一步。固定撤两步会把局面
+        # 撤到 AI 轮次导致前端无路径恢复（DESIGN §13）。hvh：撤一步。
+        if game.mode == "hva":
+            human_side_int = RED if game.human_side == "red" else BLACK
+            steps = 2 if game.board.side_to_move == human_side_int else 1
+        else:
+            steps = 1
         steps = min(steps, len(game.move_history))
 
         for _ in range(steps):
             if game.move_history:
                 board.pop()
                 game.move_history.pop()
+
+        # evals 与局面序列保持等长（被撤销局面的评估一并丢弃）
+        del game.evals[len(game.move_history) + 1:]
 
         return _build_game_state(game)
 
@@ -784,6 +861,7 @@ async def hint(game_id: str, sims: int = Query(default=400)):
             best_cn = best_uci
 
         top_moves = _visits_to_top_moves(game.board, visits)
+        _record_position_eval(game, float(root_val), side_mover, sims)
         _log_eval(
             game, "提示", best_uci, best_cn,
             float(root_val), side_mover, sims, elapsed_ms, top_moves,
@@ -865,6 +943,8 @@ async def replay_load(req: ReplayLoadRequest):
         "chinese": result["chinese"],
         "result": result["result"],
         "start_fen": record_dict.get("start_fen", START_FEN),
+        # 规范化 evals：与 fens 等长，缺失/非法项为 null（DESIGN §12/§13）
+        "evals": normalize_evals(record_dict),
     }
 
 
@@ -895,8 +975,8 @@ async def records_list():
 # ===========================================================================
 # GET /api/records/get
 # ===========================================================================
-@app.get("/api/records/get")
-async def records_get(path: str = Query(...), index: int = Query(default=0)):
+def _resolve_records_path(path: str) -> Path:
+    """把请求里的相对路径解析到 records/ 内的既有文件；越界/缺失抛 HTTPException。"""
     # 防路径穿越：resolve 后必须在 records/ 内
     try:
         target = (_RECORDS_DIR / path).resolve()
@@ -916,6 +996,12 @@ async def records_get(path: str = Query(...), index: int = Query(default=0)):
 
     if not target.exists() or not target.is_file():
         raise HTTPException(404, detail={"error": "文件不存在"})
+    return target
+
+
+@app.get("/api/records/get")
+async def records_get(path: str = Query(...), index: int = Query(default=0)):
+    target = _resolve_records_path(path)
 
     try:
         recs = read_records(target)
@@ -926,6 +1012,90 @@ async def records_get(path: str = Query(...), index: int = Query(default=0)):
         raise HTTPException(404, detail={"error": f"索引 {index} 超出范围（共 {len(recs)} 局）"})
 
     return recs[index]
+
+
+# ===========================================================================
+# POST /api/records/eval —— 复盘胜率补算（DESIGN §13）
+# ===========================================================================
+# 按 resolve 后的文件路径串行化补算，避免并发读-算-写回互相覆盖。
+_records_eval_locks: Dict[str, asyncio.Lock] = {}
+
+
+@app.post("/api/records/eval")
+async def records_eval(req: RecordsEvalRequest):
+    if not _is_model_loaded():
+        raise HTTPException(400, detail={"error": "未加载模型，无法补算胜率"})
+
+    target = _resolve_records_path(req.path)
+    sims = max(1, min(int(req.sims), 1600))
+    max_positions = max(1, min(int(req.max_positions), 64))
+
+    lock = _records_eval_locks.setdefault(str(target), asyncio.Lock())
+    async with lock:
+        try:
+            recs = await asyncio.to_thread(read_records, target)
+        except Exception as e:
+            raise HTTPException(400, detail={"error": f"读取失败: {e}"})
+
+        if req.index < 0 or req.index >= len(recs):
+            raise HTTPException(
+                404, detail={"error": f"索引 {req.index} 超出范围（共 {len(recs)} 局）"}
+            )
+        record = recs[req.index]
+
+        # 以 moves 重演为准得到局面序列（顺带校验记录合法性）
+        try:
+            fens = (await asyncio.to_thread(replay_record, record))["fens"]
+        except ValueError as e:
+            raise HTTPException(400, detail={"error": f"记录重演失败: {e}"})
+
+        evals = normalize_evals(record)
+        result = record.get("result")
+        computed = 0
+        changed = False
+
+        for i, fen in enumerate(fens):
+            if evals[i] is not None:
+                continue
+            board = Board.from_fen(fen)
+            # 终局局面按结果直接映射（不跑 MCTS、不计补算额度）：
+            # 末局面优先用记录 result（认输/长将等从 FEN 判不出），
+            # 其余局面用 FEN 可判的规则终局（将死/困毙等）。
+            mapped = None
+            if i == len(fens) - 1 and result in _RESULT_VALUE_RED:
+                mapped = _RESULT_VALUE_RED[result]
+            else:
+                r = board.result()
+                if r is not None:
+                    mapped = _RESULT_VALUE_RED.get(r, 0.0)
+            if mapped is not None:
+                evals[i] = {"value_red": mapped, "sims": 0, "source": "result"}
+                changed = True
+                continue
+
+            if computed >= max_positions:
+                continue  # 本批额度用完；后续槽位留待下一批
+            side_mover = board.side_to_move
+            _visits, root_val = await asyncio.to_thread(_run_mcts_sync, board, sims)
+            value_red = float(root_val) if side_mover == RED else -float(root_val)
+            evals[i] = {"value_red": value_red, "sims": sims, "source": "replay"}
+            computed += 1
+            changed = True
+
+        pending = sum(1 for e in evals if e is None)
+
+        if changed:
+            record = dict(record)
+            record["evals"] = evals
+            try:
+                await asyncio.to_thread(update_record, target, req.index, record)
+            except RuntimeError as e:
+                # 文件被其他进程（如训练 append）改动 → 放弃写回，409 让前端停止循环
+                raise HTTPException(409, detail={"error": str(e)})
+            except Exception as e:
+                raise HTTPException(500, detail={"error": f"记录写回失败: {e}"})
+
+        return {"evals": evals, "pending": pending, "total": len(evals)}
 
 
 # ===========================================================================

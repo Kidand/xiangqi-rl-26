@@ -459,6 +459,15 @@ select, input[type="range"], #board-svg,
   min-height: 32px;
 }
 
+/* 复盘胜率行（红黑胜率 + 补算进度） */
+#replay-eval-text {
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
 /* 复盘着法列表 */
 #replay-moves-list {
   flex: 1;

@@ -897,3 +897,283 @@ def test_log_game_over_never_raises_when_not_over():
 
     game = _GameData(game_id="cafebabe", board=Board(), mode="hvh", human_side="red", sims=10)
     _log_game_over(game)  # 未结束 → 不应抛出
+
+
+# ────────────────────────────────────────────────────────────────
+# 测试：每步胜率 evals（DESIGN §12/§13）
+# ────────────────────────────────────────────────────────────────
+def test_record_position_eval_perspective_and_sims_priority():
+    """走子方视角→红方视角换算；低 sims 不覆盖高 sims。"""
+    from gui.server import _record_position_eval, _GameData
+    from xiangqi.board import Board
+    from xiangqi.constants import RED, BLACK
+
+    game = _GameData(game_id="x", board=Board(), mode="hvh", human_side="red", sims=10)
+    _record_position_eval(game, 0.5, BLACK, 100)
+    assert game.evals[0] == {"value_red": -0.5, "sims": 100, "source": "play"}
+    # 更低 sims 不覆盖
+    _record_position_eval(game, 0.9, BLACK, 50)
+    assert game.evals[0]["value_red"] == -0.5
+    # 更高 sims 覆盖；红方视角原样保存
+    _record_position_eval(game, 0.9, RED, 200)
+    assert game.evals[0] == {"value_red": 0.9, "sims": 200, "source": "play"}
+
+
+def test_autosave_evals_length_and_result_slot(client: SimpleClient, records_dir: Path):
+    """hvh 无模型：落盘 evals 与局面数等长、人类步为 null、终局槽按 result 映射。"""
+    gs = _new_hvh(client)
+    gid = gs["game_id"]
+    client.post(f"/api/game/{gid}/move", body={"move": "h2e2"})
+    # hvh 当前走子方（黑）认输 → 红胜 1-0
+    resp = client.post(f"/api/game/{gid}/resign")
+    assert resp.status_code == 200
+
+    files = list((records_dir / "gui").glob("*.json"))
+    assert len(files) == 1
+    rec = json.loads(files[0].read_text(encoding="utf-8"))
+    assert rec["result"] == "1-0"
+    assert len(rec["evals"]) == rec["plies"] + 1 == 2
+    assert rec["evals"][0] is None
+    assert rec["evals"][-1] == {"value_red": 1.0, "sims": 0, "source": "result"}
+
+
+def test_hva_export_evals_ai_positions_filled(client_with_model: SimpleClient):
+    """hva：AI 回着评估以 source=play 写入落子前局面槽位，人走局面为 null。"""
+    resp = client_with_model.post(
+        "/api/game/new", body={"mode": "hva", "human_side": "red", "sims": 4}
+    )
+    gid = resp.json()["game_id"]
+    resp2 = client_with_model.post(f"/api/game/{gid}/move", body={"move": "h2e2"})
+    assert resp2.status_code == 200
+    assert resp2.json().get("ai_move")  # AI 已回着
+
+    rec = client_with_model.get(f"/api/game/{gid}/export").json()
+    evals = rec["evals"]
+    assert len(evals) == len(rec["moves"]) + 1 == 3
+    assert evals[0] is None            # 人走前局面无评估
+    e1 = evals[1]                      # 人走后、AI（黑）落子前的局面
+    assert e1 is not None
+    assert e1["source"] == "play" and e1["sims"] == 4
+    assert -1.0 <= e1["value_red"] <= 1.0
+    assert evals[2] is None            # AI 落子后局面尚未评估且未终局
+
+
+def test_undo_truncates_evals(client_with_model: SimpleClient):
+    """hva 悔棋撤两步后 evals 同步截断，与局面序列等长。"""
+    resp = client_with_model.post(
+        "/api/game/new", body={"mode": "hva", "human_side": "red", "sims": 4}
+    )
+    gid = resp.json()["game_id"]
+    client_with_model.post(f"/api/game/{gid}/move", body={"move": "h2e2"})
+    resp2 = client_with_model.post(f"/api/game/{gid}/undo")
+    assert resp2.status_code == 200
+    assert resp2.json()["move_history"] == []
+
+    rec = client_with_model.get(f"/api/game/{gid}/export").json()
+    assert rec["moves"] == []
+    assert rec["evals"] == [None]
+
+
+def test_replay_load_returns_normalized_evals(client: SimpleClient):
+    """replay/load 透传规范化 evals；无 evals 记录 → 全 null。"""
+    from xiangqi.constants import START_FEN as SF
+
+    good = {"value_red": 0.3, "sims": 64, "source": "play"}
+    record = {"format": "xiangqi-record-v1", "start_fen": SF,
+              "moves": ["h2e2", "h9g7"], "evals": [good, "bad", None, "overflow"]}
+    resp = client.post("/api/replay/load", body={"record": record})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["evals"] == [good, None, None]
+
+    resp2 = client.post("/api/replay/load", body={"record": {
+        "format": "xiangqi-record-v1", "start_fen": SF, "moves": ["h2e2"]}})
+    assert resp2.json()["evals"] == [None, None]
+
+
+def test_records_eval_no_model_400(client: SimpleClient, records_dir: Path, monkeypatch):
+    """无模型时补算端点返回 400。"""
+    import gui.server as srv
+    from xiangqi.constants import START_FEN as SF
+
+    # client_with_model fixture 若已创建，模块全局已有模型 —— 临时清空
+    monkeypatch.setattr(srv._model_state, "model", None)
+    gui_dir = records_dir / "gui"
+    gui_dir.mkdir(parents=True, exist_ok=True)
+    (gui_dir / "t.json").write_text(json.dumps(
+        {"format": "xiangqi-record-v1", "start_fen": SF, "moves": ["h2e2"]}
+    ), encoding="utf-8")
+    resp = client.post("/api/records/eval", body={"path": "gui/t.json"})
+    assert resp.status_code == 400
+    assert "error" in resp.json()
+
+
+def test_records_eval_path_traversal_403(client_with_model: SimpleClient):
+    """补算端点沿用 records/ 路径穿越防护。"""
+    resp = client_with_model.post(
+        "/api/records/eval", body={"path": "../../pyproject.toml"}
+    )
+    assert resp.status_code == 403
+
+
+def test_records_eval_batched_compute_and_writeback(
+    client_with_model: SimpleClient, records_dir: Path
+):
+    """分批补算：终局槽按 result 免额度映射；每批限 max_positions；随批写回文件。"""
+    from xiangqi.constants import START_FEN as SF
+
+    gui_dir = records_dir / "gui"
+    gui_dir.mkdir(parents=True, exist_ok=True)
+    rec = {"format": "xiangqi-record-v1", "start_fen": SF,
+           "moves": ["h2e2", "h9g7"], "result": "1-0", "plies": 2}
+    (gui_dir / "t.json").write_text(json.dumps(rec), encoding="utf-8")
+
+    # 第一批：只补 1 个局面；末局面按 result 免额度映射
+    resp = client_with_model.post("/api/records/eval", body={
+        "path": "gui/t.json", "index": 0, "sims": 4, "max_positions": 1})
+    assert resp.status_code == 200, resp.json()
+    data = resp.json()
+    assert data["total"] == 3
+    assert data["pending"] == 1
+    e0 = data["evals"][0]
+    assert e0["source"] == "replay" and e0["sims"] == 4
+    assert -1.0 <= e0["value_red"] <= 1.0
+    assert data["evals"][1] is None
+    assert data["evals"][2] == {"value_red": 1.0, "sims": 0, "source": "result"}
+
+    # 已写回磁盘
+    on_disk = json.loads((gui_dir / "t.json").read_text(encoding="utf-8"))
+    assert on_disk["evals"][0]["source"] == "replay"
+    assert on_disk["evals"][1] is None
+
+    # 第二批补完剩余局面；再次调用应为幂等空批
+    resp2 = client_with_model.post("/api/records/eval", body={
+        "path": "gui/t.json", "index": 0, "sims": 4, "max_positions": 8})
+    data2 = resp2.json()
+    assert data2["pending"] == 0
+    assert all(e is not None for e in data2["evals"])
+    resp3 = client_with_model.post("/api/records/eval", body={
+        "path": "gui/t.json", "index": 0, "sims": 4, "max_positions": 8})
+    assert resp3.json() == data2
+
+
+# ────────────────────────────────────────────────────────────────
+# 测试：两段式走子 ai_reply（DESIGN §13）
+# ────────────────────────────────────────────────────────────────
+def test_move_ai_reply_false_two_phase(client_with_model: SimpleClient):
+    """ai_reply=false 只落人类子立即返回；随后 /ai_move 取 AI 回着。"""
+    resp = client_with_model.post(
+        "/api/game/new", body={"mode": "hva", "human_side": "red", "sims": 4}
+    )
+    gid = resp.json()["game_id"]
+
+    r1 = client_with_model.post(
+        f"/api/game/{gid}/move", body={"move": "h2e2", "ai_reply": False}
+    )
+    assert r1.status_code == 200
+    gs1 = r1.json()
+    assert gs1.get("ai_move") is None
+    assert len(gs1["move_history"]) == 1
+    assert gs1["side_to_move"] == "black"
+
+    r2 = client_with_model.post(f"/api/game/{gid}/ai_move", body={"sims": 4})
+    assert r2.status_code == 200
+    gs2 = r2.json()
+    assert len(gs2["move_history"]) == 2
+    assert gs2["side_to_move"] == "red"
+    assert gs2["eval"]["side"] == "black"   # AI（黑）落子前的走子方视角
+
+
+def test_move_ai_reply_default_unchanged(client_with_model: SimpleClient):
+    """不带 ai_reply（旧客户端）：hva 行为不变，响应含 AI 回着。"""
+    resp = client_with_model.post(
+        "/api/game/new", body={"mode": "hva", "human_side": "red", "sims": 4}
+    )
+    gid = resp.json()["game_id"]
+    r = client_with_model.post(f"/api/game/{gid}/move", body={"move": "h2e2"})
+    gs = r.json()
+    assert gs.get("ai_move")
+    assert len(gs["move_history"]) == 2
+
+
+def test_new_game_ai_reply_false_no_first_move(client_with_model: SimpleClient):
+    """AI 执红 + ai_reply=false：新局不含首着；随后 /ai_move 补上。"""
+    resp = client_with_model.post("/api/game/new", body={
+        "mode": "hva", "human_side": "black", "sims": 4, "ai_reply": False})
+    gs = resp.json()
+    assert gs["move_history"] == []
+    assert gs["side_to_move"] == "red"
+    r2 = client_with_model.post(f"/api/game/{gs['game_id']}/ai_move", body={"sims": 4})
+    assert r2.status_code == 200
+    assert len(r2.json()["move_history"]) == 1
+
+
+def test_ai_move_rejected_on_human_turn_hva(client_with_model: SimpleClient):
+    """hva 轮到人类时 /ai_move 返回 409（两段式 undo 竞态守卫）。"""
+    resp = client_with_model.post(
+        "/api/game/new", body={"mode": "hva", "human_side": "red", "sims": 4}
+    )
+    gid = resp.json()["game_id"]
+    r = client_with_model.post(f"/api/game/{gid}/ai_move", body={"sims": 4})
+    assert r.status_code == 409
+    assert "error" in r.json()
+
+
+# ────────────────────────────────────────────────────────────────
+# 测试：两段式窗口的悔棋与轮次守卫（审查修复）
+# ────────────────────────────────────────────────────────────────
+def test_undo_one_step_in_two_phase_window(client_with_model: SimpleClient):
+    """两段式窗口（人类刚落子、AI 未回着）悔棋只撤一步，撤后轮到人类。"""
+    resp = client_with_model.post(
+        "/api/game/new", body={"mode": "hva", "human_side": "red", "sims": 4}
+    )
+    gid = resp.json()["game_id"]
+    client_with_model.post(f"/api/game/{gid}/move", body={"move": "h2e2", "ai_reply": False})
+
+    r = client_with_model.post(f"/api/game/{gid}/undo")
+    assert r.status_code == 200
+    gs = r.json()
+    assert len(gs["move_history"]) == 0
+    assert gs["side_to_move"] == "red"   # 恒撤回到人类轮次
+
+
+def test_undo_two_steps_after_ai_replied(client_with_model: SimpleClient):
+    """AI 已回着的正常态：悔棋撤一整回合两步（旧契约不变）。"""
+    resp = client_with_model.post(
+        "/api/game/new", body={"mode": "hva", "human_side": "red", "sims": 4}
+    )
+    gid = resp.json()["game_id"]
+    client_with_model.post(f"/api/game/{gid}/move", body={"move": "h2e2"})  # 默认含 AI 回着
+
+    r = client_with_model.post(f"/api/game/{gid}/undo")
+    gs = r.json()
+    assert len(gs["move_history"]) == 0
+    assert gs["side_to_move"] == "red"
+
+
+def test_human_move_rejected_on_ai_turn(client_with_model: SimpleClient):
+    """两段式窗口内（轮到 AI）人类再走子返回 409。"""
+    resp = client_with_model.post(
+        "/api/game/new", body={"mode": "hva", "human_side": "red", "sims": 4}
+    )
+    gid = resp.json()["game_id"]
+    client_with_model.post(f"/api/game/{gid}/move", body={"move": "h2e2", "ai_reply": False})
+
+    # 此刻轮到黑（AI）——人类不得再走（否则会替 AI 落子）
+    r = client_with_model.post(f"/api/game/{gid}/move", body={"move": "h9g7"})
+    assert r.status_code == 409
+    assert "error" in r.json()
+
+
+def test_normalize_evals_rejects_nan_and_out_of_range():
+    """NaN 与越界 value_red 置 None（防前端 JSON 解析失败/225% 胜率）。"""
+    from xiangqi.records import normalize_evals
+    rec = {"moves": ["h2e2", "h9g7"], "evals": [
+        {"value_red": float("nan"), "sims": 4, "source": "replay"},
+        {"value_red": 3.5, "sims": 4, "source": "replay"},
+        {"value_red": -0.5, "sims": 4, "source": "replay"},
+    ]}
+    evals = normalize_evals(rec)
+    assert evals[0] is None
+    assert evals[1] is None
+    assert evals[2]["value_red"] == -0.5
