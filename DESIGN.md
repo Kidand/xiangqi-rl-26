@@ -204,9 +204,13 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
    **0 = 自动**：`clamp(ceil(本迭代新样本数 × sample_reuse / batch), 10, 5000)`，防止小 buffer
    期过拟合——步数固定 1000 时早期每样本会被重复学习数十遍），batch 4096。损失 `CE(π) + MSE(z) + L2(1e-4)`，AdamW lr 1e-3 余弦退火（配置可换 SGD+momentum）。
 4. **Arena 门控**：新模型 vs best，`arena_games`（默认 40，红黑各半）盘，200 sims、无噪声、低温。胜率 ≥ `gate_threshold`（默认 0.55，和棋计 0.5）则晋升 best。对局经 spawn 进程池并行执行（`arena_workers`，0=自动按 GPU 数×4，每 worker 绑定单 GPU；此阶段 selfplay worker/EvalServer 已退出，整机空闲），统计语义与串行一致；1 worker 或小规模时走串行路径。
-5. 保存 checkpoint、打日志、进入下一迭代。
+5. 保存 checkpoint、打日志、进入下一迭代。buffer 落盘默认异步（`train.async_buffer_save`：
+   `snapshot`=selfplay 结束即取一致性快照、后台线程压缩、与后续阶段乃至下一迭代 selfplay
+   重叠，RAM 峰值 +1 份 states 拷贝；`freeze_window`=零拷贝、只藏进 train+arena 的只读窗口；
+   `sync`=同步旧行为）。原子 tmp+rename+.old 语义不变；崩溃时 buffer 与 checkpoint 版本差
+   最多一个迭代，`--resume` 容忍。
 
-多进程结构：`train.py` 主进程 spawn EvalServer（每 GPU 一个）与 CPU selfplay workers（`torch.multiprocessing` spawn），worker 通过共享内存+队列向 server 请求评估、通过 `Queue` 上报完成的对局（样本+统计），主进程聚合并监控 server 存活（server 死亡→置 stop_event 终止迭代）。**必须支持 `device=cpu` 无 GPU 降级**（本地冒烟）。中断恢复：`--resume` 从最新 checkpoint + buffer 续训。
+多进程结构：`train.py` 主进程 spawn EvalServer（每 GPU 一个）与 CPU selfplay workers（`torch.multiprocessing` spawn），worker 通过共享内存+队列向 server 请求评估、通过 `Queue` 上报完成的对局（样本+统计），主进程聚合并监控 server 存活（server 死亡→置 stop_event 终止迭代）。worker 自动数（`num_workers: 0`）基于**容器感知的有效核数**（cpu_count / sched_getaffinity / cgroup CFS 配额取最小，`rl/selfplay.py: effective_cpu_count`）：核充裕时 `max(8, eff - num_gpus - 4)`，小配额容器 `clamp(ceil(eff×1.5), 8, 64)`；每迭代日志打印核数信号一览。**必须支持 `device=cpu` 无 GPU 降级**（本地冒烟）。中断恢复：`--resume` 从最新 checkpoint + buffer 续训。
 
 ## 10. 启发式收敛加速（rl/heuristics.py，全部可配置开关）
 
@@ -272,10 +276,10 @@ Base: `http://127.0.0.1:8000`。静态页面挂 `/`。所有响应 JSON；错误
 
 | 方法/路径 | 请求体 | 响应 |
 |---|---|---|
-| `POST /api/game/new` | `{"mode":"hva"\|"ava"\|"hvh", "human_side":"red"\|"black", "fen":可选, "sims":400}` | GameState（若 AI 执红先走，响应已含 AI 首着） |
+| `POST /api/game/new` | `{"mode":"hva"\|"ava"\|"hvh", "human_side":"red"\|"black", "fen":可选, "sims":400, "ai_reply":true 默认}` | GameState；`ai_reply=true`（默认，兼容旧客户端）且 AI 执红先走时响应已含 AI 首着；`ai_reply=false` 时不含，客户端随后自行调 `/ai_move`（两段式渲染） |
 | `GET /api/game/{id}?with_eval=true[&sims=N]` | – | GameState；`with_eval=true` 且有模型且未终局时在该局锁内跑一次 MCTS，`eval.side`=当前 `side_to_move`（`sims` 默认 400），否则 `eval` 为 null |
-| `POST /api/game/{id}/move` | `{"move":"h2e2"}` | GameState；hva 模式下已包含 AI 回着（`ai_move` 字段同时单列） |
-| `POST /api/game/{id}/ai_move` | `{"sims":可选}` | GameState（ava 单步推进用） |
+| `POST /api/game/{id}/move` | `{"move":"h2e2", "ai_reply":true 默认}` | GameState；hva 且 `ai_reply=true`（默认，兼容旧客户端）时已包含 AI 回着（`ai_move` 字段同时单列）；`ai_reply=false` 时只落人类子立即返回，客户端随后调 `/ai_move` 取回着——**前端走两段式**：先渲染玩家落子，AI 思考期间棋盘已更新 |
+| `POST /api/game/{id}/ai_move` | `{"sims":可选}` | GameState（ava 单步推进 + hva 两段式取 AI 回着）。hva 下仅当轮到 AI 方时允许，否则 409——防止两段式窗口内 `/undo` 抢先使 AI 代人走子 |
 | `POST /api/game/{id}/undo` | – | GameState（hva 撤销一整回合两步） |
 | `GET /api/game/{id}/hint?sims=400` | – | `{"move","chinese","value","side","top_moves":[...]}`（`value` 为 `side` 方即当前走子方视角） |
 | `GET /api/game/{id}/export` | – | xiangqi-record-v1 JSON（含 fens 数组） |
@@ -294,7 +298,7 @@ Base: `http://127.0.0.1:8000`。静态页面挂 `/`。所有响应 JSON；错误
 - 响应式布局（纯 CSS，无构建）：桌面 ≥900px 双栏（左棋盘区+右侧 320px 面板）；<900px 单列纵向滚动（顶栏 → 横向评估条 → 满宽棋盘 → 触控操作栏 → 页签内容），横屏矮屏（高 ≤540px）棋盘按高定尺寸、面板并列。棋盘 SVG 按 viewBox 等比缩放；触控目标 ≥44px（`pointer: coarse`）；`touch-action: manipulation` 消除双击缩放延迟；iOS 安全区适配（`viewport-fit=cover` + `env(safe-area-inset-*)`）；视口高度用 `dvh`（`vh` 回退）。
 - 评估条方向随布局切换：桌面纵向（红在下），移动端横向（红在左）。JS 只写 CSS 变量 `--eval-pct`（50% = 均势），填充方向与轴向由 CSS 按断点决定，JS 不感知布局。
 - SVG/Canvas 棋盘：木纹配色、楚河汉界、九宫斜线、圆形棋子（中文字），红黑分色。
-- 交互：点选走子（选中高亮 + 合法落点圆点提示）、最后一着高亮、将军红光提示、吃子/走子音效可关。
+- 交互：点选走子（选中高亮 + 合法落点圆点提示）、最后一着高亮、将军红光提示、吃子/走子音效可关。hva 两段式走子：`/move` 带 `ai_reply=false` 先渲染玩家落子，再调 `/ai_move` 等 AI 回着（失败自动重试一次）；AI 执红的新局同理先出棋盘再取首着。评估条归属守卫：对局侧只在「对局」页签激活时写评估条，复盘侧只在「复盘」页签激活时写，防止 AVA 后台推进/滞后响应覆盖对方显示。
 - 对战：新对局对话框（模式 hva/ava/hvh、执红/执黑、难度=sims 档位：快 100/标准 400/强 1200、自定义 FEN 开局）。
 - 辅助：评估条（红方胜率视角，按 `eval.side` 换算；hvh 模式若已加载模型，每步局面更新后台请求 `with_eval=true` 刷新）、提示按钮（箭头显示 AI 推荐着 + top-5 列表）、悔棋、认输、翻转棋盘、着法列表（中文纵队记法，点击跳转局面）。
 - 复盘：导入（文件选择 .json/.jsonl/.txt 或粘贴文本）、records/ 浏览器（列出自我博弈记录选局）、播放控制（|< < 播放/暂停 > >|、速度）、导出当前对局（下载 .json）。

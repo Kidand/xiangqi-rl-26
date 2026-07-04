@@ -88,6 +88,10 @@ class TrainConfig:
     total_iterations: int = 200
     checkpoint_dir: str = "ckpts"
     amp: bool = True                 # 混合精度（bf16）
+    # buffer 落盘策略：snapshot=快照+后台线程（默认，save 隐藏进下一迭代，RAM 峰值
+    # +1 份 states 拷贝）；freeze_window=对只读活 buffer 起线程（零额外 RAM，只藏进
+    # train+arena）；sync=同步保存（原行为）。
+    async_buffer_save: str = "snapshot"
 
 
 @dataclass

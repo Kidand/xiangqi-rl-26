@@ -9,9 +9,12 @@
 from __future__ import annotations
 
 import csv
+import filecmp
 import logging
 import math
 import os
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -51,7 +54,7 @@ from rl.logger import CSV_COLUMNS, TrainLogger
 from rl.model import create_model, save_checkpoint
 from rl.replay_buffer import ReplayBuffer
 from rl.selfplay import sample_action_from_counts
-from rl.train import load_latest_checkpoint, resolve_train_steps
+from rl.train import _BufferSaver, load_latest_checkpoint, resolve_train_steps
 
 
 # ======================================================================
@@ -481,6 +484,232 @@ class TestReplayBufferAtomicSave:
         assert len(loaded) == 0
         assert len(received) == 1
         assert "新建空 buffer" in received[0]
+
+
+# ======================================================================
+# ReplayBuffer.snapshot：一致性快照（供后台保存线程用）
+# ======================================================================
+
+class TestReplayBufferSnapshot:
+    def test_deep_and_shallow_copy_semantics(self):
+        """states/values 实体拷贝；稀疏 π 两 list 浅拷贝（新 list、旧数组引用共享）；size/pos 冻结。"""
+        buf = ReplayBuffer(capacity=50, state_shape=(3, 10, 9))
+        buf.add_game(*_make_game(20, state_shape=(3, 10, 9)))
+        snap = buf.snapshot()
+
+        # states/values：不同底层数组对象（实体拷贝，因 add_game 原地写）。
+        assert snap._states is not buf._states
+        assert snap._values is not buf._values
+        np.testing.assert_array_equal(snap._states, buf._states)
+        np.testing.assert_array_equal(snap._values, buf._values)
+
+        # 稀疏 π：新 list 对象，但槽位数组引用共享（浅拷贝安全——add_game 只整槽替换）。
+        assert snap._pol_indices is not buf._pol_indices
+        assert snap._pol_probs is not buf._pol_probs
+        for i in range(20):
+            assert snap._pol_indices[i] is buf._pol_indices[i]
+            assert snap._pol_probs[i] is buf._pol_probs[i]
+
+        # 标量冻结。
+        assert snap._size == buf._size == 20
+        assert snap._pos == buf._pos
+        assert snap.capacity == buf.capacity
+        assert snap.state_shape == buf.state_shape
+
+    def test_snapshot_isolated_from_later_mutation(self, tmp_path):
+        """取快照后继续 add_game 不污染快照：快照落盘仍是取快照那一刻的数据。"""
+        buf = ReplayBuffer(capacity=50, state_shape=(3, 10, 9))
+        buf.add_game(*_make_game(20, state_shape=(3, 10, 9)))
+        snap = buf.snapshot()
+        states_at_snap = buf._states.copy()  # 记录快照时刻的底层 states
+
+        # 快照之后大量写入（含覆盖 add_game 原地写 _states/_values 的槽位）。
+        buf.add_game(*_make_game(25, state_shape=(3, 10, 9)))
+        assert len(buf) == 45 and snap._size == 20  # 快照 size 冻结
+
+        # 快照的 states 未被后续 add_game 改写。
+        np.testing.assert_array_equal(snap._states, states_at_snap)
+
+        d = tmp_path / "snap"
+        snap.save(d)
+        loaded = ReplayBuffer.load(d)
+        assert len(loaded) == 20
+        _assert_buf_data_equal(snap, loaded)
+
+    def test_snapshot_save_matches_direct_save(self, tmp_path):
+        """snapshot().save() 与 buffer.save() 产物逐字段等价，且逐字节等价（savez 确定性）。"""
+        buf = ReplayBuffer(capacity=60, state_shape=(4, 10, 9))
+        buf.add_game(*_make_game(30, state_shape=(4, 10, 9)))
+
+        buf.save(tmp_path / "direct")
+        buf.snapshot().save(tmp_path / "snap")
+
+        _assert_buf_data_equal(
+            ReplayBuffer.load(tmp_path / "direct"),
+            ReplayBuffer.load(tmp_path / "snap"),
+        )
+        # 逐字节等价（同一份数据 + 同一 save 代码路径 → np.savez_compressed 确定性输出）。
+        for fname in ("states_0000.npz", "values.npy", "sparse_policy.npz", "meta.json"):
+            assert filecmp.cmp(
+                tmp_path / "direct" / fname, tmp_path / "snap" / fname, shallow=False
+            ), f"{fname} 逐字节不一致"
+
+    def test_snapshot_ring_overflow(self, tmp_path):
+        """满溢 buffer 的快照保留环形顺序与 pos。"""
+        buf = ReplayBuffer(capacity=8, state_shape=(2, 10, 9))
+        buf.add_game(*_make_game(12, state_shape=(2, 10, 9)))
+        assert len(buf) == 8
+        snap = buf.snapshot()
+        assert snap._pos == buf._pos
+        d = tmp_path / "ring"
+        snap.save(d)
+        _assert_buf_data_equal(buf, ReplayBuffer.load(d))
+
+    def test_snapshot_empty(self, tmp_path):
+        """空 buffer 快照可保存/加载，len==0。"""
+        buf = ReplayBuffer(capacity=10, state_shape=(2, 10, 9))
+        snap = buf.snapshot()
+        assert len(snap) == 0
+        d = tmp_path / "empty"
+        snap.save(d)
+        assert len(ReplayBuffer.load(d)) == 0
+
+
+# ======================================================================
+# _BufferSaver：buffer 后台保存编排器（快照 + 线程，消除整机空转）
+# ======================================================================
+
+def _small_buffer(n: int = 20, shape=(3, 10, 9), capacity: int = 60) -> ReplayBuffer:
+    buf = ReplayBuffer(capacity=capacity, state_shape=shape)
+    buf.add_game(*_make_game(n, state_shape=shape))
+    return buf
+
+
+class TestBufferSaver:
+    def test_default_mode_is_snapshot(self, tmp_path):
+        assert _BufferSaver(tmp_path / "b")._mode == "snapshot"
+
+    def test_background_save_matches_sync(self, tmp_path):
+        """后台保存（真起线程 + join）与同步 save 产物逐字段等价；主 buffer 保存后仍可用。"""
+        buf = _small_buffer(30)
+        buf.save(tmp_path / "sync")
+
+        saver = _BufferSaver(tmp_path / "async", mode="snapshot", warn=lambda m: None)
+        saver.save(buf)
+        saver.close()  # join 后台线程
+
+        _assert_buf_data_equal(
+            ReplayBuffer.load(tmp_path / "sync"),
+            ReplayBuffer.load(tmp_path / "async"),
+        )
+        # 快照期间主 buffer 未被破坏，仍可继续写入。
+        buf.add_game(*_make_game(10, state_shape=(3, 10, 9)))
+        assert len(buf) == 40
+
+    def test_next_save_joins_previous(self, tmp_path, monkeypatch):
+        """发起下一次保存前先 join 上一次（buf_dir 单写者不变式）：两次 save 不重叠。"""
+        buf = _small_buffer()
+        events: list[str] = []
+        elock = threading.Lock()
+
+        def slow_save(self, d):  # noqa: ANN001
+            with elock:
+                events.append("start")
+            time.sleep(0.15)
+            with elock:
+                events.append("end")
+
+        monkeypatch.setattr(ReplayBuffer, "save", slow_save)
+
+        saver = _BufferSaver(tmp_path / "buf", mode="snapshot", warn=lambda m: None)
+        saver.save(buf)  # 线程 1
+        saver.save(buf)  # 必须先 join 线程 1，再起线程 2
+        saver.close()    # join 线程 2
+
+        # 严格串行：start,end,start,end（若第二次未 join 第一次，会交错成 start,start,...）。
+        assert events == ["start", "end", "start", "end"]
+
+    def test_close_joins_pending(self, tmp_path, monkeypatch):
+        """close() join 未完成的后台保存（退出路径落盘完整）。"""
+        buf = _small_buffer()
+        done: list[str] = []
+
+        def slow_save(self, d):  # noqa: ANN001
+            time.sleep(0.1)
+            done.append("saved")
+
+        monkeypatch.setattr(ReplayBuffer, "save", slow_save)
+        saver = _BufferSaver(tmp_path / "buf", mode="snapshot", warn=lambda m: None)
+        saver.save(buf)
+        assert saver._thread is not None
+        saver.close()
+        assert done == ["saved"]      # close 之后保存必已完成
+        assert saver._thread is None  # join 后引用清空（释放快照 RAM）
+
+    def test_save_failure_routes_to_warn_and_survives(self, tmp_path, monkeypatch):
+        """后台保存抛异常 → 经 warn 回调告警、不崩溃、不中断（保持 ed69f24 语义）。"""
+        buf = _small_buffer()
+
+        def boom_save(self, d):  # noqa: ANN001
+            raise RuntimeError("模拟磁盘写失败")
+
+        monkeypatch.setattr(ReplayBuffer, "save", boom_save)
+        received: list[str] = []
+        saver = _BufferSaver(tmp_path / "buf", mode="snapshot", warn=received.append)
+        saver.save(buf)
+        saver.close()  # join：线程内已 catch 异常并 warn
+
+        assert len(received) == 1
+        assert "保存失败" in received[0]
+        assert "模拟磁盘写失败" in received[0]
+
+    def test_sync_mode_no_thread(self, tmp_path):
+        """sync 模式同步落盘、从不起线程，产物与直接 save 等价。"""
+        buf = _small_buffer(25)
+        saver = _BufferSaver(tmp_path / "buf", mode="sync", warn=lambda m: None)
+        saver.save(buf)
+        assert saver._thread is None
+        _assert_buf_data_equal(buf, ReplayBuffer.load(tmp_path / "buf"))
+
+    def test_freeze_window_before_selfplay_joins(self, tmp_path, monkeypatch):
+        """freeze_window 模式：before_selfplay 必须 join 上一份「活 buffer」保存（改写前落盘完成）。"""
+        buf = _small_buffer()
+        events: list[str] = []
+
+        def slow_save(self, d):  # noqa: ANN001
+            events.append("start")
+            time.sleep(0.12)
+            events.append("end")
+
+        monkeypatch.setattr(ReplayBuffer, "save", slow_save)
+        saver = _BufferSaver(tmp_path / "buf", mode="freeze_window", warn=lambda m: None)
+        saver.save(buf)             # 对活 buffer 起线程
+        assert saver._thread is not None
+        saver.before_selfplay()     # 必须在此 join（下一 selfplay 即将改写活 buffer）
+        assert events == ["start", "end"]
+        assert saver._thread is None
+        saver.close()
+
+    def test_snapshot_before_selfplay_is_noop(self, tmp_path, monkeypatch):
+        """snapshot 模式 before_selfplay 不 join（保留与下一迭代 selfplay 的重叠）。"""
+        buf = _small_buffer()
+        gate = threading.Event()
+        started = threading.Event()
+
+        def blocking_save(self, d):  # noqa: ANN001
+            started.set()
+            gate.wait(timeout=5.0)  # 阻塞直到主线程放行
+
+        monkeypatch.setattr(ReplayBuffer, "save", blocking_save)
+        saver = _BufferSaver(tmp_path / "buf", mode="snapshot", warn=lambda m: None)
+        saver.save(buf)
+        started.wait(timeout=5.0)
+        # before_selfplay 在 snapshot 模式应立即返回（不等后台线程），线程仍在运行。
+        saver.before_selfplay()
+        assert saver._thread is not None and saver._thread.is_alive()
+        gate.set()
+        saver.close()
+        assert saver._thread is None
 
 
 # ======================================================================
@@ -1141,3 +1370,105 @@ class TestLoadLatestCheckpoint:
         (tmp_path / "iter_0002.pt").write_bytes(b"junk-2")
         with pytest.raises(RuntimeError, match="均损坏"):
             load_latest_checkpoint(tmp_path, "cpu")
+
+
+# ---------------------------------------------------------------------------
+# 快照环形回绕隔离（补 TestReplayBufferSnapshot 的覆盖盲区）
+# ---------------------------------------------------------------------------
+class TestSnapshotRingWraparound:
+    def test_wraparound_overwrite_does_not_pollute_snapshot(self, tmp_path):
+        """取快照后写入量超过容量、环形回绕改写快照有效槽位区，快照落盘仍是旧数据。
+
+        capacity=30：先入 20 条取快照，再入 25 条（45>30 触发回绕，槽 0-14 被
+        原地覆盖——正是快照的有效区）。若 snapshot 的 states 拷贝不完整，此处必挂。
+        """
+        shape = (3, 10, 9)
+        buf = ReplayBuffer(capacity=30, state_shape=shape)
+        buf.add_game(*_make_game(20, state_shape=shape))
+        snap = buf.snapshot()
+        states_at_snap = buf._states.copy()
+
+        buf.add_game(*_make_game(25, state_shape=shape))     # 回绕覆盖槽 0-14
+        assert len(buf) == 30 and snap._size == 20
+
+        np.testing.assert_array_equal(snap._states, states_at_snap)
+
+        d = tmp_path / "wrap"
+        snap.save(d)
+        loaded = ReplayBuffer.load(d, capacity=30, state_shape=shape)
+        assert len(loaded) == 20
+        np.testing.assert_array_equal(loaded._states[:20], states_at_snap[:20])
+
+
+# ---------------------------------------------------------------------------
+# _BufferSaver 模式校验
+# ---------------------------------------------------------------------------
+class TestBufferSaverModeValidation:
+    def test_unknown_mode_raises(self, tmp_path):
+        """拼写错误的模式必须在构造时炸掉，不得静默回落 snapshot。"""
+        with pytest.raises(ValueError, match="async_buffer_save"):
+            _BufferSaver(tmp_path / "b", mode="snapshto")
+
+    def test_valid_modes_accepted(self, tmp_path):
+        for m in ("snapshot", "freeze_window", "sync"):
+            assert _BufferSaver(tmp_path / "b", mode=m)._mode == m
+
+
+# ---------------------------------------------------------------------------
+# 容器感知的有效核数与 worker 自动数（rl/selfplay.py）
+# ---------------------------------------------------------------------------
+class TestEffectiveCpuCount:
+    def test_min_of_all_signals(self, monkeypatch):
+        """三信号取最小：cgroup 配额最严时以配额为准（K8s CFS 限额场景）。"""
+        import rl.selfplay as sp
+
+        monkeypatch.setattr(sp.os, "cpu_count", lambda: 192)
+        monkeypatch.setattr(sp.os, "sched_getaffinity", lambda pid: set(range(64)),
+                            raising=False)
+        monkeypatch.setattr(sp, "_read_cgroup_cpu_quota", lambda: 20)
+        assert sp.effective_cpu_count() == 20
+
+    def test_fallback_to_cpu_count(self, monkeypatch):
+        """无亲和性接口（Windows/macOS）且无 cgroup 配额时回退 cpu_count。"""
+        import rl.selfplay as sp
+
+        monkeypatch.setattr(sp.os, "cpu_count", lambda: 16)
+        monkeypatch.delattr(sp.os, "sched_getaffinity", raising=False)
+        monkeypatch.setattr(sp, "_read_cgroup_cpu_quota", lambda: None)
+        assert sp.effective_cpu_count() == 16
+
+
+class TestNumSelfplayWorkersAuto:
+    def _cfg(self, num_workers=0, device="cuda", num_gpus=8):
+        cfg = Config()
+        cfg.selfplay.num_workers = num_workers
+        cfg.train.device = device
+        cfg.train.num_gpus = num_gpus
+        return cfg
+
+    def test_explicit_wins(self, monkeypatch):
+        import rl.selfplay as sp
+
+        monkeypatch.setattr(sp, "effective_cpu_count", lambda: 20)
+        assert sp.num_selfplay_workers(self._cfg(num_workers=7)) == 7
+
+    def test_abundant_cores_keeps_bare_metal_formula(self, monkeypatch):
+        """核充裕（eff ≥ 4×(ngpu+4)）：裸机公式 max(8, eff-ngpu-4) 不变。"""
+        import rl.selfplay as sp
+
+        monkeypatch.setattr(sp, "effective_cpu_count", lambda: 192)
+        assert sp.num_selfplay_workers(self._cfg()) == 180
+
+    def test_scarce_quota_uses_mild_oversubscription(self, monkeypatch):
+        """核受限（小配额容器）：1.5× 轻度超订而非固定预留（20 核 → 30 worker，
+        而非旧公式的 max(8, 20-12)=8 欠订或 cpu_count 失真下的 180 严重超订）。"""
+        import rl.selfplay as sp
+
+        monkeypatch.setattr(sp, "effective_cpu_count", lambda: 20)
+        assert sp.num_selfplay_workers(self._cfg()) == 30
+
+    def test_scarce_quota_clamped_to_64(self, monkeypatch):
+        import rl.selfplay as sp
+
+        monkeypatch.setattr(sp, "effective_cpu_count", lambda: 47)  # 47 < 4*12=48
+        assert sp.num_selfplay_workers(self._cfg()) == 64  # ceil(70.5) 夹到 64

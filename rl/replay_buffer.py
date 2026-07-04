@@ -108,6 +108,46 @@ class ReplayBuffer:
             if self._size < self.capacity:
                 self._size += 1
 
+    # ── 一致性快照（供后台线程 save 用）─────────────────────────────────────
+
+    def snapshot(self) -> "ReplayBuffer":
+        """返回当前 buffer 的一致性快照，可直接 ``.save(dir)``（供后台保存线程用）。
+
+        动机：``save()``（npz 压缩 ~1.5M 样本）耗时 ~100-150s，同步执行会让整机空转。
+        取快照后可把压缩落盘挪到后台线程，与下一迭代 selfplay 并行；快照冻结「取快照那
+        一刻」的数据，后续 ``add_game`` 不会污染正在被压缩的内容。
+
+        深浅拷贝依据（已核实全仓 add_game 的写入方式）：
+          - ``_states``：**实体拷贝**（``.copy()``）。add_game 对其做原地写
+            ``self._states[pos] = ...``，若仅共享引用，后台 save 期间下一迭代的 add_game
+            会改写正在压缩的行。
+          - ``_values``：**实体拷贝**（同理，add_game 原地写 ``self._values[pos] = ...``）。
+          - ``_pol_indices`` / ``_pol_probs``：**浅拷贝**（``list(...)``）。add_game 只做整槽
+            引用替换（``self._pol_indices[pos] = np.asarray(...)``），全仓无任何对已存槽位
+            数组的原地元素改写（``_pol_indices[si][...] = ...`` 之类，已 grep 确认为空），故
+            浅拷贝捕获的数组对象引用在后台 save 期间保持不变——add_game 只替换 list 槽位、
+            绝不动被引用的旧数组，快照读到的始终是取快照时的一致数据。
+          - ``_size`` / ``_pos``：**冻结标量**。``save()`` 的 valid_idx 依赖二者确定有效槽位
+            与环形顺序，必须一并冻结。
+
+        RAM 峰值：快照对整块 ``_states`` 做实体拷贝，体量≈活 buffer 的 states
+        （configs/cloud_8xh100 满 buffer ~1.5M×2790B≈4.2GB）。故后台保存期间系统 RAM
+        峰值 ≈ 活 buffer states + 一份快照 states（约 +4.2GB）；8×H100 机器 RAM 通常 TB
+        级，可忽略。RAM 紧张时改用 rl/train.py `_BufferSaver` 的 "freeze_window" 降级模式
+        （零额外 RAM、部分隐藏）。
+        """
+        # 用 __new__ 跳过 __init__ 的 zeros 分配（否则会先无谓分配一整块 capacity 再丢弃）。
+        snap = object.__new__(ReplayBuffer)
+        snap.capacity = self.capacity
+        snap.state_shape = self.state_shape
+        snap._size = self._size          # 冻结（valid_idx 依赖）
+        snap._pos = self._pos            # 冻结（valid_idx 依赖）
+        snap._states = self._states.copy()   # 实体拷贝（add_game 原地写）
+        snap._values = self._values.copy()   # 实体拷贝（add_game 原地写）
+        snap._pol_indices = list(self._pol_indices)  # 浅拷贝（整槽替换，无原地改写）
+        snap._pol_probs = list(self._pol_probs)      # 浅拷贝（同上）
+        return snap
+
     # ── 采样 ──────────────────────────────────────────────────────────────
 
     def sample(

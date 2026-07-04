@@ -27,6 +27,7 @@ import argparse
 import logging
 import math
 import random
+import threading
 import time
 from pathlib import Path
 from queue import Empty
@@ -41,7 +42,12 @@ from rl.logger import TrainLogger
 from rl.model import create_model, save_checkpoint
 from rl.replay_buffer import ReplayBuffer
 from rl.inference_server import create_shared_buffers, eval_server_proc
-from rl.selfplay import num_eval_servers, num_selfplay_workers, selfplay_worker
+from rl.selfplay import (
+    cpu_budget_summary,
+    num_eval_servers,
+    num_selfplay_workers,
+    selfplay_worker,
+)
 
 __all__ = [
     "run_training",
@@ -229,6 +235,11 @@ def _selfplay_phase(
     n_servers = num_eval_servers(cfg)
     total_games = int(cfg.selfplay.games_per_iteration)
     use_cuda = str(cfg.train.device).startswith("cuda") and torch.cuda.is_available()
+    # 核数预算一览：容器限额（cgroup 配额/亲和性）会压缩有效核数，一眼看穿环境。
+    logger.info(
+        f"[iter {iteration}] selfplay: workers={n_workers} servers={n_servers} "
+        f"({cpu_budget_summary()})"
+    )
 
     # 共享内存：每 worker 一套（MAX_LEAVES = games_per_worker × mcts.batch_size）。
     max_leaves = int(cfg.selfplay.games_per_worker) * max(1, int(cfg.mcts.batch_size))
@@ -395,10 +406,21 @@ def _selfplay_phase(
         p.join(timeout=30.0)
         if p.is_alive():
             p.terminate()
+            # terminate 只发 SIGTERM，必须再 join 才会被内核 reap——否则该进程在训练
+            # 主进程存活期间永久滞留为 zombie（曾实测累积上百个，逼近 pod pids.max
+            # 会让后续 fork 全部失败）。仍不退（极端卡死）则 SIGKILL 兜底。
+            p.join(timeout=5.0)
+            if p.is_alive():
+                p.kill()
+                p.join()
     for p in servers:
         p.join(timeout=30.0)
         if p.is_alive():
             p.terminate()
+            p.join(timeout=5.0)
+            if p.is_alive():
+                p.kill()
+                p.join()
 
     if server_died:
         raise RuntimeError(f"iter {iteration}: EvalServer 进程死亡，自博弈中断")
@@ -561,6 +583,107 @@ def _train_phase(
 
 
 # ---------------------------------------------------------------------------
+# buffer 后台保存编排器（快照 + 线程，消除每迭代 buffer.save 的整机空转）
+# ---------------------------------------------------------------------------
+class _BufferSaver:
+    """把 ``buffer.save`` 从主循环挪到后台线程，与下一迭代 selfplay/train/arena 重叠。
+
+    背景：configs/cloud_8xh100 下 ``buffer.save`` 压缩 ~1.5M 样本 npz 约 100-150s，同步
+    执行期间整机空转（selfplay/train/arena 都已结束、下一迭代未开始）。本类把压缩落盘
+    放进后台线程与下一迭代真正并行——``np.savez_compressed`` 的 zlib 在 C 层释放 GIL、
+    训练主循环是 GPU-bound（torch 算子亦释放 GIL），故是真并行而非 GIL 假并行。
+
+    模式（``cfg.train.async_buffer_save``，缺省 "snapshot"）：
+      - "snapshot"（默认，推荐）：主线程取一致性快照（``ReplayBuffer.snapshot``：
+        states/values 实体拷贝、稀疏 π 两 list 浅拷贝、冻结 size/pos），后台线程压缩快照。
+        save 可跨入下一迭代 selfplay 完全隐藏，仅暴露 ~2-5s 的实体拷贝；RAM 峰值约
+        +4.2GB（满 buffer states 一份）。8×H100 机器 RAM 通常 TB 级，可忽略。
+      - "freeze_window"：不拷贝，直接对「只读窗口」内的活 buffer 起线程（该窗口从
+        selfplay 结束到下一迭代 selfplay 首个 add_game 之间 buffer 只读），在下一迭代
+        selfplay 改写 buffer 前无条件 join。零额外 RAM，但只把 save 藏进 train+arena，
+        残余仍阻塞下一 selfplay。RAM 紧张时的降级选择。
+      - "sync"：同步保存（原行为，零重叠、零额外 RAM）。
+
+    **单写者不变式**（ed69f24 的 tmp/.old 原子换名要求）：任一时刻至多一个线程触碰
+    ``buf_dir``——两个并发 save 的 rename/.old 换名会互相破坏。由「发起下一次保存前先
+    join 上一次」保证；主线程自身不再直接调 ``buffer.save``（sync 模式本就串行）。
+
+    **退出**：所有退出路径（正常跑完 / 异常 / Ctrl-C）都必须 ``close()`` 以 join 未完成
+    的后台保存——否则进程退出可能停在 rename 中途（load 虽能回退 .old，但不必冒险），或
+    丢最后一迭代 buffer。故绝不用 daemon=True。save() 内部原子 tmp+rename+.old
+    （ed69f24）保证即便 join 前被 kill，磁盘上 <buffer> 或 <buffer>.old 至少一份完整。
+
+    **崩溃版本差窗口（有意的权衡）**：iter N 的 buffer 落盘与 iter N+1 全程并行，若在
+    N+1 期间被 kill 且后台写尚未换名完成，磁盘 buffer 可能仍是 iter N-1 的——buffer 与
+    checkpoint 的版本差从同步时代的 ~秒级扩大到最多一整迭代。--resume 对 buffer 落后/
+    超前一代均容忍（load 回退链完好，样本是自再生软状态），非正确性问题，勿"修复"。
+    """
+
+    _MODES = ("snapshot", "freeze_window", "sync")
+
+    def __init__(
+        self,
+        buf_dir: "str | Path",
+        mode: str = "snapshot",
+        warn: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self._buf_dir = buf_dir
+        self._mode = str(mode).lower()
+        if self._mode not in self._MODES:
+            raise ValueError(
+                f"async_buffer_save={mode!r} 不合法，可选 {'/'.join(self._MODES)}"
+            )
+        self._warn = warn if warn is not None else _LOG.warning
+        self._thread: Optional[threading.Thread] = None
+
+    def _bg_save(self, payload: ReplayBuffer) -> None:
+        """线程体：压缩落盘；失败必须在线程内 catch 并走 warn（子线程未捕获异常不会
+        传播到主线程，静默丢失或崩溃线程都不可接受），保持 ed69f24 的
+        「保存失败 logger.warn 不中断训练」语义。"""
+        try:
+            payload.save(self._buf_dir)
+        except Exception as e:
+            self._warn(f"buffer 保存失败: {e}")
+
+    def before_selfplay(self) -> None:
+        """下一迭代 selfplay 前调用。"freeze_window" 模式必须在此 join——后台线程持有的
+        是活 buffer 的引用，而 selfplay 即将 add_game 原地改写它。snapshot/sync 模式无活
+        buffer 依赖，此处不 join（否则会白白丢掉与 selfplay 的重叠）。"""
+        if self._mode == "freeze_window":
+            self.join()
+
+    def save(self, buffer: ReplayBuffer) -> None:
+        """发起本迭代保存。先 join 上一次（保证 buf_dir 单写者，并释放上一份快照 RAM）。"""
+        # 单写者：join 上一次未完成的保存（snapshot 模式此处顺带回收上一份快照）。
+        self.join()
+        if self._mode == "sync":
+            self._bg_save(buffer)
+            return
+        if self._mode == "freeze_window":
+            # 直接对只读活 buffer 起线程；before_selfplay 会在下次改写前 join。
+            payload: ReplayBuffer = buffer
+        else:  # "snapshot"（默认）
+            # 主线程取一致性快照（~2-5s，~4.2GB 实体拷贝）；此后仅后台线程引用它，
+            # 内联传参不留主线程本地引用，join 时随 _thread 置 None 一并回收，RAM 峰值
+            # 仅 +1 份快照 states。
+            payload = buffer.snapshot()
+        self._thread = threading.Thread(
+            target=self._bg_save, args=(payload,), daemon=False
+        )
+        self._thread.start()
+
+    def join(self) -> None:
+        """join 未完成的后台保存并丢弃其引用（Thread 持有 payload，置 None 才能回收快照）。"""
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+
+    def close(self) -> None:
+        """退出时调用（正常/异常/Ctrl-C），join 最后一份未落盘的保存。"""
+        self.join()
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 def run_training(cfg: Config, resume: bool = False) -> Dict[str, object]:
@@ -636,103 +759,126 @@ def run_training(cfg: Config, resume: bool = False) -> Dict[str, object]:
     total_iterations = int(cfg.train.total_iterations)
     last_summary: Dict[str, object] = {}
 
-    for iteration in range(start_iter, total_iterations):
-        iter_t0 = time.monotonic()
-        records_path = records_dir / f"iter_{iteration:04d}.jsonl"
-        # --resume 崩溃重跑同一迭代时，该文件可能是上次中途写入的部分残留；
-        # append_jsonl 是纯追加，不清理会导致行数混入两次运行、超过 games_per_iteration。
-        records_path.unlink(missing_ok=True)
+    # buffer 后台保存编排器：把 ~100-150s 的 npz 压缩落盘挪出主循环、与下一迭代重叠。
+    # 缺省 "snapshot"（配置未声明该字段时的默认）；getattr 兜底以免依赖 configs/ 改动。
+    saver = _BufferSaver(
+        buf_dir,
+        mode=str(getattr(cfg.train, "async_buffer_save", "snapshot")),
+        warn=logger.warn,
+    )
 
-        # 1) Self-play（best 模型执双方）。
-        sp_t0 = time.monotonic()
-        sp_stats = _selfplay_phase(cfg, iteration, best_path, logger, buffer, records_path)
-        selfplay_sec = time.monotonic() - sp_t0
+    # try/finally：所有退出路径（正常跑完 / 异常 / Ctrl-C）都 join 后台保存，避免留下
+    # 半写状态或丢最后一迭代 buffer（save 内部 tmp+rename+.old 原子，最坏也可回退 .old）。
+    try:
+        for iteration in range(start_iter, total_iterations):
+            iter_t0 = time.monotonic()
+            # freeze_window 模式：下一迭代 selfplay 会 add_game 原地改写活 buffer，
+            # 须在此 join 上一份「活 buffer」后台保存（snapshot/sync 模式此处 no-op，
+            # 快照与活 buffer 解耦、可继续跨入本迭代 selfplay）。
+            saver.before_selfplay()
+            records_path = records_dir / f"iter_{iteration:04d}.jsonl"
+            # --resume 崩溃重跑同一迭代时，该文件可能是上次中途写入的部分残留；
+            # append_jsonl 是纯追加，不清理会导致行数混入两次运行、超过 games_per_iteration。
+            records_path.unlink(missing_ok=True)
 
-        # 2) Train（buffer 达阈值才训练）。
-        tr_t0 = time.monotonic()
-        trained = len(buffer) >= int(cfg.train.min_buffer_to_train)
-        if trained:
-            new_samples = int(sp_stats.get("new_samples", 0))
-            steps = resolve_train_steps(new_samples, cfg)
-            mode = "自动" if int(cfg.train.train_steps_per_iteration) == 0 else "固定"
-            logger.info(
-                f"[iter {iteration}] 本迭代新样本 {new_samples}，训练步数 {steps}（{mode}）"
+            # 1) Self-play（best 模型执双方）。
+            sp_t0 = time.monotonic()
+            sp_stats = _selfplay_phase(cfg, iteration, best_path, logger, buffer, records_path)
+            selfplay_sec = time.monotonic() - sp_t0
+
+            # 2) buffer 持久化发起（后台线程）。此刻起到下一迭代 selfplay 的首个
+            #    add_game 之前 buffer 只读：snapshot 模式在此取快照可与 train+arena+
+            #    下一迭代 selfplay 全程重叠；freeze_window 模式恰好把压缩藏进
+            #    train+arena（before_selfplay 会在下次改写前 join）。save 内部先 join
+            #    上一次保存（buf_dir 单写者、释放上份快照 RAM）；失败在线程内
+            #    logger.warn，不中断训练（保持 ed69f24 语义）。
+            saver.save(buffer)
+
+            # 3) Train（buffer 达阈值才训练）。
+            tr_t0 = time.monotonic()
+            trained = len(buffer) >= int(cfg.train.min_buffer_to_train)
+            if trained:
+                new_samples = int(sp_stats.get("new_samples", 0))
+                steps = resolve_train_steps(new_samples, cfg)
+                mode = "自动" if int(cfg.train.train_steps_per_iteration) == 0 else "固定"
+                logger.info(
+                    f"[iter {iteration}] 本迭代新样本 {new_samples}，训练步数 {steps}（{mode}）"
+                )
+                tr_stats = _train_phase(model, optimizer, buffer, cfg, iteration, device, logger, steps)
+            else:
+                logger.info(
+                    f"[iter {iteration}] buffer {len(buffer)} < min_buffer_to_train "
+                    f"{cfg.train.min_buffer_to_train}，跳过训练"
+                )
+                tr_stats = {}
+            train_sec = time.monotonic() - tr_t0
+
+            # 4) 存本迭代 checkpoint（含 optimizer），供 arena 与续训使用。
+            iter_path = _save_iter(iteration)
+
+            # 5) Arena 门控（新 iter vs best）。多进程并行铺满全部 GPU（rl/evaluate.py）。
+            ar_t0 = time.monotonic()
+            arena_stats = arena(str(iter_path), str(best_path), cfg, device)
+            arena_sec = time.monotonic() - ar_t0
+            promoted = bool(trained and arena_stats["score"] >= float(cfg.arena.gate_threshold))
+            if promoted:
+                save_checkpoint(
+                    model, cfg.model, best_path, iteration=iteration, meta={"promoted_from": iteration}
+                )
+
+            logger.arena_result(
+                wins=arena_stats["wins"],
+                draws=arena_stats["draws"],
+                losses=arena_stats["losses"],
+                red_wins=arena_stats["red_wins"],
+                red_draws=arena_stats["red_draws"],
+                red_losses=arena_stats["red_losses"],
+                black_wins=arena_stats["black_wins"],
+                black_draws=arena_stats["black_draws"],
+                black_losses=arena_stats["black_losses"],
+                score=arena_stats["score"],
+                threshold=float(cfg.arena.gate_threshold),
+                promoted=promoted,
+                iteration=iteration,
+                elapsed_sec=arena_sec,
             )
-            tr_stats = _train_phase(model, optimizer, buffer, cfg, iteration, device, logger, steps)
-        else:
-            logger.info(
-                f"[iter {iteration}] buffer {len(buffer)} < min_buffer_to_train "
-                f"{cfg.train.min_buffer_to_train}，跳过训练"
-            )
-            tr_stats = {}
-        train_sec = time.monotonic() - tr_t0
 
-        # 3) 存本迭代 checkpoint（含 optimizer），供 arena 与续训使用。
-        iter_path = _save_iter(iteration)
-
-        # 4) Arena 门控（新 iter vs best）。多进程并行铺满全部 GPU（rl/evaluate.py）。
-        ar_t0 = time.monotonic()
-        arena_stats = arena(str(iter_path), str(best_path), cfg, device)
-        arena_sec = time.monotonic() - ar_t0
-        promoted = bool(trained and arena_stats["score"] >= float(cfg.arena.gate_threshold))
-        if promoted:
-            save_checkpoint(
-                model, cfg.model, best_path, iteration=iteration, meta={"promoted_from": iteration}
-            )
-
-        logger.arena_result(
-            wins=arena_stats["wins"],
-            draws=arena_stats["draws"],
-            losses=arena_stats["losses"],
-            red_wins=arena_stats["red_wins"],
-            red_draws=arena_stats["red_draws"],
-            red_losses=arena_stats["red_losses"],
-            black_wins=arena_stats["black_wins"],
-            black_draws=arena_stats["black_draws"],
-            black_losses=arena_stats["black_losses"],
-            score=arena_stats["score"],
-            threshold=float(cfg.arena.gate_threshold),
-            promoted=promoted,
-            iteration=iteration,
-            elapsed_sec=arena_sec,
-        )
-
-        # 5) buffer 持久化 + CSV 汇总行。
-        try:
-            buffer.save(buf_dir)
-        except Exception as e:
-            logger.warn(f"buffer 保存失败: {e}")
-
-        total_sec = time.monotonic() - iter_t0
-        row = {
-            "iter": iteration,
-            "games": sp_stats["games"],
-            "red_win": sp_stats["red_win"],
-            "black_win": sp_stats["black_win"],
-            "draw": sp_stats["draw"],
-            "red_winrate": round(sp_stats["red_winrate"], 4),
-            "black_winrate": round(sp_stats["black_winrate"], 4),
-            "draw_rate": round(sp_stats["draw_rate"], 4),
-            "avg_plies": round(sp_stats["avg_plies"], 2),
-            "resign_rate": round(sp_stats["resign_rate"], 4),
-            "resign_fp_rate": round(sp_stats["resign_fp_rate"], 4),
-            "buffer_size": len(buffer),
-            "loss": round(tr_stats["loss"], 5) if trained else "",
-            "policy_loss": round(tr_stats["policy_loss"], 5) if trained else "",
-            "value_loss": round(tr_stats["value_loss"], 5) if trained else "",
-            "entropy": round(tr_stats["entropy"], 5) if trained else "",
-            "value_mae": round(tr_stats["value_mae"], 5) if trained else "",
-            "lr": (f"{tr_stats['lr']:.3e}" if trained else ""),
-            "arena_score": round(arena_stats["score"], 4),
-            "arena_red_score": round(arena_stats["red_score"], 4),
-            "arena_black_score": round(arena_stats["black_score"], 4),
-            "promoted": promoted,
-            "selfplay_sec": round(selfplay_sec, 2),
-            "train_sec": round(train_sec, 2),
-            "total_sec": round(total_sec, 2),
-        }
-        logger.iteration_summary(row)
-        last_summary = row
+            # 6) CSV 汇总行（buffer 落盘已在步骤 2 后台进行）。
+            total_sec = time.monotonic() - iter_t0
+            row = {
+                "iter": iteration,
+                "games": sp_stats["games"],
+                "red_win": sp_stats["red_win"],
+                "black_win": sp_stats["black_win"],
+                "draw": sp_stats["draw"],
+                "red_winrate": round(sp_stats["red_winrate"], 4),
+                "black_winrate": round(sp_stats["black_winrate"], 4),
+                "draw_rate": round(sp_stats["draw_rate"], 4),
+                "avg_plies": round(sp_stats["avg_plies"], 2),
+                "resign_rate": round(sp_stats["resign_rate"], 4),
+                "resign_fp_rate": round(sp_stats["resign_fp_rate"], 4),
+                "buffer_size": len(buffer),
+                "loss": round(tr_stats["loss"], 5) if trained else "",
+                "policy_loss": round(tr_stats["policy_loss"], 5) if trained else "",
+                "value_loss": round(tr_stats["value_loss"], 5) if trained else "",
+                "entropy": round(tr_stats["entropy"], 5) if trained else "",
+                "value_mae": round(tr_stats["value_mae"], 5) if trained else "",
+                "lr": (f"{tr_stats['lr']:.3e}" if trained else ""),
+                "arena_score": round(arena_stats["score"], 4),
+                "arena_red_score": round(arena_stats["red_score"], 4),
+                "arena_black_score": round(arena_stats["black_score"], 4),
+                "promoted": promoted,
+                "selfplay_sec": round(selfplay_sec, 2),
+                "train_sec": round(train_sec, 2),
+                "total_sec": round(total_sec, 2),
+            }
+            logger.iteration_summary(row)
+            last_summary = row
+    finally:
+        # 所有退出路径（正常跑完 / 异常 / Ctrl-C）都 join 最后一份未落盘的后台保存——
+        # 否则进程退出可能停在 rename 中途或丢最后一迭代 buffer（虽 save 原子换名 + load
+        # 回退 .old 能兜底，但不必冒险）。必须在 logger.close() 之前完成。
+        saver.close()
 
     logger.info("训练循环结束")
     logger.close()
