@@ -21,7 +21,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
@@ -292,6 +292,7 @@ class ReplayBuffer:
         dir: "str | Path",
         capacity: Optional[int] = None,
         state_shape: Optional[tuple] = None,
+        warn: Optional[Callable[[str], None]] = None,
     ) -> "ReplayBuffer":
         """容错加载 buffer。
 
@@ -304,7 +305,15 @@ class ReplayBuffer:
              打 WARN，否则重新抛出主目录的异常（无法凭空重建）。
 
         加载成功后清理遗留的 ``<dir>.tmp`` / ``<dir>.old``（上次被打断的残留）。
+
+        Parameters
+        ----------
+        warn : 容错告警回调（单参数字符串消息），默认 None 时回退 ``_LOG.warning``。
+               供调用方接入自身日志系统（如 rl/train.py 的 TrainLogger.warn），
+               否则告警只落 stderr、进不了 train.log。
         """
+        if warn is None:
+            warn = _LOG.warning
         load_dir = Path(dir)
         old_dir = load_dir.with_name(load_dir.name + ".old")
         tmp_dir = load_dir.with_name(load_dir.name + ".tmp")
@@ -316,15 +325,15 @@ class ReplayBuffer:
             # 回退到上一份完整数据 <dir>.old。
             try:
                 buf = cls._load_from_dir(old_dir)
-                _LOG.warning(
-                    "主 buffer 损坏（%s: %s），已回退上一份 %s",
-                    type(e_primary).__name__, e_primary, old_dir.name,
+                warn(
+                    f"主 buffer 损坏（{type(e_primary).__name__}: {e_primary}），"
+                    f"已回退上一份 {old_dir.name}"
                 )
             except Exception as e_old:
                 if capacity is not None and state_shape is not None:
-                    _LOG.warning(
-                        "主 buffer 与备份均不可用（主: %s；备: %s），新建空 buffer",
-                        e_primary, e_old,
+                    warn(
+                        f"主 buffer 与备份均不可用（主: {e_primary}；备: {e_old}），"
+                        f"新建空 buffer"
                     )
                     buf = cls(int(capacity), tuple(state_shape))
                 else:

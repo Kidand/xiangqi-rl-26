@@ -446,6 +446,42 @@ class TestReplayBufferAtomicSave:
         ReplayBuffer.load(main)
         assert not leftover.exists(), "load 后应清理遗留 .tmp"
 
+    def test_warn_callback_receives_fallback_message(self, tmp_path):
+        """传入 warn 回调时，回退 .old 的告警应经该回调而非 _LOG.warning。"""
+        state_shape = (3, 10, 9)
+        buf_gen1 = ReplayBuffer(capacity=50, state_shape=state_shape)
+        buf_gen1.add_game(*_make_game(12, state_shape=state_shape))
+        buf_gen2 = ReplayBuffer(capacity=50, state_shape=state_shape)
+        buf_gen2.add_game(*_make_game(18, state_shape=state_shape))
+
+        main = tmp_path / "buf"
+        old = tmp_path / "buf.old"
+        # 先写 gen2 到主目录，再写 gen1 到 .old（避免 save 清掉 .old）。
+        buf_gen2.save(main)
+        buf_gen1.save(old)
+
+        # 截断主目录的状态分片，制造解压错误，强制走回退路径。
+        shard = main / "states_0000.npz"
+        shard.write_bytes(shard.read_bytes()[:100])
+
+        received: list[str] = []
+        loaded = ReplayBuffer.load(main, warn=received.append)
+
+        _assert_buf_data_equal(buf_gen1, loaded)
+        assert len(received) == 1
+        assert "回退" in received[0]
+
+    def test_warn_callback_receives_rebuild_message(self, tmp_path):
+        """主目录与 .old 都不可用时，「新建空 buffer」告警也应经 warn 回调。"""
+        main = tmp_path / "buf"  # 不存在，.old 同样不存在
+        received: list[str] = []
+        loaded = ReplayBuffer.load(
+            main, capacity=64, state_shape=(2, 10, 9), warn=received.append
+        )
+        assert len(loaded) == 0
+        assert len(received) == 1
+        assert "新建空 buffer" in received[0]
+
 
 # ======================================================================
 # TrainLogger CSV 测试

@@ -620,6 +620,7 @@ def run_training(cfg: Config, resume: bool = False) -> Dict[str, object]:
                 buf_dir,
                 capacity=int(cfg.train.buffer_window),
                 state_shape=state_shape,
+                warn=logger.warn,
             )
             logger.info(f"buffer 续载，size={len(buffer)}")
         else:
@@ -638,6 +639,9 @@ def run_training(cfg: Config, resume: bool = False) -> Dict[str, object]:
     for iteration in range(start_iter, total_iterations):
         iter_t0 = time.monotonic()
         records_path = records_dir / f"iter_{iteration:04d}.jsonl"
+        # --resume 崩溃重跑同一迭代时，该文件可能是上次中途写入的部分残留；
+        # append_jsonl 是纯追加，不清理会导致行数混入两次运行、超过 games_per_iteration。
+        records_path.unlink(missing_ok=True)
 
         # 1) Self-play（best 模型执双方）。
         sp_t0 = time.monotonic()

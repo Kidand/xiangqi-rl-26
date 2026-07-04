@@ -15,13 +15,30 @@ cd "$PROJECT_DIR"
 # 激活虚拟环境
 source .venv/bin/activate
 
-# 构建训练命令
-TRAIN_CMD="python -m rl.train --config configs/cloud_8xh100.yaml"
+# 构建训练命令数组
+cmd_array=("python" "-m" "rl.train")
 
-# 透传额外参数
-if [ $# -gt 0 ]; then
-    TRAIN_CMD="python -m rl.train $@"
+# 检查用户是否显式传递了 --config
+has_config=false
+for arg in "$@"; do
+    if [[ "$arg" == --config* ]]; then
+        has_config=true
+        break
+    fi
+done
+
+# 如果用户没有指定 config，使用默认的
+if [ "$has_config" = false ]; then
+    cmd_array+=("--config" "configs/cloud_8xh100.yaml")
 fi
+
+# 追加用户传递的所有参数
+if [ $# -gt 0 ]; then
+    cmd_array+=("$@")
+fi
+
+# 构建显示用的命令字符串（用于日志）
+TRAIN_CMD=$(printf '%s ' "${cmd_array[@]}")
 
 echo "=========================================="
 echo "中国象棋 AlphaZero RL 训练启动"
@@ -33,5 +50,5 @@ echo "时间戳: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "=========================================="
 echo ""
 
-# 执行训练（所有参数透传）
-exec $TRAIN_CMD
+# 执行训练
+exec "${cmd_array[@]}"
