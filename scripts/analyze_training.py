@@ -192,16 +192,21 @@ def report_records(records_dir: Path, n_files: int, n_lines: int, lines: list[st
     else:
         step = (len(files) - 1) / (n_files - 1)
         picked = [files[round(i * step)] for i in range(n_files - 1)] + [files[-1]]
-    lines.append(f"- 采样 {len(picked)} 个文件 × 每文件至多 {n_lines} 局")
-    lines.append("| 文件 | 局数 | checkmate | repetition | max_moves | no_capture | resign | 其他 | plies p50/p90 |")
-    lines.append("|" + "---|" * 9)
+    # 必须读整个文件：jsonl 按对局"完成顺序"追加，短局先完成先落盘，
+    # 只读前 N 行会系统性漏掉文件尾部的长局/和棋（曾据此得出与
+    # metrics.csv 的 draw_rate/avg_plies 自相矛盾的分布）。
+    lines.append(f"- 采样 {len(picked)} 个文件（每文件全量统计，安全上限 {n_lines} 局）")
+    known = ("checkmate", "stalemate", "repetition", "perpetual_check",
+             "max_moves", "no_capture", "resign")
+    lines.append("| 文件 | 局数 | " + " | ".join(known) + " | 其他 | plies p50/p90/max |")
+    lines.append("|" + "---|" * (len(known) + 4))
     for p in picked:
         term: dict[str, int] = {}
         plies: list[int] = []
         n = 0
         with open(p, encoding="utf-8") as fh:
             for line in fh:
-                if n >= n_lines:
+                if n >= n_lines:   # 仅防极端超大文件，正常配置远达不到
                     break
                 line = line.strip()
                 if not line:
@@ -216,12 +221,12 @@ def report_records(records_dir: Path, n_files: int, n_lines: int, lines: list[st
                 n += 1
         if n == 0:
             continue
-        known = ("checkmate", "repetition", "max_moves", "no_capture", "resign")
         other = sum(v for k, v in term.items() if k not in known)
         cells = " | ".join(_pct(term.get(k, 0) / n) for k in known)
         p50 = statistics.median(plies) if plies else 0
         p90 = sorted(plies)[int(len(plies) * 0.9)] if plies else 0
-        lines.append(f"| {p.name} | {n} | {cells} | {_pct(other / n)} | {p50:.0f}/{p90} |")
+        pmax = max(plies) if plies else 0
+        lines.append(f"| {p.name} | {n} | {cells} | {_pct(other / n)} | {p50:.0f}/{p90}/{pmax} |")
 
 
 # ────────────────────────────────────────────────────────────────
@@ -448,7 +453,8 @@ def main(argv=None) -> int:
     ap.add_argument("--recent", type=int, default=20, help="明细表显示最近 N 迭代")
     ap.add_argument("--records", action="store_true", help="采样 records 统计终局类型（较慢）")
     ap.add_argument("--records-files", type=int, default=8)
-    ap.add_argument("--records-lines", type=int, default=500)
+    ap.add_argument("--records-lines", type=int, default=100000,
+                    help="每文件统计的对局数安全上限（必须≥每迭代对局数，否则会漏掉写盘靠后的长局）")
     ap.add_argument("--ladder", action="store_true", help="checkpoint 天梯实战（多进程多 GPU 并行，需 torch）")
     ap.add_argument("--ladder-offsets", default="50,100,200", help="与最新 checkpoint 的迭代差，逗号分隔")
     ap.add_argument("--ladder-games", type=int, default=200, help="每对局数（并行后可放心加大以缩 CI）")
