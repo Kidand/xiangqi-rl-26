@@ -5,6 +5,8 @@ model: {blocks: 10, filters: 128, history_steps: 2}
 mcts:
   # 前 30~50 迭代可先用 num_sims=400 加快出数据（早期网络弱、更多模拟收益低），
   # 数据规模起来后再升到 600+ 提升棋力。
+  # 阶段一保持 600（升 1000 成本 +37% 而收益未验证）；计划在迁移大模型前的
+  # 最后 ~20 迭代临时升到 1000，为大模型蒸馏热启动灌一份高质量 π 的 buffer。
   num_sims: 600
   c_puct: 1.8
   dirichlet_alpha: 0.2
@@ -35,8 +37,12 @@ train:
   sample_reuse: 3.0
   buffer_window: 1500000
   min_buffer_to_train: 100000
-  lr: 0.001
-  total_iterations: 300
+  # ── 阶段一续训（iter 300-599，2026-07 天梯诊断后设定）────────────────
+  # 300 迭代已跑完首条余弦（lr 落地板 1e-4）而天梯仍 +58 Elo/50 迭代 → 暖重启：
+  # 峰值减半 + 地平线翻倍，resume 点（iter 300, progress=0.5）有效 LR 精确 = 3.0e-4，
+  # 再沿余弦退回 1e-4。若从头重训请恢复 lr: 0.001。
+  lr: 0.0005
+  total_iterations: 600
   amp: true
 arena: {arena_games: 40, arena_sims: 200, gate_threshold: 0.55}
 log: {log_interval_sec: 30.0, train_log_interval: 100, tensorboard: true}
