@@ -97,6 +97,7 @@ class ArenaConfig:
     gate_threshold: float = 0.55     # 胜率（和=0.5）≥ 此值则晋升 best
     arena_temp_moves: int = 8        # 前几步轻微随机避免完全重复对局
     arena_temperature: float = 0.5
+    arena_workers: int = 0           # 并行对弈进程数；0=自动（cuda 且 ≥16 盘时 GPU 数×4），1=串行
 
 
 @dataclass

@@ -22,7 +22,7 @@ import csv
 import datetime
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # ── Windows 控制台 UTF-8 容错 ─────────────────────────────────────────────
 try:
@@ -265,6 +265,7 @@ class TrainLogger:
         threshold: float,
         promoted: bool,
         iteration: int = 0,
+        elapsed_sec: Optional[float] = None,
     ) -> None:
         """输出 Arena 门控结果（DESIGN §11 格式）。
 
@@ -282,12 +283,13 @@ class TrainLogger:
         total = wins + draws + losses
         score_pct = score * 100.0
 
+        elapsed = f" | {elapsed_sec:.0f}s" if elapsed_sec is not None else ""
         line = (
             f"[iter {iteration} | arena] new vs best: "
             f"{wins}W {draws}D {losses}L (score {score_pct:.1f}%) | "
             f"执红 {red_wins}W{red_draws}D{red_losses}L "
             f"执黑 {black_wins}W{black_draws}D{black_losses}L | "
-            f"GATE: {gate}"
+            f"GATE: {gate}{elapsed}"
         )
         self._emit(line)
 

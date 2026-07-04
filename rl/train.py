@@ -670,8 +670,10 @@ def run_training(cfg: Config, resume: bool = False) -> Dict[str, object]:
         # 3) 存本迭代 checkpoint（含 optimizer），供 arena 与续训使用。
         iter_path = _save_iter(iteration)
 
-        # 4) Arena 门控（新 iter vs best）。
+        # 4) Arena 门控（新 iter vs best）。多进程并行铺满全部 GPU（rl/evaluate.py）。
+        ar_t0 = time.monotonic()
         arena_stats = arena(str(iter_path), str(best_path), cfg, device)
+        arena_sec = time.monotonic() - ar_t0
         promoted = bool(trained and arena_stats["score"] >= float(cfg.arena.gate_threshold))
         if promoted:
             save_checkpoint(
@@ -692,6 +694,7 @@ def run_training(cfg: Config, resume: bool = False) -> Dict[str, object]:
             threshold=float(cfg.arena.gate_threshold),
             promoted=promoted,
             iteration=iteration,
+            elapsed_sec=arena_sec,
         )
 
         # 5) buffer 持久化 + CSV 汇总行。

@@ -6,6 +6,10 @@
 - 每步 ``arena_sims`` 次 MCTS、**无 Dirichlet 噪声**；前 ``arena_temp_moves`` 步以
   ``arena_temperature`` 采样（轻微随机避免完全重复对局），其余 argmax。
 - 返回总体 W/D/L、执红/执黑分拆、综合 score（胜=1，和=0.5，负=0）。
+- **并行执行**（``arena_workers``，0=自动）：对局切块分给 spawn 进程池、每 worker
+  绑定一张 GPU（arena 阶段 selfplay worker/EvalServer 已全部退出，整机空闲——串行
+  单进程会让 8 卡空转数分钟）。统计语义与串行完全一致；1 worker 时走原串行路径
+  （小规模/测试/monkeypatch 场景）。
 
 坐标/编码/搜索一律复用现有模块，本模块不重复定义规则。
 """
@@ -78,6 +82,125 @@ def _play_one(
     return res if res is not None else "1/2-1/2"
 
 
+def _split_games(red_games: int, black_games: int, n_chunks: int) -> list[tuple[int, int]]:
+    """把 (执红盘数, 执黑盘数) 均匀切成 n_chunks 块，各色总和精确不变。"""
+    out = []
+    for c in range(n_chunks):
+        n_red = red_games * (c + 1) // n_chunks - red_games * c // n_chunks
+        n_black = black_games * (c + 1) // n_chunks - black_games * c // n_chunks
+        if n_red + n_black > 0:
+            out.append((n_red, n_black))
+    return out
+
+
+_WORKER_DEVICE = None
+
+
+def _arena_worker_init(dev_queue) -> None:
+    """进程池 initializer：每个 worker 领取一个固定设备（每进程仅一个 CUDA 上下文），
+    并限制单线程 BLAS（瓶颈在 Python MCTS，防多 worker CPU 超订）。"""
+    global _WORKER_DEVICE
+    _WORKER_DEVICE = dev_queue.get()
+    import torch
+
+    torch.set_num_threads(1)
+
+
+def _arena_chunk(task: dict) -> Dict[str, int]:
+    """子进程：加载两个 checkpoint，打一块对局，返回计数（与 arena 聚合语义一致）。"""
+    dev = _WORKER_DEVICE or "cpu"
+    new_model, _ = load_checkpoint(task["new_ckpt"], device=dev)
+    best_model, _ = load_checkpoint(task["best_ckpt"], device=dev)
+    new_model.eval()
+    best_model.eval()
+    new_eval = build_eval_fn(new_model, dev)
+    best_eval = build_eval_fn(best_model, dev)
+
+    cfg = task["cfg"]
+    rng = np.random.default_rng(task["seed"])
+    counts = {k: 0 for k in (
+        "wins", "draws", "losses",
+        "red_wins", "red_draws", "red_losses",
+        "black_wins", "black_draws", "black_losses",
+    )}
+    for new_is_red in [True] * task["n_red"] + [False] * task["n_black"]:
+        result = _play_one(new_eval, best_eval, new_is_red, cfg, rng)
+        color = "red" if new_is_red else "black"
+        if result == "1/2-1/2":
+            counts["draws"] += 1
+            counts[f"{color}_draws"] += 1
+        elif (result == "1-0") == new_is_red:
+            counts["wins"] += 1
+            counts[f"{color}_wins"] += 1
+        else:
+            counts["losses"] += 1
+            counts[f"{color}_losses"] += 1
+    return counts
+
+
+def _resolve_workers(cfg, games: int, dev: str) -> int:
+    """解析 arena 并行度：显式 arena_workers 优先；0=自动
+    （cuda 且盘数足够时 = GPU 数×4，受 CPU 核数与盘数约束；否则串行）。"""
+    w = int(getattr(cfg.arena, "arena_workers", 0))
+    if w == 1:
+        return 1
+    if w <= 0:
+        if not dev.startswith("cuda") or games < 16:
+            return 1
+        import multiprocessing as mp
+        import torch
+
+        gpus = max(1, torch.cuda.device_count())
+        w = min(max(1, mp.cpu_count() - 4), gpus * 4)
+    return max(1, min(w, games))
+
+
+def _arena_parallel(new_ckpt: str, best_ckpt: str, cfg, workers: int, dev: str) -> Dict[str, float]:
+    """多进程 arena：全部对局切块经 spawn 进程池执行，worker 均匀铺满各 GPU。"""
+    import multiprocessing as mp
+    import torch
+
+    if dev.startswith("cuda") and torch.cuda.is_available():
+        devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+    else:
+        devices = ["cpu"]
+
+    games = int(cfg.arena.arena_games)
+    red_games = games - games // 2
+    chunks = _split_games(red_games, games - red_games, min(games, workers * 2))
+    base_seed = int(cfg.seed) + 777_777
+    tasks = [
+        {"new_ckpt": new_ckpt, "best_ckpt": best_ckpt, "cfg": cfg,
+         "n_red": nr, "n_black": nb, "seed": base_seed + i}
+        for i, (nr, nb) in enumerate(chunks)
+    ]
+
+    ctx = mp.get_context("spawn")
+    dev_queue = ctx.Queue()
+    for i in range(workers):
+        dev_queue.put(devices[i % len(devices)])
+    agg = {k: 0 for k in (
+        "wins", "draws", "losses",
+        "red_wins", "red_draws", "red_losses",
+        "black_wins", "black_draws", "black_losses",
+    )}
+    with ctx.Pool(processes=workers, initializer=_arena_worker_init, initargs=(dev_queue,)) as pool:
+        for counts in pool.imap_unordered(_arena_chunk, tasks):
+            for k in agg:
+                agg[k] += counts[k]
+
+    def _score(w: int, d: int, n: int) -> float:
+        return (w + 0.5 * d) / n if n > 0 else 0.0
+
+    return {
+        "games": games,
+        **agg,
+        "score": _score(agg["wins"], agg["draws"], games),
+        "red_score": _score(agg["red_wins"], agg["red_draws"], red_games),
+        "black_score": _score(agg["black_wins"], agg["black_draws"], games - red_games),
+    }
+
+
 def arena(new_ckpt: str, best_ckpt: str, cfg, device: str) -> Dict[str, float]:
     """新模型 vs best 模型对抗，返回门控统计。
 
@@ -90,6 +213,10 @@ def arena(new_ckpt: str, best_ckpt: str, cfg, device: str) -> Dict[str, float]:
     （wins/draws/losses 均以"新模型"为视角。）
     """
     dev = _resolve_device(device, int(cfg.train.num_gpus))
+
+    workers = _resolve_workers(cfg, int(cfg.arena.arena_games), dev)
+    if workers > 1:
+        return _arena_parallel(new_ckpt, best_ckpt, cfg, workers, dev)
 
     new_model, _ = load_checkpoint(new_ckpt, device=dev)
     best_model, _ = load_checkpoint(best_ckpt, device=dev)

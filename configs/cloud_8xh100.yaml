@@ -44,5 +44,7 @@ train:
   lr: 0.0005
   total_iterations: 600
   amp: true
-arena: {arena_games: 40, arena_sims: 200, gate_threshold: 0.55}
+# arena 并行化后（8 卡 ×4 workers）80 盘比旧串行 40 盘还快得多；
+# 加倍盘数把门控噪声 SE 从 ~0.066 压到 ~0.047（假晋升 ~22%→~14%），门槛不动。
+arena: {arena_games: 80, arena_sims: 200, gate_threshold: 0.55, arena_workers: 0}
 log: {log_interval_sec: 30.0, train_log_interval: 100, tensorboard: true}

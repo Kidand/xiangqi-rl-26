@@ -170,3 +170,68 @@ def test_play_one_uses_new_eval_when_new_is_black_and_side_black():
     """new_is_red=False（新模型执黑）时，黑方（次手）那一步应调用新模型 eval_fn。"""
     log = _play_one_side_log(new_is_red=False)
     assert log[-1] == "new"
+
+
+# --------------------------------------------------------------------------- (c)
+# 并行 arena：切块精确性（快）+ spawn 端到端（slow）
+# ---------------------------------------------------------------------------
+def test_split_games_exact_totals():
+    """切块后各色盘数总和必须精确等于输入（任意组合），且无空块。"""
+    for red, black, chunks in [(3, 3, 2), (40, 40, 16), (1, 0, 4), (0, 1, 4),
+                               (41, 40, 7), (5, 4, 9), (100, 100, 32)]:
+        parts = evaluate._split_games(red, black, chunks)
+        assert sum(p[0] for p in parts) == red
+        assert sum(p[1] for p in parts) == black
+        assert all(p[0] + p[1] > 0 for p in parts)
+
+
+def test_resolve_workers_sequential_paths():
+    """cpu / 显式 1 / 小盘数（auto）都应走串行；显式 >1 受盘数封顶。"""
+    cfg = Config()
+    cfg.arena.arena_workers = 0
+    assert evaluate._resolve_workers(cfg, 40, "cpu") == 1       # cpu auto → 串行
+    assert evaluate._resolve_workers(cfg, 8, "cuda:0") == 1     # 盘数 <16 → 串行
+    cfg.arena.arena_workers = 1
+    assert evaluate._resolve_workers(cfg, 80, "cuda:0") == 1    # 显式串行
+    cfg.arena.arena_workers = 16
+    assert evaluate._resolve_workers(cfg, 4, "cpu") == 4        # 显式并行，盘数封顶
+
+
+@pytest.mark.slow
+def test_arena_parallel_spawn_end_to_end(tmp_path):
+    """真实 spawn 进程池打 4 盘（2 workers, CPU, tiny 模型），统计语义与串行一致。
+
+    不 mock 任何东西：验证 _arena_chunk 在子进程中真实加载 checkpoint、
+    _split_games 分配、聚合后各计数总和 = arena_games。
+    """
+    import torch
+
+    from rl.config import ModelConfig
+    from rl.model import create_model, save_checkpoint
+
+    mcfg = ModelConfig(blocks=1, filters=16, history_steps=2)
+    torch.manual_seed(0)
+    new_path = tmp_path / "new.pt"
+    best_path = tmp_path / "best.pt"
+    save_checkpoint(create_model(mcfg), mcfg, new_path, iteration=1)
+    save_checkpoint(create_model(mcfg), mcfg, best_path, iteration=0)
+
+    cfg = Config()
+    cfg.model = mcfg
+    cfg.arena.arena_games = 4
+    cfg.arena.arena_sims = 4
+    cfg.arena.arena_workers = 2       # 显式并行，绕过 auto 的 cpu→串行
+    cfg.arena.arena_temp_moves = 2
+    cfg.mcts.batch_size = 4
+    cfg.selfplay.max_game_plies = 30  # 30 步封顶速战速和
+    cfg.train.num_gpus = 0
+
+    stats = evaluate.arena(str(new_path), str(best_path), cfg, device="cpu")
+
+    assert stats["games"] == 4
+    assert stats["wins"] + stats["draws"] + stats["losses"] == 4
+    red_n = stats["red_wins"] + stats["red_draws"] + stats["red_losses"]
+    black_n = stats["black_wins"] + stats["black_draws"] + stats["black_losses"]
+    assert red_n == 2 and black_n == 2   # 红黑各半被精确保持
+    assert 0.0 <= stats["score"] <= 1.0
+    assert 0.0 <= stats["red_score"] <= 1.0 and 0.0 <= stats["black_score"] <= 1.0

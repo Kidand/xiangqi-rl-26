@@ -203,7 +203,7 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
 3. **训练**：GPU 0（或 DDP）在 buffer 上采样 `train_steps_per_iteration` 步（默认 1000；
    **0 = 自动**：`clamp(ceil(本迭代新样本数 × sample_reuse / batch), 10, 5000)`，防止小 buffer
    期过拟合——步数固定 1000 时早期每样本会被重复学习数十遍），batch 4096。损失 `CE(π) + MSE(z) + L2(1e-4)`，AdamW lr 1e-3 余弦退火（配置可换 SGD+momentum）。
-4. **Arena 门控**：新模型 vs best，`arena_games`（默认 40，红黑各半）盘，200 sims、无噪声、低温。胜率 ≥ `gate_threshold`（默认 0.55，和棋计 0.5）则晋升 best。
+4. **Arena 门控**：新模型 vs best，`arena_games`（默认 40，红黑各半）盘，200 sims、无噪声、低温。胜率 ≥ `gate_threshold`（默认 0.55，和棋计 0.5）则晋升 best。对局经 spawn 进程池并行执行（`arena_workers`，0=自动按 GPU 数×4，每 worker 绑定单 GPU；此阶段 selfplay worker/EvalServer 已退出，整机空闲），统计语义与串行一致；1 worker 或小规模时走串行路径。
 5. 保存 checkpoint、打日志、进入下一迭代。
 
 多进程结构：`train.py` 主进程 spawn EvalServer（每 GPU 一个）与 CPU selfplay workers（`torch.multiprocessing` spawn），worker 通过共享内存+队列向 server 请求评估、通过 `Queue` 上报完成的对局（样本+统计），主进程聚合并监控 server 存活（server 死亡→置 stop_event 终止迭代）。**必须支持 `device=cpu` 无 GPU 降级**（本地冒烟）。中断恢复：`--resume` 从最新 checkpoint + buffer 续训。
@@ -246,6 +246,14 @@ JSON 一局一条；文件为 `.jsonl`（多局）或 `.json`（单局）。GUI 
 
 回放时逐着重演得到每步 FEN。GUI 导出时额外提供含每步 FEN 的 `fens` 数组（可选字段）。GUI 还兼容导入纯文本格式：首行 FEN（或省略=初始局面），其后每行/空格分隔的 UCCI 着法。
 
+**每步胜率（可选字段 `evals`）**：记录可含 `evals` 数组，与 `fens` 对齐（长度 = 着法数 + 1，`evals[i]` 评估局面 `fens[i]`，即走第 i+1 着**之前**的局面）。每项为 `null`（该局面未评估）或对象 `{"value_red": v, "sims": n, "source": s}`：
+
+- `value_red ∈ [-1, 1]` **恒为红方视角**期望值（红方胜率 = `(value_red + 1) / 2`）。与 API `eval.side` 约定的换算关系：MCTS 返回的走子方视角 value 在走子方为黑时取负。记录是静态文档，固定红方视角以杜绝复盘显示的符号歧义。
+- `sims`：产生该评估的 MCTS 模拟次数（`source="result"` 时为 0）。
+- `source ∈ "play"|"replay"|"result"`：`play` = 对局中 AI 计算（AI 落子/提示/with_eval）实时写入；`replay` = 复盘时经 `/api/records/eval` 补算；`result` = 终局局面由对局结果直接映射（`1-0`→+1，`0-1`→−1，`1/2-1/2`→0），认输同样适用。
+
+GUI 终局自动落盘与导出端点均携带该字段（人类走子未经 AI 评估的局面为 `null`）。无 `evals` 字段的旧记录视为全 `null`，复盘时可经 `/api/records/eval` 补算并回写文件。selfplay 记录暂不写该字段。
+
 **GUI 对局自动落盘**：GUI 对局（hva/hvh/ava）到达终局（自然终局或认输）时由服务端自动保存单局 `.json`（v1 格式，含 `fens`，内容与导出端点一致）到仓库根目录 `records/gui/`，无需用户点导出。文件名 `YYYYMMDD-HHMMSS_<mode>_<胜负>.json`，胜负 ∈ `红胜|黑胜|和棋`（对应 result `1-0|0-1|1/2-1/2`），时间戳为终局时刻；同名冲突追加 `-2`、`-3` 序号。每局至多一份记录：悔棋后再次终局以新文件替换旧文件。records 浏览器（`/api/records/list` 递归扫描）自然可见这些文件。
 
 ## 13. GUI API 契约（FastAPI，前后端共同遵守）
@@ -271,9 +279,10 @@ Base: `http://127.0.0.1:8000`。静态页面挂 `/`。所有响应 JSON；错误
 | `POST /api/game/{id}/undo` | – | GameState（hva 撤销一整回合两步） |
 | `GET /api/game/{id}/hint?sims=400` | – | `{"move","chinese","value","side","top_moves":[...]}`（`value` 为 `side` 方即当前走子方视角） |
 | `GET /api/game/{id}/export` | – | xiangqi-record-v1 JSON（含 fens 数组） |
-| `POST /api/replay/load` | `{"record": <v1 JSON>}` 或 `{"text": "FEN\n着法..."}` | `{"fens":[逐步FEN], "moves":[...], "chinese":[...], "result", "start_fen"}` |
+| `POST /api/replay/load` | `{"record": <v1 JSON>}` 或 `{"text": "FEN\n着法..."}` | `{"fens":[逐步FEN], "moves":[...], "chinese":[...], "result", "start_fen", "evals":[规范化后与 fens 等长，缺失项为 null]}` |
 | `GET /api/records/list` | – | `{"files":[{"path","games","mtime"}]}`（扫描 records/ 递归） |
 | `GET /api/records/get?path=...&index=0` | – | 该文件第 index 局的 v1 JSON（路径必须限制在 records/ 内） |
+| `POST /api/records/eval` | `{"path":"gui/x.json", "index":0, "sims":128, "max_positions":8}` | 复盘胜率补算：对该局 `evals` 缺失的局面从前往后最多补算 `max_positions` 个（每个跑 `sims` 次 MCTS 得走子方视角 value 再转红方视角写入 `source="replay"`；从 FEN 即可判定终局的局面及记录 result 已知的末局面按 result 映射 `source="result"`、不计额度），把更新后的 `evals` **原子回写**记录文件，返回 `{"evals":[...], "pending":剩余缺失数, "total":局面数}`。前端循环调用直到 `pending=0`（分批以避免 CPU 长阻塞与代理超时）。无模型 400；path 校验与 records/get 相同；同一文件的补算在服务端按文件锁串行化 |
 | `POST /api/model/load` | `{"path":"ckpts/best.pt"}` | `{"ok":true,"info":{...}}` |
 | `GET /api/model/info` | – | `{"loaded":bool,"path","params","blocks","filters","device"}` |
 | `POST /api/game/{id}/resign` | – | GameState（人认输） |
@@ -289,6 +298,7 @@ Base: `http://127.0.0.1:8000`。静态页面挂 `/`。所有响应 JSON；错误
 - 对战：新对局对话框（模式 hva/ava/hvh、执红/执黑、难度=sims 档位：快 100/标准 400/强 1200、自定义 FEN 开局）。
 - 辅助：评估条（红方胜率视角，按 `eval.side` 换算；hvh 模式若已加载模型，每步局面更新后台请求 `with_eval=true` 刷新）、提示按钮（箭头显示 AI 推荐着 + top-5 列表）、悔棋、认输、翻转棋盘、着法列表（中文纵队记法，点击跳转局面）。
 - 复盘：导入（文件选择 .json/.jsonl/.txt 或粘贴文本）、records/ 浏览器（列出自我博弈记录选局）、播放控制（|< < 播放/暂停 > >|、速度）、导出当前对局（下载 .json）。
+- 复盘胜率：步进到局面 i 时评估条与文本显示 `evals[i]` 的红/黑胜率（`value_red` 恒红方视角，以 `{value, side:"red"}` 复用评估条换算）；从 records/ 打开且 `evals` 有缺失且模型已加载时，自动循环调 `/api/records/eval` 分批补算（默认 sims 128、每批 8 个局面），随算随刷新并显示剩余进度；文件/粘贴导入的棋谱无文件路径，仅显示已有 `evals` 不补算。切换记录、开新对局时以 token 守卫终止旧补算循环。回到对局页签时评估条恢复为当前对局的 eval。
 - AI vs AI 观战：自动逐步推进 + 暂停。
 - 状态栏：模型信息、当前评估值、思考中指示。
 
