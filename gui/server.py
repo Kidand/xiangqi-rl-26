@@ -520,6 +520,18 @@ def _maybe_autosave_record(game: _GameData) -> None:
 app = FastAPI(title="Xiangqi GUI Server", version="1.0.0")
 
 
+# ── 静态资源 no-cache：前端 js/css/html 每次都走 etag 重新校验 ────────────────
+# 否则浏览器会把 board.js/style.css 强缓存，改了 UI 普通刷新（F5）看不到更新，
+# 必须硬刷新。no-cache 不等于不缓存：内容没变返回 304（省带宽），变了才下新的。
+@app.middleware("http")
+async def _no_cache_static(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.endswith((".js", ".css", ".html")):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
+
 # ── 统一错误格式：{"error": "..."}（DESIGN §13） ─────────────────────────────
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):

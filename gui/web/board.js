@@ -306,27 +306,57 @@ class XiangqiBoard {
       g.appendChild(svgEl("circle", { cx: x, cy: y, r, fill: color, opacity: String(opacity) }));
     };
 
-    if (this.lastMove) {
-      add(this.lastMove.from, "#f1c40f", 0.5);
-      add(this.lastMove.to,   "#f1c40f", 0.5);
-
-      // 落点环：内环贴棋子外缘描边 + 外环淡光晕
-      const { x, y } = this._sq2px(this.lastMove.to);
+    // 落点/选中共用：棋子之上的发光脉动环。棋子会盖住画在下层的高亮圆盘，
+    // 故画在 overlay 层并加高斯辉光 + 浅色高光衬边 + 持续脉动；主色区分语义
+    // ——落点橙金、选中蓝。
+    const pulseRing = (sq, cls, main, edge) => {
+      this._ensureGlowFilter();
+      const { x, y } = this._sq2px(sq);
       const R = C * 0.42;  // 与 _renderPieces 的棋子半径一致
-      const ring = svgEl("g", { class: "last-move-ring" });
+      const ring = svgEl("g", { class: cls, filter: "url(#board-glow)" });
       ring.appendChild(svgEl("circle", {
-        cx: x, cy: y, r: R + 3,
-        fill: "none", stroke: "#f39c12", "stroke-width": "3", opacity: "0.95"
+        cx: x, cy: y, r: R + 4.5,
+        fill: "none", stroke: main, "stroke-width": "5", opacity: "1"
       }));
+      // 浅色高光内衬：给亮环一条清晰边界，浅底深底都不糊
       ring.appendChild(svgEl("circle", {
-        cx: x, cy: y, r: R + 6.5,
-        fill: "none", stroke: "#f39c12", "stroke-width": "2.5", opacity: "0.3"
+        cx: x, cy: y, r: R + 4.5,
+        fill: "none", stroke: edge, "stroke-width": "1.6", opacity: "0.7"
       }));
       ov.appendChild(ring);
+    };
+
+    if (this.lastMove) {
+      // 起点：黄色圆盘（棋子已离开，整盘可见）；落点：橙金脉动环（不叠黄盘）
+      add(this.lastMove.from, "#f1c40f", 0.5);
+      pulseRing(this.lastMove.to, "last-move-ring", "#ff7a00", "#fff6d8");
     }
     if (this.selectedSq !== null) {
-      add(this.selectedSq, "#3498db", 0.6);
+      // 选中棋子：蓝色脉动环（与落点同款脉动，语义色区分）
+      pulseRing(this.selectedSq, "select-ring", "#2f8fe0", "#eaf6ff");
     }
+  }
+
+  /** 惰性创建通用辉光滤镜（feGaussianBlur 两次叠加得到更浓光晕），
+   *  落点环与选中环共用（颜色由各自 stroke 决定）。 */
+  _ensureGlowFilter() {
+    let defs = this.svg.querySelector("defs");
+    if (!defs) {
+      defs = svgEl("defs");
+      this.svg.insertBefore(defs, this.svg.firstChild);
+    }
+    if (defs.querySelector("#board-glow")) return;
+    const filter = svgEl("filter", {
+      id: "board-glow",
+      x: "-60%", y: "-60%", width: "220%", height: "220%"
+    });
+    filter.appendChild(svgEl("feGaussianBlur", { stdDeviation: "2.6", result: "blur" }));
+    const merge = svgEl("feMerge");
+    merge.appendChild(svgEl("feMergeNode", { in: "blur" }));
+    merge.appendChild(svgEl("feMergeNode", { in: "blur" }));
+    merge.appendChild(svgEl("feMergeNode", { in: "SourceGraphic" }));
+    filter.appendChild(merge);
+    defs.appendChild(filter);
   }
 
   /** 渲染合法落点小圆点 */
