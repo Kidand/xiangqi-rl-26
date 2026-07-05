@@ -139,6 +139,10 @@ const App = {
   // hva 两段式：AI 回着请求防重入
   aiReplyInFlight: false,
 
+  // 评估条归属 = 棋盘当前显示的内容："game"（对局局面）| "replay"（复盘局面）。
+  // 谁最后渲染棋盘谁拥有评估条；页签激活与否与归属无关（桌面布局棋盘常驻可见）。
+  boardView: "game",
+
   // 提示
   hintVisible: false,
 
@@ -172,6 +176,8 @@ function applyGameState(gs, withSound = true, opts = {}) {
   App.gameState = gs;
   App.viewingHistory = false;
   App.historyPos = -1;
+  // 棋盘即将渲染对局局面 → 评估条归对局侧（见 boardView 约定）
+  App.boardView = "game";
 
   boardObj.setFen(gs.fen);
   boardObj.setLegalMoves(gs.legal_moves || []);
@@ -199,13 +205,12 @@ function applyGameState(gs, withSound = true, opts = {}) {
   }
   App.lastPieceCount = newPieceCount;
 
-  // 评估条归属守卫：只在「对局」页签激活时写（复盘页由 updateReplayEvalDisplay 接管，
-  // 防止 AVA 后台推进/滞后响应覆盖复盘胜率显示）。
+  // 评估条跟随棋盘内容（本函数已把 boardView 置为 "game"，无条件接管）。
+  // 早期版本按「页签是否激活」判断归属是个 bug：桌面布局棋盘/评估条始终可见，
+  // 右侧面板停在复盘页签时继续下棋会导致胜率条冻结。
   // opts.keepEvalBar：两段式走子中人类落子响应无 eval，保持上次评估不回弹 50%。
-  if ($id("tab-game").classList.contains("active")) {
-    if (gs.eval) updateEvalBar(gs.eval);
-    else if (!opts.keepEvalBar) updateEvalBar(null);
-  }
+  if (gs.eval) updateEvalBar(gs.eval);
+  else if (!opts.keepEvalBar) updateEvalBar(null);
 
   // 着法列表
   renderMoveList(gs.move_history || []);
@@ -340,7 +345,7 @@ async function maybeRefreshEval() {
     // 防止连走两步时先发请求的响应后到、用滞后一步的评估覆盖新值。
     const cur = App.gameState;
     if (App.gameId === gid && !App.viewingHistory &&
-        $id("tab-game").classList.contains("active") &&
+        App.boardView === "game" &&
         cur && !cur.game_over && data.fen === cur.fen) {
       updateEvalBar(data.eval || null);
     }
@@ -899,6 +904,9 @@ function gotoReplayPos(pos) {
   const fen = App.replayFens[App.replayPos];
   if (!fen) return;
 
+  // 棋盘即将渲染复盘局面 → 评估条归复盘侧
+  App.boardView = "replay";
+
   boardObj.setFen(fen);
   boardObj.setLegalMoves([]);
   boardObj.setInteractive(false);
@@ -933,8 +941,8 @@ function updateReplayEvalDisplay() {
   const el = $id("replay-eval-text");
   if (!App.replayFens.length) { el.textContent = "—"; return; }
 
-  // 评估条只在复盘页签激活时接管（避免覆盖对局页的实时评估）
-  const replayActive = $id("tab-replay").classList.contains("active");
+  // 评估条只在棋盘正在显示复盘局面时接管（避免覆盖对局的实时评估）
+  const replayActive = App.boardView === "replay";
   const ev = App.replayEvals[App.replayPos] || null;
   let txt;
   if (ev && typeof ev.value_red === "number") {
@@ -1172,14 +1180,17 @@ function setupTabs() {
 
       if (pane === "tab-replay") {
         loadRecordsList();
-        // 复盘页接管评估条：显示当前复盘局面的胜率
-        if (App.replayFens.length) updateReplayEvalDisplay();
+        // 已加载棋谱：重新渲染当前复盘局面（棋盘+评估条一起交给复盘侧）
+        if (App.replayFens.length) gotoReplayPos(App.replayPos);
       } else if (pane === "tab-settings") {
         refreshModelInfo();
       } else if (pane === "tab-game") {
-        // 回到对局页：评估条恢复为当前对局的实时评估
-        updateEvalBar((App.gameState && App.gameState.eval) || null);
-        maybeRefreshEval();
+        // 回到对局页：若棋盘正显示复盘局面，恢复为对局局面（含交互与评估条）
+        if (App.gameState && App.boardView === "replay") {
+          applyGameState(App.gameState, false);
+        } else {
+          maybeRefreshEval();
+        }
       }
     });
   });

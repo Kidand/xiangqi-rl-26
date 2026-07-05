@@ -1177,3 +1177,46 @@ def test_normalize_evals_rejects_nan_and_out_of_range():
     assert evals[0] is None
     assert evals[1] is None
     assert evals[2]["value_red"] == -0.5
+
+
+# ────────────────────────────────────────────────────────────────
+# 测试：悔棋响应恢复历史评估（评估条不回弹 50%）
+# ────────────────────────────────────────────────────────────────
+def test_undo_restores_recorded_eval(client_with_model: SimpleClient):
+    """撤回到曾被 AI 评估的局面时，undo 响应带 eval（side=red，值=槽位 value_red）。"""
+    resp = client_with_model.post(
+        "/api/game/new", body={"mode": "hva", "human_side": "red", "sims": 4}
+    )
+    gid = resp.json()["game_id"]
+
+    # 人走 + AI 回着（默认 ai_reply）：局面1（AI 落子前）已有 play 评估
+    r1 = client_with_model.post(f"/api/game/{gid}/move", body={"move": "h2e2"})
+    gs1 = r1.json()
+    assert len(gs1["move_history"]) == 2
+    # 对当前局面（局面2，人类轮）请求 with_eval，把槽位 2 填上
+    client_with_model.get(f"/api/game/{gid}", params={"with_eval": "true", "sims": 4})
+    # 再走一回合（人 + AI）到局面4——AI 回着随机，第二步从合法着法中取
+    r2 = client_with_model.post(
+        f"/api/game/{gid}/move", body={"move": gs1["legal_moves"][0]}
+    )
+    assert r2.status_code == 200, r2.json()
+
+    # 悔棋撤一整回合 → 回到局面2，该局面评估已记录，应随响应带回
+    r = client_with_model.post(f"/api/game/{gid}/undo")
+    assert r.status_code == 200
+    gs = r.json()
+    assert len(gs["move_history"]) == 2
+    ev = gs["eval"]
+    assert ev is not None, "撤回到已评估局面应带回历史评估"
+    assert ev["side"] == "red"
+    assert -1.0 <= ev["value"] <= 1.0
+
+
+def test_undo_eval_none_when_slot_empty(client: SimpleClient):
+    """hvh 无模型：撤回到未评估局面，eval 为 null（评估条回中性 50%）。"""
+    gs = _new_hvh(client)
+    gid = gs["game_id"]
+    client.post(f"/api/game/{gid}/move", body={"move": "h2e2"})
+    r = client.post(f"/api/game/{gid}/undo")
+    assert r.status_code == 200
+    assert r.json()["eval"] is None

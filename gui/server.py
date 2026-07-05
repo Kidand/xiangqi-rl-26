@@ -289,6 +289,19 @@ def _apply_move(game: _GameData, mv: tuple) -> None:
     game.evals.append(None)
 
 
+def _eval_info_from_slot(game: _GameData) -> Optional[dict]:
+    """当前局面若有已记录评估（evals 槽位），转为 GameState.eval。
+
+    槽位存红方视角 value_red（DESIGN §12），故 side 恒为 "red"。
+    悔棋响应用它让前端评估条恢复历史值而非回弹 50%。
+    """
+    idx = len(game.move_history)
+    slot = game.evals[idx] if idx < len(game.evals) else None
+    if slot is None:
+        return None
+    return {"value": float(slot["value_red"]), "side": "red", "top_moves": []}
+
+
 def _record_position_eval(
     game: _GameData, value_mover: float, side_mover: int, sims: int
 ) -> None:
@@ -800,7 +813,7 @@ async def undo(game_id: str):
         if game.resigned:
             game.resigned = False
             game.resign_result = None
-            return _build_game_state(game)
+            return _build_game_state(game, eval_info=_eval_info_from_slot(game))
 
         if not game.move_history:
             raise HTTPException(400, detail={"error": "没有可撤销的着法"})
@@ -823,7 +836,8 @@ async def undo(game_id: str):
         # evals 与局面序列保持等长（被撤销局面的评估一并丢弃）
         del game.evals[len(game.move_history) + 1:]
 
-        return _build_game_state(game)
+        # 撤后局面若曾被 AI 评估过，随响应带回，评估条恢复历史值
+        return _build_game_state(game, eval_info=_eval_info_from_slot(game))
 
 
 # ===========================================================================
