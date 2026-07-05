@@ -166,6 +166,22 @@ class SearchTree:
             counts[move_to_action(move)] = root.child_N[i]
         return counts
 
+    def q_values(self) -> np.ndarray:
+        """(8100,) 根各子边 Q（根走子方视角），棋盘真实坐标；未访问边为 NaN。
+
+        child_W 挂在根上、按根走子方视角累计（backup 逐层取负后写入），
+        故 W/N 即"根走子方走该着法的期望值"，与 root_value() 同一尺度。
+        """
+        q = np.full(ACTION_SIZE, np.nan, dtype=np.float32)
+        root = self._root
+        if not root.expanded:
+            return q
+        for i, move in enumerate(root.child_moves):
+            n = float(root.child_N[i])
+            if n > 0:
+                q[move_to_action(move)] = float(root.child_W[i]) / n
+        return q
+
     # ---------------------------------------------------------------- 选路
     def _select_child(self, node: _Node) -> int:
         """PUCT 选边：返回子节点索引。"""
@@ -451,17 +467,24 @@ def search(
     num_sims: int,
     add_noise: bool = False,
     history_steps: int = 2,
-) -> tuple[np.ndarray, float]:
+    return_q: bool = False,
+) -> tuple[np.ndarray, float] | tuple[np.ndarray, float, np.ndarray]:
     """对单一局面跑 num_sims 次模拟。
 
     net_eval_fn: states[B,C,10,9] float32 -> (policy_probs[B,8100], values[B])。
-    返回 (visit_counts[8100] 棋盘真实坐标, root_value 当前走子方视角)。
+    返回 (visit_counts[8100] 棋盘真实坐标, root_value 当前走子方视角)；
+    return_q=True 时追加 q_values[8100]（根走子方视角，未访问边 NaN）。
     """
     tree = SearchTree(board, cfg, add_noise, history_steps=history_steps)
 
+    def _result():
+        if return_q:
+            return tree.visit_counts(), tree.root_value(), tree.q_values()
+        return tree.visit_counts(), tree.root_value()
+
     # 根即终局：无可搜索内容，直接返回真实结果值（root_value 惰性判定，和棋返回 draw_value）。
     if board.result() is not None:
-        return tree.visit_counts(), tree.root_value()
+        return _result()
 
     batch_cap = max(1, int(cfg.batch_size))
     while tree.total_visits < num_sims:
@@ -475,4 +498,4 @@ def search(
         if tree.total_visits == before and not tokens:
             break
 
-    return tree.visit_counts(), tree.root_value()
+    return _result()

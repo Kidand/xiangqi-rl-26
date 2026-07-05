@@ -424,3 +424,35 @@ def test_terminal_draw_root_returns_draw_value():
     counts, value = search(board, _zero_eval, cfg, num_sims=30)
     assert int(counts.sum()) == 0
     assert value == pytest.approx(draw_value, abs=1e-9)
+
+
+# --------------------------------------------------------------------------- q_values
+def test_q_values_alignment_scale_and_perspective():
+    """q_values 三守护（DESIGN §8）：坐标对齐、与 root_value 同尺度、根走子方视角。
+
+    视角断言用一步杀：杀着经终局捷径回传真实值，其 Q 必为 +1（根走子方视角）；
+    若符号约定被改坏（误存对手视角/漏取负），该值会变 -1，测试立即失败。
+    """
+    board = Board.from_fen(MATE_FEN)
+    mate_action = move_to_action(uci_to_move(MATE_MOVE))
+    cfg = MCTSConfig(num_sims=100, batch_size=8)
+    counts, root_val, q = search(
+        board, _uniform_eval(seed=7), cfg, num_sims=100, return_q=True
+    )
+
+    nz = counts > 0
+    # 对齐：有访问的边恰为非 NaN 的边（同一棋盘真实坐标）
+    assert np.array_equal(nz, ~np.isnan(q))
+    # 尺度：root_value 是子边 Q 的访问加权平均（恒等式，深度无关）
+    wavg = float((counts[nz] * q[nz]).sum() / counts[nz].sum())
+    assert root_val == pytest.approx(wavg, abs=1e-5)
+    # 视角：红先一步杀的杀着 Q == +1（根走子方视角）
+    assert q[mate_action] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_search_return_q_backward_compatible():
+    """默认（不传 return_q）仍返回二元组，既有调用方不受影响。"""
+    board = Board.from_fen(MATE_FEN)
+    cfg = MCTSConfig(num_sims=20, batch_size=8)
+    result = search(board, _zero_eval, cfg, num_sims=20)
+    assert len(result) == 2

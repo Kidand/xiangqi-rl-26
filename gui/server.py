@@ -61,6 +61,7 @@ from xiangqi.records import (
 from rl.config import MCTSConfig
 from rl.mcts import search as mcts_search
 from rl.model import XiangqiNet, load_checkpoint
+from rl.selfplay import sample_action_from_counts
 
 # ===========================================================================
 # 路径常量
@@ -203,8 +204,9 @@ def _build_game_state(
 def _run_mcts_sync(
     board: Board,
     sims: int,
-) -> tuple[np.ndarray, float]:
-    """同步跑 MCTS，返回 (visit_counts[8100], root_value 当前走子方视角)。"""
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """同步跑 MCTS，返回 (visit_counts[8100], root_value 当前走子方视角,
+    q_values[8100] 根走子方视角、未访问边 NaN)。"""
     ms = _model_state
     eval_fn = _make_eval_fn(ms.model, ms.device, ms.history_steps)
     cfg = MCTSConfig(
@@ -212,11 +214,11 @@ def _run_mcts_sync(
         batch_size=min(64, sims),
     )
     board_copy = board.copy()
-    visits, root_val = mcts_search(
+    visits, root_val, q_vals = mcts_search(
         board_copy, eval_fn, cfg, sims, add_noise=False,
-        history_steps=ms.history_steps,
+        history_steps=ms.history_steps, return_q=True,
     )
-    return visits, root_val
+    return visits, root_val, q_vals
 
 
 def _visits_to_top_moves(board: Board, visits: np.ndarray, top_n: int = 5) -> list:
@@ -271,6 +273,63 @@ def _pick_best_move(board: Board, visits: np.ndarray) -> Optional[tuple]:
             best_v = v
             best_move = mv
     return best_move
+
+
+# AI 落子采样参数（DESIGN §13）：GUI 全链路无 Dirichlet 噪声、前向确定，
+# argmax 会使 ava 每局复读、hva 对相同人类走法回应固定。多样性由价值差
+# 硬约束兜底：只在"Q 与最佳着法相差 ≤ dq"的着法中采样（Q 为根走子方视角，
+# 与 root_value 同尺度 [-1,1]；纯 visits 截断会放进 Q 明显更差的离谱着法）。
+_AI_OPENING_PLIES = 8     # 前 8 个半回合视为开局
+_AI_OPENING_TAU = 1.0     # 开局温度
+_AI_OPENING_KEEP = 0.15   # 开局 visits ≥ 最佳 15%（低访问边 Q 估计噪声大）
+_AI_OPENING_DQ = 0.06     # 开局价值差上限（≈3% 胜率）
+_AI_LATER_TAU = 0.35      # 开局后温度（近同分才换手）
+_AI_LATER_KEEP = 0.50     # 开局后 visits ≥ 最佳 50%
+_AI_LATER_DQ = 0.03       # 开局后价值差上限
+_ai_rng = np.random.default_rng()
+
+
+def _pick_ai_move(
+    board: Board, visits: np.ndarray, q_vals: np.ndarray
+) -> Optional[tuple]:
+    """AI 落子选择：价值感知的截断温度采样；/hint 不走此路径（恒 argmax）。
+
+    候选须同时满足 visits ≥ 最佳着法的 keep 倍、且 Q ≥ 参照 Q - dq
+    （参照 = visits 最高着法的 Q）。ply 从局面 fullmove/side_to_move 推出：
+    带着数字段的中局 FEN 不会被误判为开局高温；缺 fullmove 的短 FEN 默认 1
+    会按开局对待——接受此边界（价值过滤已保证不会走明显劣着）。
+    采样退化（截断后全零/数值异常）回退 argmax。
+    """
+    legal = board.legal_moves()
+    if not legal:
+        return None
+    ply = (board.fullmove - 1) * 2 + (1 if board.side_to_move == BLACK else 0)
+    opening = ply < _AI_OPENING_PLIES
+    tau = _AI_OPENING_TAU if opening else _AI_LATER_TAU
+    keep = _AI_OPENING_KEEP if opening else _AI_LATER_KEEP
+    dq = _AI_OPENING_DQ if opening else _AI_LATER_DQ
+
+    # 只在合法着法上取 visits（防御非法位残留）
+    masked = np.zeros_like(visits, dtype=np.float64)
+    for mv in legal:
+        a = mv[0] * 90 + mv[1]
+        masked[a] = visits[a]
+    vmax = float(masked.max())
+    if vmax <= 0:
+        return _pick_best_move(board, visits)
+
+    # 价值参照：visits 最高着法的 Q（低访问边 Q 噪声大，不作参照）
+    a_ref = int(np.argmax(masked))
+    q_ref = float(q_vals[a_ref])
+    if np.isfinite(q_ref):
+        # 双重截断：访问数下限 + 价值差上限（NaN 比较恒 False → 一并剔除）
+        with np.errstate(invalid="ignore"):
+            bad = ~(q_vals >= q_ref - dq)
+        masked[bad] = 0.0
+    masked[masked < vmax * keep] = 0.0
+
+    mv = sample_action_from_counts(masked, tau, _ai_rng)
+    return mv if mv is not None else _pick_best_move(board, visits)
 
 
 # ===========================================================================
@@ -628,11 +687,11 @@ async def new_game(req: NewGameRequest):
             ai_side = RED if ai_is_red else BLACK
             if game.board.side_to_move == ai_side:
                 t0 = time.monotonic()
-                visits, root_val = await asyncio.to_thread(
+                visits, root_val, q_vals = await asyncio.to_thread(
                     _run_mcts_sync, game.board, game.sims
                 )
                 elapsed_ms = (time.monotonic() - t0) * 1000.0
-                ai_mv = _pick_best_move(game.board, visits)
+                ai_mv = _pick_ai_move(game.board, visits, q_vals)
                 if ai_mv:
                     ai_move_str = move_to_uci(ai_mv)
                     top_moves = _visits_to_top_moves(game.board, visits)
@@ -672,7 +731,7 @@ async def get_game(
         # with_eval=true 且有模型且未终局时，跑一次 MCTS 得到当前走子方视角的评估。
         if with_eval and _is_model_loaded() and not _game_is_over(game):
             side_mover = game.board.side_to_move
-            visits, root_val = await asyncio.to_thread(
+            visits, root_val, _q = await asyncio.to_thread(
                 _run_mcts_sync, game.board, sims
             )
             top_moves = _visits_to_top_moves(game.board, visits)
@@ -730,11 +789,11 @@ async def make_move(game_id: str, req: MoveRequest):
             if game.board.side_to_move != human_side_int:
                 ai_side = game.board.side_to_move
                 t0 = time.monotonic()
-                visits, root_val = await asyncio.to_thread(
+                visits, root_val, q_vals = await asyncio.to_thread(
                     _run_mcts_sync, game.board, game.sims
                 )
                 elapsed_ms = (time.monotonic() - t0) * 1000.0
-                ai_mv = _pick_best_move(game.board, visits)
+                ai_mv = _pick_ai_move(game.board, visits, q_vals)
                 if ai_mv:
                     ai_move_str = move_to_uci(ai_mv)
                     top_moves = _visits_to_top_moves(game.board, visits)
@@ -783,11 +842,11 @@ async def ai_move(game_id: str, req: AiMoveRequest):
 
         ai_side = game.board.side_to_move
         t0 = time.monotonic()
-        visits, root_val = await asyncio.to_thread(
+        visits, root_val, q_vals = await asyncio.to_thread(
             _run_mcts_sync, game.board, sims
         )
         elapsed_ms = (time.monotonic() - t0) * 1000.0
-        ai_mv = _pick_best_move(game.board, visits)
+        ai_mv = _pick_ai_move(game.board, visits, q_vals)
         top_moves = _visits_to_top_moves(game.board, visits)
         eval_info = {
             "value": float(root_val),
@@ -872,7 +931,7 @@ async def hint(game_id: str, sims: int = Query(default=400)):
 
         side_mover = game.board.side_to_move
         t0 = time.monotonic()
-        visits, root_val = await asyncio.to_thread(
+        visits, root_val, _q = await asyncio.to_thread(
             _run_mcts_sync, game.board, sims
         )
         elapsed_ms = (time.monotonic() - t0) * 1000.0
@@ -1102,7 +1161,7 @@ async def records_eval(req: RecordsEvalRequest):
             if computed >= max_positions:
                 continue  # 本批额度用完；后续槽位留待下一批
             side_mover = board.side_to_move
-            _visits, root_val = await asyncio.to_thread(_run_mcts_sync, board, sims)
+            _visits, root_val, _q = await asyncio.to_thread(_run_mcts_sync, board, sims)
             value_red = float(root_val) if side_mover == RED else -float(root_val)
             evals[i] = {"value_red": value_red, "sims": sims, "source": "replay"}
             computed += 1

@@ -177,10 +177,13 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
       @property
       def total_visits(self) -> int       # 根已完成模拟数
       def visit_counts(self) -> "np.ndarray"  # (8100,) 根访问计数，**棋盘真实坐标**（非翻转视角）
+      def q_values(self) -> "np.ndarray"  # (8100,) 根各子边 Q（根走子方视角，与 root_value 同尺度），
+                                          # 棋盘真实坐标；未访问边为 NaN。GUI 价值感知采样用
       def root_value(self) -> float       # 根 Q，当前走子方视角
       def advance(self, move) -> None     # 走子并保留对应子树（树复用）
-  def search(board, net_eval_fn, cfg, num_sims, add_noise=False) -> tuple[np.ndarray, float]
+  def search(board, net_eval_fn, cfg, num_sims, add_noise=False, return_q=False) -> tuple
       # 单盘便捷封装（GUI/arena 用）；net_eval_fn: states[B,C,10,9] -> (policy_probs[B,8100], values[B])
+      # 返回 (visits, root_value)；return_q=True 追加 q_values 三元组返回
   ```
   selfplay 驱动方式：对每盘未满 sims 的对局调 select_leaves，跨盘 stack 成大 batch 一次前向，再逐盘 apply_results。
   训练样本 π 入库时用 move_to_policy_index 转为当前方视角；visit_counts 本身保持棋盘真实坐标。
@@ -291,7 +294,7 @@ Base: `http://127.0.0.1:8000`。静态页面挂 `/`。所有响应 JSON；错误
 | `GET /api/model/info` | – | `{"loaded":bool,"path","params","blocks","filters","device"}` |
 | `POST /api/game/{id}/resign` | – | GameState（人认输） |
 
-无模型加载时 hva/ava 返回 400（提示先加载模型）；hvh 与回放不需要模型。AI 走子在线程池执行避免阻塞事件循环。终局自动落盘（§12）是服务端行为、非端点，在该局锁内完成。启动参数：`python -m gui.server --model ckpts/best.pt --port 8000 --sims 400 --device cpu`；手机/局域网对战加 `--host 0.0.0.0` 后用手机浏览器访问 `http://<电脑IP>:8000`。
+无模型加载时 hva/ava 返回 400（提示先加载模型）；hvh 与回放不需要模型。AI 走子在线程池执行避免阻塞事件循环。**AI 落子选择为价值感知的截断温度采样而非 argmax**（GUI 全链路无 Dirichlet 噪声、前向确定，argmax 会使 ava 每局复读、hva 对相同人类走法回应固定）：候选须同时满足 visits 下限与 Q 值差上限——Q 取 `SearchTree.q_values()`（根走子方视角，参照 = visits 最高着法的 Q）。实测（400 sims，best/best0705 各 24 个开局局面）纯 visits 阈值会放入 ΔQ 达 0.4+ 的劣着（访问占比 0.2 的着法 ΔQ 可达 0.32），故 ΔQ 过滤是硬约束。ply 从局面 fullmove/side_to_move 推出：ply < 8 时 τ=1.0、visits ≥ 最佳 15%、ΔQ ≤ 0.06（开局多样化且不走亏棋）；之后 τ=0.35、visits ≥ 50%、ΔQ ≤ 0.03（近同分才换手）；采样退化（全零/异常/q 参照 NaN）回退 argmax 或仅 visits 截断。适用于 `/ai_move`、`/move` 内嵌 AI 回着与 `/new` 的 AI 首着；`/hint` 恒为 argmax（推荐须稳定可复现）。终局自动落盘（§12）是服务端行为、非端点，在该局锁内完成。启动参数：`python -m gui.server --model ckpts/best.pt --port 8000 --sims 400 --device cpu`；手机/局域网对战加 `--host 0.0.0.0` 后用手机浏览器访问 `http://<电脑IP>:8000`。
 
 ## 14. GUI 前端功能清单（gui/web/，原生 JS，无构建）
 
