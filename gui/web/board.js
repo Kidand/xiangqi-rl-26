@@ -291,10 +291,13 @@ class XiangqiBoard {
 
   // ── 动态内容渲染 ────────────────────────────────────────────────────────────
 
-  /** 刷新高亮（选中 + 最后一着） */
+  /** 刷新高亮（选中 + 最后一着）。落点环画在 overlay 层（棋子之上），
+   *  否则会被落点上的棋子盖住只露一圈细边（曾因此看不清落点）。 */
   _renderHighlights() {
     const g = this._layers.highlights;
+    const ov = this._layers.overlay;
     g.innerHTML = "";
+    ov.innerHTML = "";
     const { cellSize: C } = this;
     const r = C * 0.48;
 
@@ -306,6 +309,20 @@ class XiangqiBoard {
     if (this.lastMove) {
       add(this.lastMove.from, "#f1c40f", 0.5);
       add(this.lastMove.to,   "#f1c40f", 0.5);
+
+      // 落点环：内环贴棋子外缘描边 + 外环淡光晕
+      const { x, y } = this._sq2px(this.lastMove.to);
+      const R = C * 0.42;  // 与 _renderPieces 的棋子半径一致
+      const ring = svgEl("g", { class: "last-move-ring" });
+      ring.appendChild(svgEl("circle", {
+        cx: x, cy: y, r: R + 3,
+        fill: "none", stroke: "#f39c12", "stroke-width": "3", opacity: "0.95"
+      }));
+      ring.appendChild(svgEl("circle", {
+        cx: x, cy: y, r: R + 6.5,
+        fill: "none", stroke: "#f39c12", "stroke-width": "2.5", opacity: "0.3"
+      }));
+      ov.appendChild(ring);
     }
     if (this.selectedSq !== null) {
       add(this.selectedSq, "#3498db", 0.6);

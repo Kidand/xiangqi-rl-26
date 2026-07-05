@@ -748,6 +748,18 @@ select, input[type="range"], #board-svg,
   animation: check-flash 0.7s ease-in-out infinite;
 }
 
+/* 最后一着落点环：落定时从外向内收拢 */
+@keyframes last-move-pop {
+  from { transform: scale(1.35); opacity: 0; }
+  to   { transform: scale(1); opacity: 1; }
+}
+.last-move-ring {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: last-move-pop 0.25s ease-out;
+  pointer-events: none;
+}
+
 /* 复盘游标位置显示 */
 #replay-jump-select {
   width: 100%;
