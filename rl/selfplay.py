@@ -46,6 +46,7 @@ from rl.heuristics import (
     blend_value,
     lambda_schedule,
     material_score,
+    sims_schedule,
 )
 from rl.inference_server import EvalClient, WorkerStop
 from rl.mcts import SearchTree
@@ -57,6 +58,7 @@ __all__ = [
     "num_eval_servers",
     "worker_game_quota",
     "sample_action_from_counts",
+    "sharpen_counts",
 ]
 
 # 记录用格式常量（与 xiangqi.records.RECORD_FORMAT 保持一致，避免在 worker 内引入
@@ -208,6 +210,37 @@ def sample_action_from_counts(
 
 
 # ---------------------------------------------------------------------------
+# π 训练目标锐化（DESIGN §8）：只作用于训练样本 π 的构造，不影响落子采样
+# （sample_action_from_counts）与 visit_counts 语义。
+# ---------------------------------------------------------------------------
+def sharpen_counts(counts: np.ndarray, temp: float, prune_frac: float) -> np.ndarray:
+    """把访问计数锐化并归一，返回与 counts 同形的概率向量（float64）。
+
+    先剪噪声边、再幂锐化、最后归一（DESIGN §8）：
+      - prune_frac>0：剔除 visits < prune_frac*max 的边（削 Dirichlet 噪声边）；
+      - temp!=1.0：p ∝ c^(1/T)（float64 中间量防溢出/下溢，T<1 锐化）。
+    默认 (temp=1.0, prune_frac=0.0) 逐 bit 等价原始「counts[nz] 归一」：仅在 nonzero
+    子集上按升序求和/除法，与旧路径同序同值。全零输入返回全零向量。
+    """
+    out = np.zeros(counts.shape, dtype=np.float64)
+    nz = np.nonzero(counts)[0]
+    if nz.size == 0:
+        return out
+    c = counts[nz].astype(np.float64)
+    if prune_frac > 0.0:
+        c[c < prune_frac * c.max()] = 0.0
+    if temp != 1.0:
+        c = np.power(c, 1.0 / temp)  # 0**正=0，被剪的边保持 0
+    s = c.sum()
+    if not np.isfinite(s) or s <= 0.0:
+        # 极端兜底（全被剪/数值退化，不应发生）：退回未锐化归一。
+        c = counts[nz].astype(np.float64)
+        s = c.sum()
+    out[nz] = c / s
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 单盘对局的运行时状态（一个 worker 内并发多个 slot）。
 # ---------------------------------------------------------------------------
 class _GameSlot:
@@ -232,6 +265,7 @@ class _GameSlot:
         "sample_pol_prob",
         "sample_sides",
         "sample_mat_red",
+        "sample_root_values",
         "result",
         "termination",
         "emitted",
@@ -265,6 +299,8 @@ class _GameSlot:
         self.sample_pol_prob: List[np.ndarray] = []
         self.sample_sides: List[int] = []
         self.sample_mat_red: List[float] = []
+        # 每步搜索根价值（当前走子方视角，与 z 同视角）；用于 z 混根价值（β>0）。
+        self.sample_root_values: List[float] = []
         self.result: Optional[str] = None
         self.termination: Optional[str] = None
         self.emitted = False
@@ -294,8 +330,14 @@ def _record_sample(
     pol_idx: np.ndarray,
     pol_prob: np.ndarray,
     history_steps: int,
+    root_value: float,
 ) -> None:
-    """记录一步训练样本（state uint8 + 稀疏 π + 走子方 + 红方视角材料分）。"""
+    """记录一步训练样本（state uint8 + 稀疏 π + 走子方 + 红方视角材料分 + 根价值）。
+
+    四个逐步列表（sides/mat_red/root_values 及稀疏 π）在此单点同步 append，保证等长
+    （build_payload 断言依赖此不变式；错位会静默污染训练数据）。root_value 为当前
+    走子方视角，与 z 同视角。
+    """
     state = encode_board(board, history_steps).astype(np.uint8, copy=False)
     slot.sample_states.append(state)
     slot.sample_pol_idx.append(pol_idx)
@@ -303,6 +345,7 @@ def _record_sample(
     slot.sample_sides.append(board.side_to_move)
     # 直接传 Board 对象走 material_score 快路径（遍历 squares，免 fen() 字符串往返）。
     slot.sample_mat_red.append(material_score(board))
+    slot.sample_root_values.append(float(root_value))
 
 
 class _WorkerEngine:
@@ -321,9 +364,13 @@ class _WorkerEngine:
             cfg.mcts, draw_value=float(cfg.selfplay.draw_penalty)
         )
         self.history_steps = int(cfg.model.history_steps)
-        self.num_sims = int(cfg.mcts.num_sims)
+        # num_sims 按迭代调度（不 mutate cfg——cfg 引用会写进 checkpoint/meta）。
+        self.num_sims = sims_schedule(self.iteration, cfg.mcts)
         self.batch_cap = max(1, int(cfg.mcts.batch_size))
         self.target = self.num_sims
+        # π 训练目标锐化参数（DESIGN §8）；默认 (1.0, 0.0) = 不锐化。
+        self.policy_temp = float(cfg.mcts.policy_target_temp)
+        self.policy_prune_frac = float(cfg.mcts.policy_target_prune_frac)
 
         # 认输仅在 resign_enabled 且迭代 ≥ resign_start_iter 后启用（DESIGN §10.3）。
         self.resign_active = bool(cfg.selfplay.resign_enabled) and (
@@ -362,12 +409,14 @@ class _WorkerEngine:
             slot.state = "searching"
             return
 
-    @staticmethod
-    def _sparse_from_counts(counts: np.ndarray, side: int) -> Tuple[np.ndarray, np.ndarray]:
-        """visits 归一 + move_to_policy_index 转当前方视角 → 稀疏 π (idx int16, prob f32)。"""
-        nz = np.nonzero(counts)[0]
-        probs = counts[nz].astype(np.float64)
-        probs /= probs.sum()
+    def _sparse_from_counts(self, counts: np.ndarray, side: int) -> Tuple[np.ndarray, np.ndarray]:
+        """visits 锐化归一 + move_to_policy_index 转当前方视角 → 稀疏 π (idx int16, prob f32)。
+
+        锐化（temp/prune_frac）后被剪的边概率为 0，不进稀疏输出。默认参数逐 bit 等价原行为。
+        """
+        probs_full = sharpen_counts(counts, self.policy_temp, self.policy_prune_frac)
+        nz = np.nonzero(probs_full)[0]
+        probs = probs_full[nz]
         idx = np.fromiter(
             (move_to_policy_index(action_to_move(int(a)), side) for a in nz),
             dtype=np.int16,
@@ -383,12 +432,12 @@ class _WorkerEngine:
         slot.moves.append(move_to_uci(move))
 
     def _play_mate(self, slot: _GameSlot, move: Tuple[int, int]) -> None:
-        """一步杀捷径：π one-hot 记样本并落子。"""
+        """一步杀捷径：π one-hot 记样本并落子（无搜索，根价值取 +1.0：一步杀必胜）。"""
         board = slot.board
         side = board.side_to_move
         idx = np.array([move_to_policy_index(move, side)], dtype=np.int16)
         prob = np.array([1.0], dtype=np.float32)
-        _record_sample(slot, board, idx, prob, self.history_steps)
+        _record_sample(slot, board, idx, prob, self.history_steps, 1.0)
         self._push_move(slot, move)
 
     def _decide(self, slot: _GameSlot) -> None:
@@ -424,7 +473,7 @@ class _WorkerEngine:
 
         # 记录当前局面训练样本（π = 归一化访问计数，当前方视角）。
         idx, prob = self._sparse_from_counts(counts, side)
-        _record_sample(slot, board, idx, prob, self.history_steps)
+        _record_sample(slot, board, idx, prob, self.history_steps, root_value)
 
         # 认输判定（在落子前）。校准镜像先更新。
         self._update_calibration(slot, side, root_value)
@@ -517,7 +566,12 @@ class _WorkerEngine:
             winner = BLACK
 
         # 逐步价值：z 含和棋惩罚 + 材料混合 λ，符号 = 该步走子方视角。
+        # 三个逐步列表必须等长（错位会静默污染训练数据，与 z 视角挂钩）。
+        assert (
+            len(slot.sample_root_values) == len(slot.sample_sides) == len(slot.sample_mat_red)
+        ), "逐步列表长度错位：root_values/sides/mat_red 不等长"
         lam = lambda_schedule(self.iteration, cfg.selfplay)
+        beta = float(cfg.selfplay.root_value_weight)  # z 混根价值权重，0=关（原行为）
         values = np.empty(len(slot.sample_sides), dtype=np.float32)
         for i, (side, mat_red) in enumerate(zip(slot.sample_sides, slot.sample_mat_red)):
             if winner == 0:
@@ -526,7 +580,11 @@ class _WorkerEngine:
                 z = 1.0 if winner == side else -1.0
             mat_side = mat_red * side  # 红分转当前走子方视角
             mat_tanh = float(np.tanh(mat_side / MATERIAL_SCALE))
-            values[i] = float(blend_value(z, mat_tanh, lam))
+            blended = float(blend_value(z, mat_tanh, lam))
+            if beta > 0.0:
+                # root_value 与 z 同视角（当前走子方），直接凸组合无需翻符号。
+                blended = (1.0 - beta) * blended + beta * float(slot.sample_root_values[i])
+            values[i] = blended
 
         if slot.sample_states:
             states = np.stack(slot.sample_states).astype(np.uint8, copy=False)

@@ -163,6 +163,23 @@ def lambda_schedule(iteration: int, cfg) -> float:
     return init_lam * (1.0 - iteration / blend_iters)
 
 
+def sims_schedule(iteration: int, mcts_cfg) -> int:
+    """返回当前迭代生效的 MCTS 模拟数（DESIGN §8）。
+
+    num_sims_late>0 且 iteration≥num_sims_late_start_iter 时切到 num_sims_late
+    （收尾阶段灌高质量 π buffer）；否则用 num_sims。默认 num_sims_late=0 → 恒为 num_sims。
+
+    Parameters
+    ----------
+    iteration : 当前迭代编号（0-based）
+    mcts_cfg  : MCTSConfig（须有 num_sims, num_sims_late, num_sims_late_start_iter 字段）
+    """
+    late = int(mcts_cfg.num_sims_late)
+    if late > 0 and int(iteration) >= int(mcts_cfg.num_sims_late_start_iter):
+        return late
+    return int(mcts_cfg.num_sims)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # §10.2 和棋惩罚
 # ─────────────────────────────────────────────────────────────────────────────

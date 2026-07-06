@@ -3,16 +3,27 @@
 # 建议先跑 1-2 个迭代，观察日志中的 moves/s、evals/s、avg_batch 与 htop CPU 占用再调参
 model: {blocks: 10, filters: 128, history_steps: 2}
 mcts:
-  # 前 30~50 迭代可先用 num_sims=400 加快出数据（早期网络弱、更多模拟收益低），
-  # 数据规模起来后再升到 600+ 提升棋力。
-  # 阶段一保持 600（升 1000 成本 +37% 而收益未验证）；计划在迁移大模型前的
-  # 最后 ~20 迭代临时升到 1000，为大模型蒸馏热启动灌一份高质量 π 的 buffer。
+  # 稳态保持 600：GUI 探针实证 800/1600 sims 都翻不动近均匀先验（要 3200 才翻），
+  # 盲加 sims 是全场最贵、单位收益最低的杠杆；π 锐度靠 policy_target_* 解决。
   num_sims: 600
   c_puct: 1.8
   dirichlet_alpha: 0.2
   temp_moves: 32
   temp_final: 0.15    # temp_moves 后保留小温度采样，打破确定性循环（抑制 80%+ 重复判和）
   batch_size: 96
+  # ── 阶段二（iter 600-999）新增：π 训练目标锐化（DESIGN §8）─────────────
+  # 诊断：policy_loss≈entropy≈2.54 走平——网络已把高熵 π 目标拟合到头，瓶颈在
+  # 目标本身不锐（600 sims 摊在 ~40 个合法着法上 visits 近均匀，开局先验最高仅 3%）。
+  # 只锐化写进 buffer 的训练目标，不改落子采样/对局轨迹；温和参数防探索崩塌。
+  # 注意：dirichlet_eps/c_puct/fpu 微调与本项同源（都压 visit 熵），刻意不同批启用
+  # ——若 20~30 迭代后 entropy 仍不降，再单独逐档试 dirichlet_eps 0.25→0.15。
+  policy_target_temp: 0.75        # p ∝ c^(1/T)，放大薄 margin
+  policy_target_prune_frac: 0.03  # 剪掉 visits < 3%·max 的 Dirichlet 噪声边
+  # 收尾高 sims 调度：iter ≥ 980 的最后 20 迭代升 1000 sims，把整窗 buffer 刷成
+  # 高质量 π（~2.3 次覆盖），供大模型蒸馏热启动（scripts/distill_bigmodel.py）。
+  # 若提前决定迁移，把 late_start_iter 改成"当前迭代+1"即可提前触发。
+  num_sims_late: 1000
+  num_sims_late_start_iter: 980
 selfplay:
   games_per_iteration: 2000
   # 瓶颈在 CPU 端 Python MCTS：worker 是纯 CPU 进程，数量按 vCPU 数自动扩展
@@ -27,6 +38,11 @@ selfplay:
   value_blend_iters: 30
   draw_penalty: -0.2  # 同时注入 MCTS 树内和棋值（搜索会主动避免重复循环）
   resign_start_iter: 10
+  # ── 阶段二新增：z 目标混入根价值去噪（DESIGN §10.1b）─────────────────
+  # 诊断：value_loss 0.29→0.49 / value_mae 0.37→0.55 持续上行——对局越来越对等，
+  # ±1 的 z 接近抛硬币。root_value 是 600 sims 平均后的低方差估计，β=0.3 温和混合
+  #（三量同为当前走子方视角，无翻转；λ 已退火为 0，不与材料混合叠加）。
+  root_value_weight: 0.3
 train:
   device: cuda
   num_gpus: 8
@@ -37,14 +53,22 @@ train:
   sample_reuse: 3.0
   buffer_window: 1500000
   min_buffer_to_train: 100000
-  # ── 阶段一续训（iter 300-599，2026-07 天梯诊断后设定）────────────────
-  # 300 迭代已跑完首条余弦（lr 落地板 1e-4）而天梯仍 +58 Elo/50 迭代 → 暖重启：
-  # 峰值减半 + 地平线翻倍，resume 点（iter 300, progress=0.5）有效 LR 精确 = 3.0e-4，
-  # 再沿余弦退回 1e-4。若从头重训请恢复 lr: 0.001。
-  lr: 0.0005
-  total_iterations: 600
+  # ── 阶段二续训（iter 600-999，2026-07-06 平台期诊断后设定）──────────────
+  # 阶段一暖重启（lr 5e-4/total 600，resume@300 有效 LR=3.0e-4）已跑完，iter 400 后
+  # 平台期：晋升间隔 1~2 拉长到 7~23、arena 徘徊 0.50、LR 落地板 1e-4。
+  # 二次温和暖重启：峰值再降（4e-4）+ 地平线抬到 1000，resume 点（iter 600,
+  # progress=0.6, cos(0.6π)=-0.309）有效 LR = 1e-4+0.5·3e-4·0.691 ≈ 2.0e-4，
+  # 沿余弦退回 1e-4。LR 不是平台期根因（根因=π/z 目标钝化，见 mcts/selfplay 段），
+  # 暖重启只为给目标锐化提供可塑性。若从头重训请恢复 lr: 0.001。
+  # 若迁移大模型（15b×192f+SE），改用 configs/cloud_stage2_15x192se.yaml。
+  lr: 0.0004
+  total_iterations: 1000
   amp: true
-# arena 并行化后（8 卡 ×4 workers）80 盘比旧串行 40 盘还快得多；
-# 加倍盘数把门控噪声 SE 从 ~0.066 压到 ~0.047（假晋升 ~22%→~14%），门槛不动。
-arena: {arena_games: 80, arena_sims: 200, gate_threshold: 0.55, arena_workers: 0}
+# 阶段二门控降噪：平台期 arena 徘徊 0.50，晋升信号里噪声占比高（80 盘 SE~0.047、
+# 假晋升 ~14%/迭代 → best 沿噪声随机上漂，给自博弈提供移动靶）。三管齐下：
+# 盘数 80→160（SE→~0.033）、arena_sims 200→400（减少低 sims 随机和棋）、
+# LCB 门控 gate_lcb_z=1.0（额外要求 score-1σ ≥ 0.5，假晋升 ~14%→~3%）。
+# gate_threshold 保持 0.55 不再抬高（与 LCB 叠加会过严）。arena 铺满 8 卡，
+# 墙钟增量相对 selfplay 330s/iter 可忽略。
+arena: {arena_games: 160, arena_sims: 400, gate_threshold: 0.55, gate_lcb_z: 1.0, arena_workers: 0}
 log: {log_interval_sec: 30.0, train_log_interval: 100, tensorboard: true}

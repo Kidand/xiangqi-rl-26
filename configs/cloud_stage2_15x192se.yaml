@@ -1,0 +1,80 @@
+# 云端 8×H100 迁移专用预设：大模型 15×192+SE（阶段二 → 大网续训）
+# ---------------------------------------------------------------------------
+# 迁移 runbook（严格按序）：
+#   ① 阶段二末 20 迭代已用高 sims（cloud_8xh100.yaml 的 num_sims_late=1000 /
+#      num_sims_late_start_iter=980）把整窗 buffer 灌成高质量 π 目标。
+#   ② 云端跑 scripts/distill_bigmodel.py，从落盘 buffer 监督蒸馏本尺寸大网：
+#        python scripts/distill_bigmodel.py --buffer-dir ckpts/buffer \
+#          --blocks 15 --filters 192 --se --history-steps 2 \
+#          --iteration <当前迭代+1> --epochs 8 --batch-size 4096 \
+#          --device cuda --lr-peak 1e-3 --arena-check ckpts/best.pt --seed-best
+#      产出 ckpts/iter_XXXX.pt（文件名符合 resume glob）。
+#   ③ --arena-check 校验新大网 vs 旧 best，score ≥ 0.5 才允许 seed。
+#   ④ --seed-best 自动把旧 best.pt 备份为 best_pre_distill_iter{N}.pt 再用大网覆盖
+#      （arena score < 0.5 会拒绝执行，不会破坏 best）。
+#   ⑤ 用本 yaml --resume 接续自博弈训练：
+#        python -m rl.train --config configs/cloud_stage2_15x192se.yaml --resume
+#      resume 用本 yaml 的 model 段建骨架再 strict load iter_XXXX.pt——四字段
+#      （blocks/filters/se/history_steps）必须与蒸馏脚本完全一致，否则直接崩。
+# ---------------------------------------------------------------------------
+# 15×192+SE ≈ 10.5M 参数、3.38× FLOPs（相对 10×128 阶段一网）。
+# history_steps 绝不能改：改了 in_channels（14T+3）就变，旧 buffer 会静默加载、
+# 前向才炸；蒸馏脚本已对 buffer.state_shape 做一致性断言，此处保持 2 与其对齐。
+model: {blocks: 15, filters: 192, se: true, history_steps: 2}
+mcts:
+  # 稳态 sims 保持 600（同阶段二：盲加 sims 单位收益最低，π 锐度靠 policy_target_*）。
+  num_sims: 600
+  c_puct: 1.8
+  dirichlet_alpha: 0.2
+  temp_moves: 32
+  temp_final: 0.15
+  batch_size: 96
+  # π 训练目标锐化（DESIGN §8）——照抄阶段二值：只锐化写进 buffer 的训练目标，
+  # 不改落子采样/对局轨迹。大网容量更大，锐目标能吃得更满。
+  policy_target_temp: 0.75
+  policy_target_prune_frac: 0.03
+  # 收尾高 sims 调度：迁移后从大网重新起算。默认关（0/0）；到大网自身收尾阶段若要
+  # 再灌一批高质量 π（例如二次蒸馏或稳态强化），把 num_sims_late_start_iter 设为
+  # “当前迭代+1”、num_sims_late 设为 1000 即按需触发。
+  num_sims_late: 0
+  num_sims_late_start_iter: 0
+selfplay:
+  games_per_iteration: 2000
+  num_workers: 0
+  games_per_worker: 16
+  eval_max_batch: 4096
+  eval_wait_ms: 2.0
+  eval_fp16: true           # bf16 推理；SE+bf16 从未在 CUDA 实测——distill_bigmodel.py
+                            # 首次云端运行时的 bf16 预检是前置门，预检不过不要开训
+  max_game_plies: 400
+  value_blend_init: 0.5
+  value_blend_iters: 30
+  draw_penalty: -0.2
+  resign_start_iter: 10
+  # z 目标混入根价值去噪（DESIGN §10.1b）——照抄阶段二值。
+  root_value_weight: 0.3
+train:
+  device: cuda
+  num_gpus: 8
+  batch_size: 4096
+  train_steps_per_iteration: 0
+  sample_reuse: 3.0
+  buffer_window: 1500000
+  min_buffer_to_train: 100000
+  # ── 迁移续训 LR（大网从蒸馏点接手，温和暖重启给自博弈可塑性）────────────────
+  # 峰值 6e-4 / 地平线 1000，从蒸馏产出的 iter≈620 处 --resume。
+  # 有效 LR 手算（余弦，与 _cosine_lr 一致，progress = resume_iter / total_iterations）：
+  #   progress = 620/1000 = 0.620，cos(0.620π) = -0.3681
+  #   eff_lr = lr_min + 0.5·(lr - lr_min)·(1 + cos)
+  #          = 1e-4 + 0.5·(6e-4 - 1e-4)·(1 - 0.3681)
+  #          = 1e-4 + 2.5e-4·0.6319 ≈ 2.58e-4  → 有效 LR ≈ 2.6e-4，沿余弦退回 1e-4。
+  # 若蒸馏产出迭代号不同，用同一公式手算 progress 即可。
+  lr: 0.0006
+  lr_min: 0.0001
+  total_iterations: 1000
+  amp: true
+# 门控降噪照抄阶段二：盘数 160（SE→~0.033）、arena_sims 400、LCB gate_lcb_z=1.0
+#（额外要求 score-1σ ≥ 0.5，压假晋升）、gate_threshold 0.55。arena 走 load_checkpoint
+# 按各自 model_config 重建，大网自洽。
+arena: {arena_games: 160, arena_sims: 400, gate_threshold: 0.55, gate_lcb_z: 1.0, arena_workers: 0}
+log: {log_interval_sec: 30.0, train_log_interval: 100, tensorboard: true}

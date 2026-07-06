@@ -187,6 +187,14 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
   ```
   selfplay 驱动方式：对每盘未满 sims 的对局调 select_leaves，跨盘 stack 成大 batch 一次前向，再逐盘 apply_results。
   训练样本 π 入库时用 move_to_policy_index 转为当前方视角；visit_counts 本身保持棋盘真实坐标。
+- **π 训练目标锐化**（`policy_target_temp`/`policy_target_prune_frac`，默认 1.0/0.0 = 不锐化）：
+  构造训练目标时（仅此处，selfplay 的 `_sparse_from_counts`），先剪掉 `visits < prune_frac·max(visits)`
+  的边（剔除 Dirichlet 噪声份额），再按 `p ∝ c^(1/T)` 归一（T<1 放大薄 margin）。**落子采样、
+  visit_counts/q_values 语义、GUI/arena 路径一律不受影响**——锐化只改变写进 buffer 的 π。
+- **num_sims 按迭代调度**（`num_sims_late`/`num_sims_late_start_iter`，默认 0 = 关闭）：
+  selfplay 中 iteration ≥ late_start_iter 且 num_sims_late>0 时，该迭代实际模拟数改用
+  num_sims_late（收尾阶段灌高质量 π buffer，供大模型蒸馏热启动）。对局记录 meta.sims
+  写实际生效值，事后可还原。
 
 ## 9. 自我博弈与训练流水线（同步迭代制，便于看日志调参）
 
@@ -206,7 +214,7 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
 3. **训练**：GPU 0（或 DDP）在 buffer 上采样 `train_steps_per_iteration` 步（默认 1000；
    **0 = 自动**：`clamp(ceil(本迭代新样本数 × sample_reuse / batch), 10, 5000)`，防止小 buffer
    期过拟合——步数固定 1000 时早期每样本会被重复学习数十遍），batch 4096。损失 `CE(π) + MSE(z) + L2(1e-4)`，AdamW lr 1e-3 余弦退火（配置可换 SGD+momentum）。
-4. **Arena 门控**：新模型 vs best，`arena_games`（默认 40，红黑各半）盘，200 sims、无噪声、低温。胜率 ≥ `gate_threshold`（默认 0.55，和棋计 0.5）则晋升 best。对局经 spawn 进程池并行执行（`arena_workers`，0=自动按 GPU 数×4，每 worker 绑定单 GPU；此阶段 selfplay worker/EvalServer 已退出，整机空闲），统计语义与串行一致；1 worker 或小规模时走串行路径。
+4. **Arena 门控**：新模型 vs best，`arena_games`（默认 40，红黑各半）盘，200 sims、无噪声、低温。胜率 ≥ `gate_threshold`（默认 0.55，和棋计 0.5）则晋升 best。若 `arena.gate_lcb_z` > 0，额外要求 `score - gate_lcb_z·score_se ≥ 0.5`（LCB 门控；`score_se = sqrt(逐局得分{1,0.5,0}样本方差/games)`，由 W/D/L 计数即可算出），抑制门控噪声下的假晋升与 best 随机漂移；arena 统计 dict 增加 `score_se` 字段（串行与并行路径口径一致）。对局经 spawn 进程池并行执行（`arena_workers`，0=自动按 GPU 数×4，每 worker 绑定单 GPU；此阶段 selfplay worker/EvalServer 已退出，整机空闲），统计语义与串行一致；1 worker 或小规模时走串行路径。
 5. 保存 checkpoint、打日志、进入下一迭代。buffer 落盘默认异步（`train.async_buffer_save`：
    `snapshot`=selfplay 结束即取一致性快照、后台线程压缩、与后续阶段乃至下一迭代 selfplay
    重叠，RAM 峰值 +1 份 states 拷贝；`freeze_window`=零拷贝、只藏进 train+arena 的只读窗口；
@@ -218,6 +226,11 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
 ## 10. 启发式收敛加速（rl/heuristics.py，全部可配置开关）
 
 1. **材料价值混合**：`z_target = (1-λ)·z + λ·tanh(material_diff/材料尺度)`，λ 从 `value_blend_init`（0.5）线性退火到 0（前 `value_blend_iters` 个迭代）。材料分：车9 炮4.5 马4 象2 士2 兵1(过河2)。
+1b. **根价值混合去噪**（`selfplay.root_value_weight` = β，默认 0 = 关）：最终 value 目标
+   `z' = (1-β)·z_target + β·root_value`，root_value 为该样本落子前 MCTS 根价值（当前走子方
+   视角——z、材料分、root_value 三量同视角，混合**无需任何翻转**）。一步杀捷径样本无搜索，
+   root_value 取 +1.0（当前方必胜）。压低对等对局 ±1 结果目标的方差（KataGo 式）；
+   buffer 落盘仍是混合后的单个 float，schema 不变。
 2. **和棋惩罚**：和棋的 z = `draw_penalty`（默认 -0.1，双方同罚），提高进取性（象棋和棋率高，防止塌缩到互相闲逛）。
 3. **认输机制**：迭代 ≥ `resign_start_iter`（默认 10）后启用；双方连续 `resign_consecutive`（4）个己方回合 root value < `resign_threshold`（-0.92）即判负提前结束；10% 对局禁用认输以校准误判率（日志输出 false-positive 率）。
 4. **开局多样化**：前 `opening_random_plies`（8）步温度 1.25 采样，防止开局塌缩。

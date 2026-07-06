@@ -37,7 +37,7 @@ import numpy as np
 
 from xiangqi.records import append_jsonl
 from rl.config import Config
-from rl.evaluate import arena
+from rl.evaluate import arena, passes_gate
 from rl.logger import TrainLogger
 from rl.model import create_model, save_checkpoint
 from rl.replay_buffer import ReplayBuffer
@@ -820,7 +820,7 @@ def run_training(cfg: Config, resume: bool = False) -> Dict[str, object]:
             ar_t0 = time.monotonic()
             arena_stats = arena(str(iter_path), str(best_path), cfg, device)
             arena_sec = time.monotonic() - ar_t0
-            promoted = bool(trained and arena_stats["score"] >= float(cfg.arena.gate_threshold))
+            promoted = bool(trained and passes_gate(arena_stats, cfg.arena))
             if promoted:
                 save_checkpoint(
                     model, cfg.model, best_path, iteration=iteration, meta={"promoted_from": iteration}
@@ -841,6 +841,10 @@ def run_training(cfg: Config, resume: bool = False) -> Dict[str, object]:
                 promoted=promoted,
                 iteration=iteration,
                 elapsed_sec=arena_sec,
+            )
+            logger.info(
+                f"[iter {iteration} | arena] se {arena_stats['score_se']:.3f}"
+                f"（gate_lcb_z={float(cfg.arena.gate_lcb_z):.2f}）"
             )
 
             # 6) CSV 汇总行（buffer 落盘已在步骤 2 后台进行）。

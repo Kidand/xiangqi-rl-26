@@ -40,6 +40,14 @@ class MCTSConfig:
     draw_value: float = 0.0          # 树内和棋终局回传值（不翻符号，双方同罚）；
                                      # selfplay/arena 会注入 selfplay.draw_penalty
     batch_size: int = 64             # 单进程叶子评估凑批上限
+    # π 训练目标锐化（DESIGN §8）：只作用于训练样本 π 的构造，不影响落子采样
+    # 与 visit_counts 语义。默认值 = 原行为（不锐化）。
+    policy_target_temp: float = 1.0       # 目标温度 T，p ∝ c^(1/T)；<1 锐化
+    policy_target_prune_frac: float = 0.0 # 剪掉 visits < frac*max 的边再归一；0=关
+    # num_sims 按迭代调度（DESIGN §8）：iteration ≥ late_start_iter 时改用 num_sims_late
+    #（>0 时生效），用于收尾阶段灌高质量 π buffer（蒸馏热启动数据）。
+    num_sims_late: int = 0
+    num_sims_late_start_iter: int = 0
 
 
 @dataclass
@@ -67,6 +75,10 @@ class SelfPlayConfig:
     opening_random_plies: int = 8
     opening_temperature: float = 1.25
     mate_shortcut: bool = True       # 一步杀捷径
+    # z 目标与 MCTS 根价值混合（DESIGN §10）：z' = (1-β)·blend(z,材料,λ) + β·root_value，
+    # root_value 为该样本落子前搜索根价值（当前走子方视角，与 z 同视角无需翻转）。
+    # 压低对等对局中 ±1 结果的方差。0 = 关（原行为）。
+    root_value_weight: float = 0.0
 
 
 @dataclass
@@ -99,6 +111,9 @@ class ArenaConfig:
     arena_games: int = 40
     arena_sims: int = 200
     gate_threshold: float = 0.55     # 胜率（和=0.5）≥ 此值则晋升 best
+    # LCB 门控（DESIGN §9）：>0 时额外要求 score - z·score_se ≥ 0.5（score_se 为
+    # 逐局得分 {0,0.5,1} 的样本标准误），抑制假晋升导致的 best 随机漂移。0 = 关。
+    gate_lcb_z: float = 0.0
     arena_temp_moves: int = 8        # 前几步轻微随机避免完全重复对局
     arena_temperature: float = 0.5
     arena_workers: int = 0           # 并行对弈进程数；0=自动（cuda 且 ≥16 盘时 GPU 数×4），1=串行

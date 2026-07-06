@@ -17,7 +17,8 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Callable, Dict
+import math
+from typing import Callable, Dict, Tuple
 
 import numpy as np
 
@@ -27,7 +28,40 @@ from rl.mcts import search
 from rl.model import load_checkpoint
 from rl.selfplay import build_eval_fn, sample_action_from_counts
 
-__all__ = ["arena"]
+__all__ = ["arena", "score_stats", "passes_gate"]
+
+
+def score_stats(wins: int, draws: int, losses: int) -> Tuple[float, float]:
+    """由 W/D/L 计数算综合得分与其标准误（DESIGN §9.4 LCB 门控用）。
+
+    score = (W + 0.5D) / N；score_se = 逐局得分（胜=1/和=0.5/负=0）样本方差的标准误
+    = sqrt(方差 / N)。N=0（无对局）时两者均为 0。
+    """
+    n = wins + draws + losses
+    if n <= 0:
+        return 0.0, 0.0
+    score = (wins + 0.5 * draws) / n
+    var = (
+        wins * (1.0 - score) ** 2
+        + draws * (0.5 - score) ** 2
+        + losses * (0.0 - score) ** 2
+    ) / n
+    score_se = math.sqrt(var / n)
+    return score, score_se
+
+
+def passes_gate(stats: Dict, arena_cfg) -> bool:
+    """LCB 门控判定（DESIGN §9.4）：score 达标，且 ``gate_lcb_z`` > 0 时下界也需达标。
+
+    ``gate_lcb_z <= 0``（默认）时与旧行为完全一致，只看 ``score >= gate_threshold``。
+    """
+    threshold = float(arena_cfg.gate_threshold)
+    if stats["score"] < threshold:
+        return False
+    z = float(getattr(arena_cfg, "gate_lcb_z", 0.0))
+    if z <= 0.0:
+        return True
+    return stats["score"] - z * stats["score_se"] >= 0.5
 
 
 def _resolve_device(device: str, num_gpus: int) -> str:
@@ -193,10 +227,12 @@ def _arena_parallel(new_ckpt: str, best_ckpt: str, cfg, workers: int, dev: str) 
     def _score(w: int, d: int, n: int) -> float:
         return (w + 0.5 * d) / n if n > 0 else 0.0
 
+    score, score_se = score_stats(agg["wins"], agg["draws"], agg["losses"])
     return {
         "games": games,
         **agg,
-        "score": _score(agg["wins"], agg["draws"], games),
+        "score": score,
+        "score_se": score_se,
         "red_score": _score(agg["red_wins"], agg["red_draws"], red_games),
         "black_score": _score(agg["black_wins"], agg["black_draws"], games - red_games),
     }
@@ -210,8 +246,8 @@ def arena(new_ckpt: str, best_ckpt: str, cfg, device: str) -> Dict[str, float]:
     dict，含键：
       games, wins, draws, losses,
       red_wins, red_draws, red_losses, black_wins, black_draws, black_losses,
-      score, red_score, black_score
-    （wins/draws/losses 均以"新模型"为视角。）
+      score, score_se, red_score, black_score
+    （wins/draws/losses 均以"新模型"为视角；score_se 见 score_stats，供 LCB 门控用。）
     """
     dev = _resolve_device(device, int(cfg.train.num_gpus))
 
@@ -264,6 +300,7 @@ def arena(new_ckpt: str, best_ckpt: str, cfg, device: str) -> Dict[str, float]:
     def _score(w: int, d: int, n: int) -> float:
         return (w + 0.5 * d) / n if n > 0 else 0.0
 
+    score, score_se = score_stats(wins, draws, losses)
     return {
         "games": games,
         "wins": wins,
@@ -275,7 +312,8 @@ def arena(new_ckpt: str, best_ckpt: str, cfg, device: str) -> Dict[str, float]:
         "black_wins": black_w,
         "black_draws": black_d,
         "black_losses": black_l,
-        "score": _score(wins, draws, games),
+        "score": score,
+        "score_se": score_se,
         "red_score": _score(red_w, red_d, red_games),
         "black_score": _score(black_w, black_d, games - red_games),
     }
