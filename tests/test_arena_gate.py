@@ -7,6 +7,9 @@
   也能放行样本量更大/胜率更高的场景。
 - 两条 arena 统计 dict 构造路径（串行 ~267-280 行、并行 ~196-201 行）都要带
   ``score_se`` 字段——分别驱动一次，钉死两处都没漏改。
+- distinct_openings（DESIGN §9.4）：monkeypatch ``_play_one`` 返回可控的
+  ``evaluate._PlayResult``（挂 ``.opening`` 指纹），驱动串行与并行两条路径，
+  验证"全相同指纹→1"、"全不同指纹→N"两种边界，且口径一致。
 """
 
 from __future__ import annotations
@@ -217,3 +220,113 @@ def test_arena_parallel_path_includes_score_se(monkeypatch):
     expected_score, expected_se = score_stats(2, 0, 2)
     assert stats["score"] == pytest.approx(expected_score)
     assert stats["score_se"] == pytest.approx(expected_se)
+
+
+# --------------------------------------------------------------------------- distinct_openings（DESIGN §9.4）
+def test_arena_serial_distinct_openings_all_same_is_one(monkeypatch):
+    """串行路径：6 盘都返回同一开局指纹 → distinct_openings 应为 1。"""
+    cfg = Config()
+    cfg.arena.arena_games = 6
+    cfg.arena.arena_workers = 1
+    cfg.train.device = "cpu"
+
+    same_opening = ("h2e2", "h9g7")
+
+    def fake_play_one(new_eval, best_eval, new_is_red, cfg_, rng):
+        return evaluate._PlayResult("1/2-1/2", same_opening)
+
+    monkeypatch.setattr(evaluate, "_play_one", fake_play_one)
+    monkeypatch.setattr(evaluate, "load_checkpoint", _fake_load_checkpoint)
+
+    stats = evaluate.arena("new.pt", "best.pt", cfg, device="cpu")
+    assert stats["distinct_openings"] == 1
+
+
+def test_arena_serial_distinct_openings_all_different_is_n(monkeypatch):
+    """串行路径：6 盘各返回互不相同的开局指纹 → distinct_openings 应等于盘数 6。"""
+    cfg = Config()
+    cfg.arena.arena_games = 6
+    cfg.arena.arena_workers = 1
+    cfg.train.device = "cpu"
+
+    counter = iter(range(1000))
+
+    def fake_play_one(new_eval, best_eval, new_is_red, cfg_, rng):
+        i = next(counter)
+        return evaluate._PlayResult("1/2-1/2", (f"a{i}b{i}",))
+
+    monkeypatch.setattr(evaluate, "_play_one", fake_play_one)
+    monkeypatch.setattr(evaluate, "load_checkpoint", _fake_load_checkpoint)
+
+    stats = evaluate.arena("new.pt", "best.pt", cfg, device="cpu")
+    assert stats["distinct_openings"] == 6
+
+
+class _FakeQueueForOpenings:
+    def __init__(self):
+        self._items = []
+
+    def put(self, item):
+        self._items.append(item)
+
+    def get(self):
+        return self._items.pop(0)
+
+
+class _FakePoolForOpenings:
+    def __init__(self, processes=None, initializer=None, initargs=()):
+        if initializer is not None:
+            initializer(*initargs)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def imap_unordered(self, fn, tasks):
+        return [fn(t) for t in tasks]
+
+
+class _FakeCtxForOpenings:
+    def Queue(self):
+        return _FakeQueueForOpenings()
+
+    def Pool(self, processes=None, initializer=None, initargs=()):
+        return _FakePoolForOpenings(processes=processes, initializer=initializer, initargs=initargs)
+
+
+def test_arena_parallel_distinct_openings_matches_serial_semantics(monkeypatch):
+    """并行路径（同进程假 Pool，不 spawn 真实进程）：验证 distinct_openings 的
+    并集去重口径与串行路径一致——同一指纹在两个 chunk 里各出现一次算 1 个，
+    每盘各自不同的指纹按盘数计数。"""
+    import multiprocessing
+
+    monkeypatch.setattr(multiprocessing, "get_context", lambda name: _FakeCtxForOpenings())
+    monkeypatch.setattr(evaluate, "load_checkpoint", _fake_load_checkpoint)
+
+    cfg = Config()
+    cfg.arena.arena_games = 4
+    cfg.arena.arena_workers = 2  # 显式并行，绕开 auto 的 cpu→串行判定；切成 4 块（workers*2）
+    cfg.train.device = "cpu"
+    cfg.train.num_gpus = 0
+
+    # 全部同一指纹 → 跨 chunk 求并集后仍应只有 1 个。
+    same_opening = ("h2e2",)
+    monkeypatch.setattr(
+        evaluate, "_play_one",
+        lambda new_eval, best_eval, new_is_red, cfg_, rng: evaluate._PlayResult("1/2-1/2", same_opening),
+    )
+    stats_same = evaluate.arena("new.pt", "best.pt", cfg, device="cpu")
+    assert stats_same["distinct_openings"] == 1
+
+    # 各盘指纹互不相同 → 应等于盘数（4）。
+    counter = iter(range(1000))
+
+    def fake_play_one_distinct(new_eval, best_eval, new_is_red, cfg_, rng):
+        i = next(counter)
+        return evaluate._PlayResult("1/2-1/2", (f"a{i}b{i}",))
+
+    monkeypatch.setattr(evaluate, "_play_one", fake_play_one_distinct)
+    stats_diff = evaluate.arena("new.pt", "best.pt", cfg, device="cpu")
+    assert stats_diff["distinct_openings"] == 4

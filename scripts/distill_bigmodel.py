@@ -17,8 +17,8 @@ LR 用独立 one-cycle（warmup→lr_peak→余弦退到 lr_min），**不复用
 用法::
 
     python scripts/distill_bigmodel.py \
-        --buffer-dir ckpts/buffer --blocks 15 --filters 192 --se \
-        --history-steps 2 --iteration 620 --epochs 8 --batch-size 4096 \
+        --buffer-dir ckpts/buffer_distill_snapshot --blocks 15 --filters 192 --se \
+        --history-steps 2 --iteration 1000 --epochs 10 --batch-size 4096 \
         --device cuda --lr-peak 1e-3 \
         --arena-check ckpts/best.pt --seed-best
 
@@ -233,14 +233,27 @@ def train_distill(
 # 主流程
 # ---------------------------------------------------------------------------
 def _arena_config(device: str, num_gpus: int) -> Config:
-    """给 rl.evaluate.arena 用的 Config：arena/train 段用默认值，仅覆盖设备。
+    """给 rl.evaluate.arena 用的 Config：arena 段对齐训练门控强度，仅覆盖设备。
 
     arena() 走 load_checkpoint 按各自 model_config 重建，新旧异构（大网 vs 旧 best）
     因此安全——两边各自读自己的四字段建骨架。
+
+    不用 ArenaConfig 默认值（40 盘/200 sims/temp 0.5/8 步）：阶段二对抗评审发现
+    默认强度下策略锐化导致对局高度相关（160 盘 N_eff 仅 ~2-6，分数双峰
+    0.99/0.02），score 的独立同分布假设被破坏，此时 --seed-best 用它做覆盖
+    best.pt 的决策≈抛硬币。这里改用 configs/cloud_stage2_15x192se.yaml 的 arena
+    段同款设置（160 盘、400 sims、arena_temp_moves=16、arena_temperature=0.8）
+    去相关，使 score 有统计意义。gate_threshold/gate_lcb_z 不在此覆盖——那是训练
+    循环晋升 best 的判据，本函数只服务 seed-best 的 score>=0.5 点估计判据
+    （"不弱于旧 best"，无需 LCB）。
     """
     cfg = Config()
     cfg.train.device = device
     cfg.train.num_gpus = int(num_gpus)
+    cfg.arena.arena_games = 160
+    cfg.arena.arena_sims = 400
+    cfg.arena.arena_temp_moves = 16
+    cfg.arena.arena_temperature = 0.8
     return cfg
 
 
@@ -321,6 +334,9 @@ def run(args: argparse.Namespace, log_fn: Callable[[str], None] = print) -> Dict
         f"value_mse={metrics['final_value_mse']:.5f} "
         f"耗时={time.monotonic() - t0:.1f}s"
     )
+    log_fn(
+        "[蒸馏] 参考：阶段二末 buffer π 熵约 1.05，CE 明显高于此值可加轮重蒸"
+    )
 
     # ── 写 checkpoint（model_config 随 checkpoint 写入，供 yaml resume strict load）──
     save_checkpoint(
@@ -392,7 +408,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="历史步数 T（C_in=14T+3，必须与迁移 yaml 一致）")
     p.add_argument("--iteration", type=int, required=True,
                    help="产出写 ckpts/iter_{iteration:04d}.pt；应为续训起点迭代号")
-    p.add_argument("--epochs", type=int, default=8, help="蒸馏轮数")
+    p.add_argument("--epochs", type=int, default=10, help="蒸馏轮数")
     p.add_argument("--batch-size", dest="batch_size", type=int, default=4096)
     p.add_argument("--device", default="cuda", help="cuda / cpu")
     p.add_argument("--lr-peak", dest="lr_peak", type=float, default=1e-3,

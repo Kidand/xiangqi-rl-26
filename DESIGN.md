@@ -214,7 +214,7 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
 3. **训练**：GPU 0（或 DDP）在 buffer 上采样 `train_steps_per_iteration` 步（默认 1000；
    **0 = 自动**：`clamp(ceil(本迭代新样本数 × sample_reuse / batch), 10, 5000)`，防止小 buffer
    期过拟合——步数固定 1000 时早期每样本会被重复学习数十遍），batch 4096。损失 `CE(π) + MSE(z) + L2(1e-4)`，AdamW lr 1e-3 余弦退火（配置可换 SGD+momentum）。
-4. **Arena 门控**：新模型 vs best，`arena_games`（默认 40，红黑各半）盘，200 sims、无噪声、低温。胜率 ≥ `gate_threshold`（默认 0.55，和棋计 0.5）则晋升 best。若 `arena.gate_lcb_z` > 0，额外要求 `score - gate_lcb_z·score_se ≥ 0.5`（LCB 门控；`score_se = sqrt(逐局得分{1,0.5,0}样本方差/games)`，由 W/D/L 计数即可算出），抑制门控噪声下的假晋升与 best 随机漂移；arena 统计 dict 增加 `score_se` 字段（串行与并行路径口径一致）。对局经 spawn 进程池并行执行（`arena_workers`，0=自动按 GPU 数×4，每 worker 绑定单 GPU；此阶段 selfplay worker/EvalServer 已退出，整机空闲），统计语义与串行一致；1 worker 或小规模时走串行路径。
+4. **Arena 门控**：新模型 vs best，`arena_games`（默认 40，红黑各半）盘，200 sims、无噪声、低温。胜率 ≥ `gate_threshold`（默认 0.55，和棋计 0.5）则晋升 best。若 `arena.gate_lcb_z` > 0，额外要求 `score - gate_lcb_z·score_se ≥ 0.5`（LCB 门控；`score_se = sqrt(逐局得分{1,0.5,0}样本方差/games)`，由 W/D/L 计数即可算出），抑制门控噪声下的假晋升与 best 随机漂移；arena 统计 dict 增加 `score_se` 字段（串行与并行路径口径一致）。**对局去相关**：score_se 假设各盘独立，策略锐化后低温 arena 对局会高度相关（近确定性复盘）使 SE 失真——`arena_temp_moves`/`arena_temperature` 须给足多样性；arena 统计 dict 另增 `distinct_openings` 字段（各盘前 12 ply 走子序列去重计数，串/并行同口径），直接观测有效对局多样性。对局经 spawn 进程池并行执行（`arena_workers`，0=自动按 GPU 数×4，每 worker 绑定单 GPU；此阶段 selfplay worker/EvalServer 已退出，整机空闲），统计语义与串行一致；1 worker 或小规模时走串行路径。
 5. 保存 checkpoint、打日志、进入下一迭代。buffer 落盘默认异步（`train.async_buffer_save`：
    `snapshot`=selfplay 结束即取一致性快照、后台线程压缩、与后续阶段乃至下一迭代 selfplay
    重叠，RAM 峰值 +1 份 states 拷贝；`freeze_window`=零拷贝、只藏进 train+arena 的只读窗口；

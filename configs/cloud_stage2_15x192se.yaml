@@ -1,41 +1,53 @@
-# 云端 8×H100 迁移专用预设：大模型 15×192+SE（阶段二 → 大网续训）
+# 云端 8×H100 迁移专用预设：大模型 15×192+SE（阶段三 → 大网续训，resume 点 iter 1000）
 # ---------------------------------------------------------------------------
-# 迁移 runbook（严格按序）：
-#   ① 阶段二末 20 迭代已用高 sims（cloud_8xh100.yaml 的 num_sims_late=1000 /
-#      num_sims_late_start_iter=980）把整窗 buffer 灌成高质量 π 目标。
-#   ② 云端跑 scripts/distill_bigmodel.py，从落盘 buffer 监督蒸馏本尺寸大网：
-#        python scripts/distill_bigmodel.py --buffer-dir ckpts/buffer \
+# 迁移 runbook（严格按序；阶段二已跑完 iter 600-999，末 20 迭代 1000-sims buffer 已灌满）：
+#   ⓪ 【先快照 buffer——易腐资产】600-sims 新自博弈约 3.4 迭代就冲掉半窗高质量 π：
+#        cp -r ckpts/buffer ckpts/buffer_distill_snapshot
+#      蒸馏读快照目录，主训练是否继续互不干扰。
+#   ① 把旧小网检查点移出 ckpts/（保留 best 备份由 --seed-best 自动做）：
+#        mkdir -p ckpts/small_net_archive && mv ckpts/iter_0*.pt ckpts/small_net_archive/
+#      原因：resume 的 load_latest 按文件名取最大 iter 且无架构校验——若 iter_1000.pt
+#      损坏，会回退到小网权重、在大网骨架上 strict load 直接崩（rl/train.py:730）。
+#   ② 云端跑蒸馏（epochs 10；监控 final_policy_ce 是否逼近 buffer π 的不可约熵 ≈1.05）：
+#        python scripts/distill_bigmodel.py --buffer-dir ckpts/buffer_distill_snapshot \
 #          --blocks 15 --filters 192 --se --history-steps 2 \
-#          --iteration <当前迭代+1> --epochs 8 --batch-size 4096 \
+#          --iteration 1000 --epochs 10 --batch-size 4096 \
 #          --device cuda --lr-peak 1e-3 --arena-check ckpts/best.pt --seed-best
-#      产出 ckpts/iter_XXXX.pt（文件名符合 resume glob）。
-#   ③ --arena-check 校验新大网 vs 旧 best，score ≥ 0.5 才允许 seed。
-#   ④ --seed-best 自动把旧 best.pt 备份为 best_pre_distill_iter{N}.pt 再用大网覆盖
-#      （arena score < 0.5 会拒绝执行，不会破坏 best）。
+#      注意：iter_1000.pt 在 arena 校验【之前】就会落盘——arena/seed-best 只保护
+#      best.pt 不被弱网覆盖，不会阻止 iter_1000.pt 成为续训起点；若 arena 明显 <0.5，
+#      删掉 iter_1000.pt、加大 epochs 重蒸，不要带病 resume。
+#   ③ --arena-check 用与训练门控同强度的对局（160 盘/400 sims/去相关温度），score ≥ 0.5
+#      才允许 seed（bf16+SE 预检不过也不要开训）。
+#   ④ --seed-best 自动把旧 best.pt 备份为 best_pre_distill_iter{N}.pt 再用大网覆盖。
 #   ⑤ 用本 yaml --resume 接续自博弈训练：
 #        python -m rl.train --config configs/cloud_stage2_15x192se.yaml --resume
-#      resume 用本 yaml 的 model 段建骨架再 strict load iter_XXXX.pt——四字段
+#      resume 用本 yaml 的 model 段建骨架再 strict load iter_1000.pt——四字段
 #      （blocks/filters/se/history_steps）必须与蒸馏脚本完全一致，否则直接崩。
+#   ⑥ 迁移后头几迭代盯：evals/s 与 avg_batch（大网前向变慢，selfplay_sec 预估
+#      ~1.5-2×）、policy entropy 与开局 top1 先验（见 mcts 段触发线）、红黑胜率口径。
 # ---------------------------------------------------------------------------
-# 15×192+SE ≈ 10.5M 参数、3.38× FLOPs（相对 10×128 阶段一网）。
+# 15×192+SE ≈ 10.5M 参数、3.38× FLOPs（相对 10×128）。GPU 训练侧迁移几乎免费
+# （train_sec 仅占 ~2%）；本地笔记本 CPU 前向 ~5.5×（GUI 建议 --sims 200，约 3s/步）。
 # history_steps 绝不能改：改了 in_channels（14T+3）就变，旧 buffer 会静默加载、
 # 前向才炸；蒸馏脚本已对 buffer.state_shape 做一致性断言，此处保持 2 与其对齐。
 model: {blocks: 15, filters: 192, se: true, history_steps: 2}
 mcts:
-  # 稳态 sims 保持 600（同阶段二：盲加 sims 单位收益最低，π 锐度靠 policy_target_*）。
+  # 稳态 sims 保持 600（盲加 sims 单位收益最低，π 锐度靠 policy_target_*）。
   num_sims: 600
   c_puct: 1.8
   dirichlet_alpha: 0.2
   temp_moves: 32
   temp_final: 0.15
   batch_size: 96
-  # π 训练目标锐化（DESIGN §8）——照抄阶段二值：只锐化写进 buffer 的训练目标，
-  # 不改落子采样/对局轨迹。大网容量更大，锐目标能吃得更满。
+  # π 训练目标锐化（DESIGN §8）。阶段二实证：熵 2.54→1.05 且减速收敛（未失控），
+  # temp 0.75 保持不动。prune 0.03→0.02 是大网阶段的保险：大网拟合锐目标更彻底，
+  # 函数逼近的"平均化刹车"变弱，放宽支撑集下限防过度收窄（可逆、代价小）。
+  # 【触发线】若 policy entropy < 0.85 nats 或开局 top1 先验 > 75%：
+  # 把 policy_target_temp 回调至 0.85——熵地板跌破小网水平即为过冲信号。
   policy_target_temp: 0.75
-  policy_target_prune_frac: 0.03
-  # 收尾高 sims 调度：迁移后从大网重新起算。默认关（0/0）；到大网自身收尾阶段若要
-  # 再灌一批高质量 π（例如二次蒸馏或稳态强化），把 num_sims_late_start_iter 设为
-  # “当前迭代+1”、num_sims_late 设为 1000 即按需触发。
+  policy_target_prune_frac: 0.02
+  # 收尾高 sims 调度默认关；到大网自身收尾阶段（如二次蒸馏前）再按需设
+  # num_sims_late: 1000、num_sims_late_start_iter: 当前迭代+1。
   num_sims_late: 0
   num_sims_late_start_iter: 0
 selfplay:
@@ -51,7 +63,7 @@ selfplay:
   value_blend_iters: 30
   draw_penalty: -0.2
   resign_start_iter: 10
-  # z 目标混入根价值去噪（DESIGN §10.1b）——照抄阶段二值。
+  # z 目标混入根价值去噪（DESIGN §10.1b）——阶段二实证 value_loss 0.49→0.23，保持。
   root_value_weight: 0.3
 train:
   device: cuda
@@ -61,20 +73,23 @@ train:
   sample_reuse: 3.0
   buffer_window: 1500000
   min_buffer_to_train: 100000
-  # ── 迁移续训 LR（大网从蒸馏点接手，温和暖重启给自博弈可塑性）────────────────
-  # 峰值 6e-4 / 地平线 1000，从蒸馏产出的 iter≈620 处 --resume。
-  # 有效 LR 手算（余弦，与 _cosine_lr 一致，progress = resume_iter / total_iterations）：
-  #   progress = 620/1000 = 0.620，cos(0.620π) = -0.3681
-  #   eff_lr = lr_min + 0.5·(lr - lr_min)·(1 + cos)
-  #          = 1e-4 + 0.5·(6e-4 - 1e-4)·(1 - 0.3681)
-  #          = 1e-4 + 2.5e-4·0.6319 ≈ 2.58e-4  → 有效 LR ≈ 2.6e-4，沿余弦退回 1e-4。
-  # 若蒸馏产出迭代号不同，用同一公式手算 progress 即可。
+  # ── 迁移续训 LR（resume 点 = iter 1000，蒸馏产出 iter_1000.pt 后 start_iter=1001）──
+  # 有效 LR 手算（余弦，rl/train.py _cosine_lr，progress = iteration / total_iterations）：
+  #   progress = 1000/1500 ≈ 0.667，cos(2π/3) = -0.5
+  #   eff_lr = 1e-4 + 0.5·(6e-4 - 1e-4)·(1 - 0.5) = 2.25e-4（起步实际 1001/1500 → 2.245e-4）
+  # 沿余弦退回 1e-4@1500。6e-4 只是曲线参数，大网全程最高只见 ~2.25e-4——
+  # 介于两次历史成功暖重启（3.0e-4 / 2.0e-4）之间，对刚蒸馏未经 RL 的大网合理。
+  # 若蒸馏产出迭代号不同，用同一公式手算 progress。
   lr: 0.0006
   lr_min: 0.0001
-  total_iterations: 1000
+  total_iterations: 1500
   amp: true
-# 门控降噪照抄阶段二：盘数 160（SE→~0.033）、arena_sims 400、LCB gate_lcb_z=1.0
-#（额外要求 score-1σ ≥ 0.5，压假晋升）、gate_threshold 0.55。arena 走 load_checkpoint
-# 按各自 model_config 重建，大网自洽。
-arena: {arena_games: 160, arena_sims: 400, gate_threshold: 0.55, gate_lcb_z: 1.0, arena_workers: 0}
+# ── arena 去相关（阶段二末段实证：策略锐化后对局高度相关，160 盘 N_eff 仅 ~2-6，
+# score_se 的独立性假设被破坏 → LCB 形同虚设，出现 0.99/0.02 双峰分数）──────────
+# 主杠杆 arena_temperature 0.5→0.8（N^1.25 采样，首步 top1 ~80%→~58%）；
+# arena_temp_moves 8→16 把分叉推进到不再收敛的中局。观测 distinct_openings
+# （arena 统计新增字段）：应从个位数升向 160；若停在几十且晋升枯竭，
+# 正确解是加 arena_games/arena_sims，不要回退温度重新制造相关性。
+arena: {arena_games: 160, arena_sims: 400, gate_threshold: 0.55, gate_lcb_z: 1.0,
+        arena_temp_moves: 16, arena_temperature: 0.8, arena_workers: 0}
 log: {log_interval_sec: 30.0, train_log_interval: 100, tensorboard: true}

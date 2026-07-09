@@ -70,5 +70,9 @@ train:
 # LCB 门控 gate_lcb_z=1.0（额外要求 score-1σ ≥ 0.5，假晋升 ~14%→~3%）。
 # gate_threshold 保持 0.55 不再抬高（与 LCB 叠加会过严）。arena 铺满 8 卡，
 # 墙钟增量相对 selfplay 330s/iter 可忽略。
-arena: {arena_games: 160, arena_sims: 400, gate_threshold: 0.55, gate_lcb_z: 1.0, arena_workers: 0}
+# 阶段三追加·arena 去相关：策略锐化后对局近确定性（末段实证 160 盘 N_eff 仅 ~2-6，
+# 双峰分数 0.99/0.02，SE 独立性假设被破坏 → LCB 失效）。温度 0.5→0.8 压平每步采样
+# （N^1.25），窗口 8→16 步把分叉推进中局；观测新增的 distinct_openings 统计验证生效。
+arena: {arena_games: 160, arena_sims: 400, gate_threshold: 0.55, gate_lcb_z: 1.0,
+        arena_temp_moves: 16, arena_temperature: 0.8, arena_workers: 0}
 log: {log_interval_sec: 30.0, train_log_interval: 100, tensorboard: true}

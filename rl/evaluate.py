@@ -23,12 +23,31 @@ from typing import Callable, Dict, Tuple
 import numpy as np
 
 from xiangqi.board import Board
-from xiangqi.constants import RED
+from xiangqi.constants import RED, move_to_uci
 from rl.mcts import search
 from rl.model import load_checkpoint
 from rl.selfplay import build_eval_fn, sample_action_from_counts
 
 __all__ = ["arena", "score_stats", "passes_gate"]
+
+# 开局指纹长度（DESIGN §9.4 对局去相关观测：前 N ply 走子序列去重计数）。
+OPENING_FINGERPRINT_PLIES = 12
+
+
+class _PlayResult(str):
+    """``_play_one`` 的返回值：本质仍是结果串（"1-0"/"0-1"/"1/2-1/2"），==、格式化
+    等旧用法（含测试 monkeypatch 直接返回纯字符串）完全兼容；额外挂载 ``.opening``
+    —— 该盘前 ``OPENING_FINGERPRINT_PLIES`` ply 的 UCCI 走子指纹（tuple[str,...]，
+    不足则用实际长度），供 arena 多样性统计（``distinct_openings``）用。
+    调用方一律用 ``getattr(result, "opening", ())`` 读取，纯字符串返回值兜底为空
+    tuple（不因未挂载指纹而报错）。"""
+
+    __slots__ = ("opening",)
+
+    def __new__(cls, result: str, opening: Tuple[str, ...] = ()):
+        obj = str.__new__(cls, result)
+        obj.opening = opening
+        return obj
 
 
 def score_stats(wins: int, draws: int, losses: int) -> Tuple[float, float]:
@@ -80,7 +99,8 @@ def _play_one(
     cfg,
     rng: np.random.Generator,
 ) -> str:
-    """对弈一盘，返回结果串 "1-0"/"0-1"/"1/2-1/2"（棋盘绝对视角）。"""
+    """对弈一盘，返回结果串 "1-0"/"0-1"/"1/2-1/2"（棋盘绝对视角）；返回值实为
+    ``_PlayResult``（str 子类），额外挂载 ``.opening`` 开局指纹（见该类文档）。"""
     board = Board(
         max_plies=int(cfg.selfplay.max_game_plies),
         no_capture_plies=int(cfg.selfplay.no_capture_draw_plies),
@@ -93,6 +113,7 @@ def _play_one(
     temp_moves = int(cfg.arena.arena_temp_moves)
     temperature = float(cfg.arena.arena_temperature)
     ply = 0
+    opening_moves: list[str] = []
 
     while board.result() is None:
         side = board.side_to_move
@@ -109,11 +130,14 @@ def _play_one(
             if not legal:
                 break
             move = legal[0]
+        if ply < OPENING_FINGERPRINT_PLIES:
+            opening_moves.append(move_to_uci(move))
         board.push(move)
         ply += 1
 
     res = board.result()
-    return res if res is not None else "1/2-1/2"
+    result = res if res is not None else "1/2-1/2"
+    return _PlayResult(result, tuple(opening_moves))
 
 
 def _split_games(red_games: int, black_games: int, n_chunks: int) -> list[tuple[int, int]]:
@@ -140,8 +164,9 @@ def _arena_worker_init(dev_queue) -> None:
     torch.set_num_threads(1)
 
 
-def _arena_chunk(task: dict) -> Dict[str, int]:
-    """子进程：加载两个 checkpoint，打一块对局，返回计数（与 arena 聚合语义一致）。"""
+def _arena_chunk(task: dict) -> Dict[str, object]:
+    """子进程：加载两个 checkpoint，打一块对局，返回计数 + 开局指纹列表
+    （``"openings"`` 键，与 arena 聚合语义一致）。"""
     dev = _WORKER_DEVICE or "cpu"
     new_model, _ = load_checkpoint(task["new_ckpt"], device=dev)
     best_model, _ = load_checkpoint(task["best_ckpt"], device=dev)
@@ -157,8 +182,10 @@ def _arena_chunk(task: dict) -> Dict[str, int]:
         "red_wins", "red_draws", "red_losses",
         "black_wins", "black_draws", "black_losses",
     )}
+    openings = []  # 每盘开局指纹（getattr 兜底空 tuple），主进程聚合去重
     for new_is_red in [True] * task["n_red"] + [False] * task["n_black"]:
         result = _play_one(new_eval, best_eval, new_is_red, cfg, rng)
+        openings.append(getattr(result, "opening", ()))
         color = "red" if new_is_red else "black"
         if result == "1/2-1/2":
             counts["draws"] += 1
@@ -169,6 +196,7 @@ def _arena_chunk(task: dict) -> Dict[str, int]:
         else:
             counts["losses"] += 1
             counts[f"{color}_losses"] += 1
+    counts["openings"] = openings
     return counts
 
 
@@ -219,10 +247,12 @@ def _arena_parallel(new_ckpt: str, best_ckpt: str, cfg, workers: int, dev: str) 
         "red_wins", "red_draws", "red_losses",
         "black_wins", "black_draws", "black_losses",
     )}
+    distinct_openings = set()  # 各 chunk 开局指纹求并集（跨进程去重口径与串行一致）
     with ctx.Pool(processes=workers, initializer=_arena_worker_init, initargs=(dev_queue,)) as pool:
         for counts in pool.imap_unordered(_arena_chunk, tasks):
             for k in agg:
                 agg[k] += counts[k]
+            distinct_openings.update(counts["openings"])
 
     def _score(w: int, d: int, n: int) -> float:
         return (w + 0.5 * d) / n if n > 0 else 0.0
@@ -235,6 +265,7 @@ def _arena_parallel(new_ckpt: str, best_ckpt: str, cfg, workers: int, dev: str) 
         "score_se": score_se,
         "red_score": _score(agg["red_wins"], agg["red_draws"], red_games),
         "black_score": _score(agg["black_wins"], agg["black_draws"], games - red_games),
+        "distinct_openings": len(distinct_openings),
     }
 
 
@@ -246,8 +277,10 @@ def arena(new_ckpt: str, best_ckpt: str, cfg, device: str) -> Dict[str, float]:
     dict，含键：
       games, wins, draws, losses,
       red_wins, red_draws, red_losses, black_wins, black_draws, black_losses,
-      score, score_se, red_score, black_score
-    （wins/draws/losses 均以"新模型"为视角；score_se 见 score_stats，供 LCB 门控用。）
+      score, score_se, red_score, black_score, distinct_openings
+    （wins/draws/losses 均以"新模型"为视角；score_se 见 score_stats，供 LCB 门控用；
+    distinct_openings 见 _PlayResult，各盘前 OPENING_FINGERPRINT_PLIES ply 走子指纹
+    去重计数，串/并行口径一致，供观测 arena 对局多样性/去相关程度。）
     """
     dev = _resolve_device(device, int(cfg.train.num_gpus))
 
@@ -271,10 +304,12 @@ def arena(new_ckpt: str, best_ckpt: str, cfg, device: str) -> Dict[str, float]:
     wins = draws = losses = 0
     red_w = red_d = red_l = 0
     black_w = black_d = black_l = 0
+    distinct_openings = set()  # 各盘开局指纹去重（DESIGN §9.4 对局多样性观测）
 
     for g in range(games):
         new_is_red = g < red_games
         result = _play_one(new_eval, best_eval, new_is_red, cfg, rng)
+        distinct_openings.add(getattr(result, "opening", ()))
 
         if result == "1/2-1/2":
             draws += 1
@@ -316,4 +351,5 @@ def arena(new_ckpt: str, best_ckpt: str, cfg, device: str) -> Dict[str, float]:
         "score_se": score_se,
         "red_score": _score(red_w, red_d, red_games),
         "black_score": _score(black_w, black_d, games - red_games),
+        "distinct_openings": len(distinct_openings),
     }

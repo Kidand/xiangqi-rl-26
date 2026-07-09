@@ -30,7 +30,7 @@ from rl.replay_buffer import ReplayBuffer
 from rl.train import _build_optimizer
 from xiangqi.constants import ACTION_SIZE
 
-from scripts.distill_bigmodel import onecycle_lr, train_distill
+from scripts.distill_bigmodel import _arena_config, onecycle_lr, train_distill
 
 
 _HISTORY = 2
@@ -58,6 +58,17 @@ def _make_buffer(n: int = 400, k: int = 6) -> ReplayBuffer:
         values[i] = np.float32(np.tanh(states[i].mean() * 4.0 - 2.0))
     buf.add_game(states, sparse, values)
     return buf
+
+
+def test_arena_config_matches_stage2_gate_strength():
+    """seed-best 用的 arena 段须与 cloud_stage2_15x192se.yaml 的训练门控同强度，
+    防止未来误改回 ArenaConfig 默认值（40 盘/200 sims/temp 0.5/8 步——对局高度
+    相关，score>=0.5 判据下覆盖 best.pt 约等于抛硬币）。"""
+    cfg = _arena_config("cpu", 1)
+    assert cfg.arena.arena_games == 160
+    assert cfg.arena.arena_sims == 400
+    assert cfg.arena.arena_temp_moves == 16
+    assert cfg.arena.arena_temperature == pytest.approx(0.8)
 
 
 def test_onecycle_lr_shape():

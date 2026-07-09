@@ -844,6 +844,7 @@ def run_training(cfg: Config, resume: bool = False) -> Dict[str, object]:
             )
             logger.info(
                 f"[iter {iteration} | arena] se {arena_stats['score_se']:.3f}"
+                f" | openings {arena_stats['distinct_openings']}/{arena_stats['games']}"
                 f"（gate_lcb_z={float(cfg.arena.gate_lcb_z):.2f}）"
             )
 
