@@ -1,8 +1,8 @@
 #!/bin/bash
-# 云端训练启动脚本（8×H100）
+# 云端训练启动脚本（多 GPU）
 # 在 tmux 会话内运行，支持传递额外参数如 --resume --config
 # 用法：
-#   bash scripts/train_cloud.sh                    # 默认 cloud_8xh100.yaml
+#   bash scripts/train_cloud.sh                    # 默认 cloud.yaml
 #   bash scripts/train_cloud.sh --resume           # 续训
 #   bash scripts/train_cloud.sh --config configs/custom.yaml
 #   bash scripts/train_cloud.sh --config configs/custom.yaml --resume
@@ -29,7 +29,7 @@ done
 
 # 如果用户没有指定 config，使用默认的
 if [ "$has_config" = false ]; then
-    cmd_array+=("--config" "configs/cloud_8xh100.yaml")
+    cmd_array+=("--config" "configs/cloud.yaml")
 fi
 
 # 追加用户传递的所有参数

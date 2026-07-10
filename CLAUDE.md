@@ -21,7 +21,7 @@ AlphaZero 式中国象棋强化学习系统：纯自我博弈训练（无人类�
 # 端到端冒烟（CPU 完整流水线：自博弈→训练→arena→记录/CSV 校验，~30s，改动 rl/ 后必跑）
 .venv/Scripts/python.exe scripts/smoke_test.py
 
-# 训练（云端 8×H100 用 cloud_8xh100.yaml；--resume 续训）
+# 训练（云端多 GPU 用 cloud.yaml；--resume 续训）
 python -m rl.train --config configs/smoke.yaml
 
 # GUI（浏览器开 http://127.0.0.1:8000；hvh 与复盘不需要模型）

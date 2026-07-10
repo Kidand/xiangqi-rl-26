@@ -3,7 +3,7 @@
 
 入口::
 
-    python -m rl.train --config configs/cloud_8xh100.yaml [--resume]
+    python -m rl.train --config configs/cloud.yaml [--resume]
 
 每迭代：
   1. Self-play（推理服务架构，DESIGN §9）：主进程创建共享内存与队列 → spawn
@@ -588,7 +588,7 @@ def _train_phase(
 class _BufferSaver:
     """把 ``buffer.save`` 从主循环挪到后台线程，与下一迭代 selfplay/train/arena 重叠。
 
-    背景：configs/cloud_8xh100 下 ``buffer.save`` 压缩 ~1.5M 样本 npz 约 100-150s，同步
+    背景：configs/cloud 下 ``buffer.save`` 压缩 ~1.5M 样本 npz 约 100-150s，同步
     执行期间整机空转（selfplay/train/arena 都已结束、下一迭代未开始）。本类把压缩落盘
     放进后台线程与下一迭代真正并行——``np.savez_compressed`` 的 zlib 在 C 层释放 GIL、
     训练主循环是 GPU-bound（torch 算子亦释放 GIL），故是真并行而非 GIL 假并行。
@@ -597,7 +597,7 @@ class _BufferSaver:
       - "snapshot"（默认，推荐）：主线程取一致性快照（``ReplayBuffer.snapshot``：
         states/values 实体拷贝、稀疏 π 两 list 浅拷贝、冻结 size/pos），后台线程压缩快照。
         save 可跨入下一迭代 selfplay 完全隐藏，仅暴露 ~2-5s 的实体拷贝；RAM 峰值约
-        +4.2GB（满 buffer states 一份）。8×H100 机器 RAM 通常 TB 级，可忽略。
+        +4.2GB（满 buffer states 一份）。多 GPU 服务器 RAM 通常 TB 级，可忽略。
       - "freeze_window"：不拷贝，直接对「只读窗口」内的活 buffer 起线程（该窗口从
         selfplay 结束到下一迭代 selfplay 首个 add_game 之间 buffer 只读），在下一迭代
         selfplay 改写 buffer 前无条件 join。零额外 RAM，但只把 save 藏进 train+arena，

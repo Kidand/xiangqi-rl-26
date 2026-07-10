@@ -1,7 +1,7 @@
 """训练配置体系（契约，见 DESIGN.md §7–§11）。YAML 预设位于 configs/。
 
 用法:
-    cfg = Config.from_yaml("configs/cloud_8xh100.yaml")
+    cfg = Config.from_yaml("configs/cloud.yaml")
     cfg = Config()  # 全默认
 YAML 顶层键与各子配置字段同名，未出现的字段用默认值；未知键报错（防拼写错误静默失效）。
 """

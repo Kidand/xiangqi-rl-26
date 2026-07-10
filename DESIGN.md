@@ -6,7 +6,7 @@
 ## 1. 总览
 
 - **目标**：无人类数据，纯自我博弈（AlphaZero 范式）训练中国象棋模型。
-- **训练环境**：云端 8×H100，CUDA 12.8，项目路径 `/home/jovyan/LLM/yanjz/projects/xiangqi-rl-26`。
+- **训练环境**：云端多 GPU 服务器，CUDA 12.8，项目根目录（下文以 `~/xiangqi-rl-26` 代指）。
 - **推理环境**：Windows / macOS 笔记本（CPU 或核显），模型导出 TorchScript + ONNX。
 - **界面**：本地 Web GUI（FastAPI + 原生 JS 单页），人机对战 / 观战 / 复盘 / FEN 导入导出。
 - **对局记录**：Xiangqi FEN + UCCI 着法列表（JSONL），自我博弈与 GUI 对战共用同一格式，GUI 可加载回放。
@@ -17,7 +17,7 @@
 xiangqi-rl-26/
 ├── DESIGN.md                  # 本文档
 ├── pyproject.toml
-├── configs/                   # YAML 训练预设: smoke.yaml / laptop.yaml / cloud_8xh100.yaml
+├── configs/                   # YAML 训练预设: smoke.yaml / laptop.yaml / cloud.yaml
 ├── xiangqi/                   # 纯 Python 规则引擎（零 torch 依赖）
 │   ├── __init__.py            # 导出 Board, Move 等公共 API
 │   ├── constants.py           # [已定稿] 坐标/棋子/动作编码
@@ -41,7 +41,7 @@ xiangqi-rl-26/
 ├── scripts/
 │   ├── setup_env.sh           # 云端 uv 环境（CUDA 12.8）
 │   ├── setup_env_local.ps1    # 本地 Windows CPU 环境
-│   ├── train_cloud.sh         # 8×H100 训练启动（tmux 内）
+│   ├── train_cloud.sh         # 多 GPU 训练启动（tmux 内）
 │   ├── smoke_test.py          # 端到端冒烟：tiny 模型自我博弈→训练→arena（CPU 可跑）
 │   ├── bench_engine.py        # 引擎性能基准（movegen/s, perft）
 │   └── export_model.py        # checkpoint → TorchScript / ONNX
@@ -332,15 +332,15 @@ Base: `http://127.0.0.1:8000`。静态页面挂 `/`。所有响应 JSON；错误
 - `test_records.py`：记录写→读→重演到终局 FEN 一致。
 - `scripts/smoke_test.py`：small 模型 CPU 端到端（4 盘 selfplay → 50 步训练 → 4 盘 arena），< 5 分钟，退出码 0 即通过。
 
-## 16. 云端部署（8×H100, CUDA 12.8）
+## 16. 云端部署（多 GPU, CUDA 12.8）
 
 ```bash
-cd /home/jovyan/LLM/yanjz/projects/xiangqi-rl-26
+cd ~/xiangqi-rl-26
 bash scripts/setup_env.sh          # uv venv + torch cu128 + 依赖
 source .venv/bin/activate
 tmux new -s xiangqi
-python -m rl.train --config configs/cloud_8xh100.yaml   # 或 bash scripts/train_cloud.sh
+python -m rl.train --config configs/cloud.yaml   # 或 bash scripts/train_cloud.sh
 # 观察: tail -f logs/train.log ; tensorboard --logdir logs/tb
 ```
-中断续训：`python -m rl.train --config configs/cloud_8xh100.yaml --resume`。
+中断续训：`python -m rl.train --config configs/cloud.yaml --resume`。
 训好后：`python scripts/export_model.py ckpts/best.pt --onnx --torchscript`，把 `best.pt`/`best.onnx` 拷回笔记本，GUI 加载即可。

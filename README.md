@@ -1,6 +1,6 @@
 # 中国象棋 AlphaZero 式强化学习系统
 
-纯自我博弈、无人类数据、端到端可复现的中国象棋 AlphaZero 实现。云端 8×H100 训练，笔记本 CPU/核显推理与 Web GUI 对战。
+纯自我博弈、无人类数据、端到端可复现的中国象棋 AlphaZero 实现。云端多 GPU 训练，笔记本 CPU/核显推理与 Web GUI 对战。
 
 ## 特性
 
@@ -21,7 +21,7 @@ xiangqi-rl-26/
 ├── configs/                   # YAML 训练预设
 │   ├── smoke.yaml            # CPU 冒烟（2-3 分钟）
 │   ├── laptop.yaml           # 笔记本 CPU（迭代耗时 10-30 min）
-│   └── cloud_8xh100.yaml     # 云端正式（迭代耗时 30-60 min）
+│   └── cloud.yaml            # 云端正式（迭代耗时 30-60 min）
 ├── xiangqi/                   # 规则引擎（零 torch 依赖）
 │   ├── board.py              # 局面、走子、终局判定
 │   ├── fen.py                # FEN 解析、UCCI 着法
@@ -157,20 +157,20 @@ h2e2 h9g7 e2e9
 
 ## 云端训练全流程
 
-### 云端环境（/home/jovyan/LLM/yanjz/projects/xiangqi-rl-26）
+### 云端环境（项目根目录，下文以 `~/xiangqi-rl-26` 代指）
 
 #### 初次配置
 
 ```bash
 # 1. 克隆或进入项目目录
-cd /home/jovyan/LLM/yanjz/projects/xiangqi-rl-26
+cd ~/xiangqi-rl-26
 
 # 2. 运行环境配置脚本（首次或重新配置时）
 bash scripts/setup_env.sh
 # 脚本会：
 #   - 检查/安装 uv
-#   - 创建虚拨虚拟环境（Python 3.11）
-#   - 安装 PyTorch CUDA 12.8（支持 H100）
+#   - 创建虚拟环境（Python 3.11）
+#   - 安装 PyTorch CUDA 12.8（支持现代 GPU）
 #   - 安装其他依赖（numpy, pyyaml, fastapi, tensorboard 等）
 #   - 验证环境（CUDA 可用性、GPU 数量）
 ```
@@ -182,16 +182,16 @@ bash scripts/setup_env.sh
 tmux new-session -s xiangqi
 
 # 4. 在 tmux 中启动训练
-cd /home/jovyan/LLM/yanjz/projects/xiangqi-rl-26
+cd ~/xiangqi-rl-26
 bash scripts/train_cloud.sh
 # 或自定义配置：
 # bash scripts/train_cloud.sh --config configs/custom.yaml
 
 # 5. 在另一个终端观察日志
-tail -f /home/jovyan/LLM/yanjz/projects/xiangqi-rl-26/logs/train.log
+tail -f ~/xiangqi-rl-26/logs/train.log
 
 # 6. TensorBoard 实时监控（可选，在有图形界面的环境）
-tensorboard --logdir /home/jovyan/LLM/yanjz/projects/xiangqi-rl-26/logs/tb --port 6006
+tensorboard --logdir ~/xiangqi-rl-26/logs/tb --port 6006
 ```
 
 #### 续训（中断恢复）
@@ -251,7 +251,7 @@ scp -r /path/to/remote/ckpts/best.onnx ~/xiangqi-rl-26/ckpts/
 |------|------|---------|------|------|
 | **smoke.yaml** | CPU 端到端验证 | 2-3 分钟 | 极弱 | 代码检查、ci/cd |
 | **laptop.yaml** | 本地试训（收敛趋势） | 10-30 min/iter | 弱（但可看趋势） | 参数调试、本地开发 |
-| **cloud_8xh100.yaml** | 云端正式 | 30-60 min/iter | 强（与强 AI 竞争级别） | 实际训练 |
+| **cloud.yaml** | 云端正式 | 30-60 min/iter | 强（与强 AI 竞争级别） | 实际训练 |
 
 #### smoke.yaml（冒烟测试）
 
@@ -275,7 +275,7 @@ train: {device: cpu, batch_size: 256, total_iterations: 50}
 
 用途：本地调参、观察收敛趋势、学习过程。预期棋力有限（不与云端模型对齐），但可看网络学习的曲线。
 
-#### cloud_8xh100.yaml（云端正式）
+#### cloud.yaml（云端正式）
 
 ```yaml
 model: {blocks: 10, filters: 128}        # 10 个残差块，128 通道，~7M 参数
@@ -293,7 +293,7 @@ train:
   total_iterations: 300                  # 300 个迭代
 ```
 
-用途：正式训练，充分利用 8×H100 算力，预期达到竞争级棋力。
+用途：正式训练，充分利用多 GPU 算力，预期达到竞争级棋力。
 
 ### 关键超参调整指南
 

@@ -13,7 +13,7 @@
 
     # 加 checkpoint 天梯（多进程吃满全部 GPU 实打对局；衡量 Elo 增益斜率）
     python scripts/analyze_training.py --ladder --ladder-games 200 --ladder-sims 400 \
-        --config configs/cloud_8xh100.yaml
+        --config configs/cloud.yaml
 
     # 全量 + 存文件
     python scripts/analyze_training.py --records --ladder --out report.md
@@ -464,7 +464,7 @@ def main(argv=None) -> int:
     ap.add_argument("--ladder-workers", type=int, default=0,
                     help="并行 worker 进程数；0=自动（GPU 数×6，受 CPU 核数约束）")
     ap.add_argument("--config", default=None,
-                    help="训练 yaml（如 configs/cloud_8xh100.yaml），使天梯的 c_puct/draw_penalty 等与训练一致")
+                    help="训练 yaml（如 configs/cloud.yaml），使天梯的 c_puct/draw_penalty 等与训练一致")
     ap.add_argument("--device", default="auto", help="ladder 推理设备 auto/cuda/cpu")
     ap.add_argument("--out", default=None, help="同时写入文件")
     args = ap.parse_args(argv)

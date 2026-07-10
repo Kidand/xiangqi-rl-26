@@ -1,5 +1,5 @@
 #!/bin/bash
-# 云端 Linux 环境配置脚本（CUDA 12.8，8×H100）
+# 云端 Linux 环境配置脚本（CUDA 12.8，多 GPU）
 # 幂等性：可重复运行，已存在的组件跳过
 # 用法：bash scripts/setup_env.sh
 
@@ -82,5 +82,5 @@ echo "=== 配置完成 ==="
 echo "后续使用（云端 tmux 中）:"
 echo "  cd $PROJECT_DIR"
 echo "  source .venv/bin/activate"
-echo "  python -m rl.train --config configs/cloud_8xh100.yaml"
+echo "  python -m rl.train --config configs/cloud.yaml"
 echo ""

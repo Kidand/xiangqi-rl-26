@@ -131,8 +131,8 @@ class ReplayBuffer:
             与环形顺序，必须一并冻结。
 
         RAM 峰值：快照对整块 ``_states`` 做实体拷贝，体量≈活 buffer 的 states
-        （configs/cloud_8xh100 满 buffer ~1.5M×2790B≈4.2GB）。故后台保存期间系统 RAM
-        峰值 ≈ 活 buffer states + 一份快照 states（约 +4.2GB）；8×H100 机器 RAM 通常 TB
+        （configs/cloud 满 buffer ~1.5M×2790B≈4.2GB）。故后台保存期间系统 RAM
+        峰值 ≈ 活 buffer states + 一份快照 states（约 +4.2GB）；多 GPU 服务器 RAM 通常 TB
         级，可忽略。RAM 紧张时改用 rl/train.py `_BufferSaver` 的 "freeze_window" 降级模式
         （零额外 RAM、部分隐藏）。
         """
