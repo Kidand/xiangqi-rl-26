@@ -1,6 +1,15 @@
-# 云端多 GPU 迁移专用预设：大模型 15×192+SE（阶段三 → 大网续训，resume 点 iter 1000）
+# 云端多 GPU 大模型预设：15×192+SE（阶段三迁移 + 阶段四续训）
 # ---------------------------------------------------------------------------
-# 迁移 runbook（严格按序；阶段二已跑完 iter 600-999，末 20 迭代 1000-sims buffer 已灌满）：
+# 【阶段四续训 iter 1500-1999，2026-07-16 大网诊断后设定】迁移(下方 runbook)已完成，
+# 大网训到 iter 1499 仍在快速变强（末 100 迭代 43 次晋升、arena 0.537、entropy 仍在降）。
+# 直接续训即可，无需再走迁移步骤：
+#     git pull && bash scripts/train_cloud.sh --config configs/cloud_stage2_15x192se.yaml --resume
+# 本轮两处调整（见 mcts / train 段）：
+#   - policy_target_temp 0.75→0.85：开局 top1 先验已 90%>75% 触发护栏（value 头偏好
+#     炮八平五、policy 却 90% 押炮二平五，锐化略过冲），软化目标让先验回到 value 认可区间。
+#   - total_iterations 1500→2000：不改则 resume@1500 progress=1.0、LR 钉死地板 1e-4。
+# ---------------------------------------------------------------------------
+# 迁移 runbook【历史记录，已执行完毕，续训无需重跑】：
 #   ⓪ 【先快照 buffer——易腐资产】600-sims 新自博弈约 3.4 迭代就冲掉半窗高质量 π：
 #        cp -r ckpts/buffer ckpts/buffer_distill_snapshot
 #      蒸馏读快照目录，主训练是否继续互不干扰。
@@ -39,12 +48,12 @@ mcts:
   temp_moves: 32
   temp_final: 0.15
   batch_size: 96
-  # π 训练目标锐化（DESIGN §8）。阶段二实证：熵 2.54→1.05 且减速收敛（未失控），
-  # temp 0.75 保持不动。prune 0.03→0.02 是大网阶段的保险：大网拟合锐目标更彻底，
-  # 函数逼近的"平均化刹车"变弱，放宽支撑集下限防过度收窄（可逆、代价小）。
-  # 【触发线】若 policy entropy < 0.85 nats 或开局 top1 先验 > 75%：
-  # 把 policy_target_temp 回调至 0.85——熵地板跌破小网水平即为过冲信号。
-  policy_target_temp: 0.75
+  # π 训练目标锐化（DESIGN §8）。阶段三实证：大网把熵地板从小网 1.05 捅穿到 ~1.0
+  # （min 0.859，逼近 0.85 触发线）；开局 top1 先验冲到 90%（>75% 触发线），且 value 头
+  # 已偏好炮八平五而 policy 仍 90% 押炮二平五 = 锐化过冲信号。→ 阶段四 temp 0.75→0.85，
+  # 软化目标、让 value 认可的着法拿回先验权重，防开局塌向 one-hot。prune 保持 0.02。
+  # 【下一档触发线】若续训后 entropy 仍 < 0.80 或开局 top1 > 90%：再回调 temp 至 0.95。
+  policy_target_temp: 0.85
   policy_target_prune_frac: 0.02
   # 收尾高 sims 调度默认关；到大网自身收尾阶段（如二次蒸馏前）再按需设
   # num_sims_late: 1000、num_sims_late_start_iter: 当前迭代+1。
@@ -73,16 +82,17 @@ train:
   sample_reuse: 3.0
   buffer_window: 1500000
   min_buffer_to_train: 100000
-  # ── 迁移续训 LR（resume 点 = iter 1000，蒸馏产出 iter_1000.pt 后 start_iter=1001）──
+  # ── LR 计划 ────────────────────────────────────────────────────────────
   # 有效 LR 手算（余弦，rl/train.py _cosine_lr，progress = iteration / total_iterations）：
-  #   progress = 1000/1500 ≈ 0.667，cos(2π/3) = -0.5
-  #   eff_lr = 1e-4 + 0.5·(6e-4 - 1e-4)·(1 - 0.5) = 2.25e-4（起步实际 1001/1500 → 2.245e-4）
-  # 沿余弦退回 1e-4@1500。6e-4 只是曲线参数，大网全程最高只见 ~2.25e-4——
-  # 介于两次历史成功暖重启（3.0e-4 / 2.0e-4）之间，对刚蒸馏未经 RL 的大网合理。
-  # 若蒸馏产出迭代号不同，用同一公式手算 progress。
+  #   阶段三迁移 resume@1000：progress 0.667 → eff LR 2.25e-4（已跑完，退回 1e-4@1500）。
+  #   阶段四续训 resume@1500（start_iter=1500，total 抬到 2000）：
+  #     progress = 1500/2000 = 0.75，cos(0.75π) = -0.7071
+  #     eff_lr = 1e-4 + 0.5·(6e-4-1e-4)·(1-0.7071) = 1e-4 + 2.5e-4·0.2929 ≈ 1.73e-4
+  #   沿余弦退回 1e-4@2000。这是从地板起的温和暖重启（大网在 1e-4 仍快速改进，
+  #   小幅抬到 1.73e-4 加速而不扰动）；lr=6e-4 只是曲线参数，实际最高只见 ~1.73e-4。
   lr: 0.0006
   lr_min: 0.0001
-  total_iterations: 1500
+  total_iterations: 2000
   amp: true
 # ── arena 去相关（阶段二末段实证：策略锐化后对局高度相关，160 盘 N_eff 仅 ~2-6，
 # score_se 的独立性假设被破坏 → LCB 形同虚设，出现 0.99/0.02 双峰分数）──────────
