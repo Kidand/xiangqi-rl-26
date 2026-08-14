@@ -157,6 +157,34 @@ h2e2 h9g7 e2e9
 
 ## 云端训练全流程
 
+> **当前进度**：已完成六个训练阶段、约 400 万盘自博弈（小网 10×128 三阶段 → 蒸馏迁移
+> 大网 15×192+SE → 大网续训）。**当前生效配置为 `configs/cloud_stage6.yaml`**（PUCT +
+> 1000 sims，从阶段三峰值 iter_1498 续训）；各阶段的配置与决策依据记录在对应 yaml
+> 文件头注释与 git log 中。
+
+### 阶段六续训（当前完整命令）
+
+```bash
+cd ~/xiangqi-rl-26 && git pull
+
+# ① 备份阶段五 best，把起点恢复到阶段三峰值（iter_1498，即本地存档 best0716）
+cp ckpts/best.pt ckpts/best_stage5_final.pt
+cp ckpts/iter_1498.pt ckpts/best.pt
+mkdir -p ckpts/stage5_archive && mv ckpts/iter_1[5-7][0-9][0-9].pt ckpts/stage5_archive/
+ls ckpts/iter_149*.pt        # 确认 iter_1498.pt / iter_1499.pt 还在
+
+# ② 续训（tmux 内；启动后确认日志 start_iter=1500、lr≈1.73e-4）
+tmux new -s xiangqi          # 已有会话则 tmux attach -t xiangqi
+bash scripts/train_cloud.sh --config configs/cloud_stage6.yaml --resume
+
+# ③ 另开终端观察
+tail -f logs/train.log
+```
+
+观测口径：selfplay 约 650s/迭代（1000 sims，较 600 增 ~65%）；前 ~7 迭代为旧 buffer
+混合期，成效看 15 迭代之后——policy_loss/entropy 应脱离 ~0.99 地板继续下行、晋升回到
+15+/百迭代、arena 均值 > 0.52；30~40 迭代无起色即停下复盘（详见 cloud_stage6.yaml 头部）。
+
 ### 云端环境（项目根目录，下文以 `~/xiangqi-rl-26` 代指）
 
 #### 初次配置
@@ -245,13 +273,15 @@ scp -r /path/to/remote/ckpts/best.onnx ~/xiangqi-rl-26/ckpts/
 
 ## 配置说明
 
-### 三个预设对比
+### 预设对比
 
-| 预设 | 场景 | 迭代耗时 | 棋力 | 适用 |
-|------|------|---------|------|------|
-| **smoke.yaml** | CPU 端到端验证 | 2-3 分钟 | 极弱 | 代码检查、ci/cd |
-| **laptop.yaml** | 本地试训（收敛趋势） | 10-30 min/iter | 弱（但可看趋势） | 参数调试、本地开发 |
-| **cloud.yaml** | 云端正式 | 30-60 min/iter | 强（与强 AI 竞争级别） | 实际训练 |
+| 预设 | 场景 | 迭代耗时 | 适用 |
+|------|------|---------|------|
+| **smoke.yaml** | CPU 端到端验证 | 2-3 分钟 | 代码检查、ci/cd |
+| **smoke_gumbel.yaml** | CPU 验证 Gumbel 训练搜索流水线 | 2-3 分钟 | 代码检查（DESIGN §8） |
+| **laptop.yaml** | 本地试训（收敛趋势） | 10-30 min/iter | 参数调试、本地开发 |
+| **cloud.yaml** | 云端正式·初代小网（10×128≈3.2M） | ~6 min/iter | 阶段一~二历史配置 |
+| **cloud_stage6.yaml** | 云端正式·大网（15×192+SE≈10.5M）**当前生效** | ~11 min/iter | 实际训练 |
 
 #### smoke.yaml（冒烟测试）
 
@@ -275,25 +305,24 @@ train: {device: cpu, batch_size: 256, total_iterations: 50}
 
 用途：本地调参、观察收敛趋势、学习过程。预期棋力有限（不与云端模型对齐），但可看网络学习的曲线。
 
-#### cloud.yaml（云端正式）
+#### cloud.yaml（云端正式·初代小网）与 cloud_stage6.yaml（当前生效·大网）
 
 ```yaml
-model: {blocks: 10, filters: 128}        # 10 个残差块，128 通道，~7M 参数
-mcts: {num_sims: 600}                    # 大量模拟（覆盖更多变化）
-selfplay:
-  games_per_iteration: 2000              # 2000 盘对局
-  num_workers: 0                         # 0 = 自动 max(8, cpu_count - num_gpus - 4)
-  eval_max_batch: 2048                   # EvalServer 单次前向 batch 上限
-  eval_wait_ms: 2.0                      # 聚合请求的等待窗口（毫秒）
-  eval_fp16: true                        # cuda 上 bf16 autocast 推理
-train:
-  device: cuda
-  num_gpus: 8                            # 分布式（DDP 或 DataParallel）
-  batch_size: 4096                       # 大 batch
-  total_iterations: 300                  # 300 个迭代
+# cloud.yaml —— 小网阶段（阶段一~二）
+model: {blocks: 10, filters: 128}        # ≈3.2M 参数
+mcts: {num_sims: 600, policy_target_temp: 0.75, policy_target_prune_frac: 0.03}
+selfplay: {games_per_iteration: 2000, num_workers: 0, root_value_weight: 0.3}
+arena: {arena_games: 160, arena_sims: 400, gate_lcb_z: 1.0, arena_temperature: 0.8}
+
+# cloud_stage6.yaml —— 大网续训（当前生效）
+model: {blocks: 15, filters: 192, se: true}   # ≈10.5M 参数（蒸馏迁移而来）
+mcts: {num_sims: 1000, algorithm: puct}       # 阶段六核心杠杆：600→1000 sims
 ```
 
-用途：正式训练，充分利用多 GPU 算力，预期达到竞争级棋力。
+演进过程中沉淀的训练杠杆（均有 yaml 注释与 DESIGN 契约）：π 目标锐化（temp 0.75 是
+实证承重值，0.85 会崩盘）、z 混根价值去噪、arena LCB 门控 + 对局去相关、num_sims 按迭代
+调度、大模型蒸馏迁移工具链（`scripts/distill_bigmodel.py`）、Gumbel 训练搜索（已实现，
+离线质量门未过，默认关闭，档案见 `configs/cloud_stage6_gumbel.yaml`）。
 
 ### 关键超参调整指南
 

@@ -1,0 +1,73 @@
+# 云端多 GPU·阶段六【当前生效配置】：PUCT + num_sims 1000 续训
+# （15×192+SE，从阶段三峰值 best0716 = iter_1498 重启；取代 cloud_stage2_15x192se.yaml）
+# ---------------------------------------------------------------------------
+# 【决策依据，2026-07-29 离线扫描裁决】阶段五末平台期签名 KL≈0（visit 目标已学到头），
+# 两条候选路线同台对比（12 真实局面 × 7 臂，指标=PUCT-2400 深搜一致率/熵/KL/跨种子 TV）：
+#   - Gumbel completed-Q 目标（5 个参数点，m∈{4,8,16}×c_scale∈{0.15~1.0}×sims∈{600,1000}）：
+#     最优点一致率 79%、TV 0.287——SH 摊薄后每候选 Q 信噪比不足，目标骑在噪声上。
+#     无一通过判据。实现保留在库（mcts.algorithm，默认 puct），红灯档案见
+#     cloud_stage6_gumbel.yaml 头部。
+#   - PUCT+1000 sims：目标比 600 更锐（熵 0.745<0.806）、更稳（TV 0.084<0.091）、
+#     一致率 100%——以 +65% selfplay 墙钟换更高质量目标。← 本配置。
+#
+# 云端 runbook（按序；起点 = 阶段三峰值 iter_1498，本地存档名 best0716.pt）：
+#   ① 备份阶段五 best，恢复 best 与 checkpoint 起点：
+#        cp ckpts/best.pt ckpts/best_stage5_final.pt
+#        cp ckpts/iter_1498.pt ckpts/best.pt
+#        mkdir -p ckpts/stage5_archive && mv ckpts/iter_1[5-7][0-9][0-9].pt ckpts/stage5_archive/
+#        ls ckpts/iter_149*.pt      # 确认 iter_1498.pt / iter_1499.pt 还在
+#   ② 续训：
+#        git pull && bash scripts/train_cloud.sh --config configs/cloud_stage6.yaml --resume
+#      预期日志：start_iter=1500、lr≈1.73e-4。
+#   ③ 观测口径：
+#      - selfplay_sec 预估 ~650s/iter（1000 sims，较 600 增 ~65%），500 迭代约 4 天。
+#      - buffer 前 ~7 迭代仍是阶段五 600-sims 数据（混合期），判断成效看 15 迭代之后。
+#      - 成效标志：policy_loss/entropy 脱离 ~0.99 地板继续下行、晋升回到 15+/百迭代、
+#        arena 均值 > 0.52。30~40 迭代无起色 → 停下复盘（这已是该架构最后一根常规杠杆，
+#        再往后是更大网或 Gumbel 研究线）。
+#      - metrics.csv 会再次出现 iter 1500+ 重复段（追加写），分析时按文件位置切段。
+# ---------------------------------------------------------------------------
+model: {blocks: 15, filters: 192, se: true, history_steps: 2}
+mcts:
+  # 阶段六核心杠杆：600 → 1000。扫描实证 1000-sims 锐化目标更锐且更稳（见文件头）。
+  num_sims: 1000
+  c_puct: 1.8
+  dirichlet_alpha: 0.2
+  temp_moves: 32
+  temp_final: 0.15
+  batch_size: 96
+  algorithm: puct           # gumbel 未过质量门（红灯档案见 cloud_stage6_gumbel.yaml）
+  # π 锐化维持阶段五实证值：0.75 是承重结构（阶段四 0.85 崩盘教训），prune 0.02。
+  policy_target_temp: 0.75
+  policy_target_prune_frac: 0.02
+  num_sims_late: 0
+  num_sims_late_start_iter: 0
+selfplay:
+  games_per_iteration: 2000
+  num_workers: 0
+  games_per_worker: 16
+  eval_max_batch: 4096
+  eval_wait_ms: 2.0
+  eval_fp16: true
+  max_game_plies: 400
+  value_blend_init: 0.5
+  value_blend_iters: 30
+  draw_penalty: -0.2
+  resign_start_iter: 10
+  root_value_weight: 0.3
+train:
+  device: cuda
+  num_gpus: 8
+  batch_size: 4096
+  train_steps_per_iteration: 0
+  sample_reuse: 3.0
+  buffer_window: 1500000
+  min_buffer_to_train: 100000
+  # resume@1500：progress=0.75，cos(0.75π)=-0.7071 → eff_lr≈1.73e-4，余弦退回 1e-4@2000。
+  lr: 0.0006
+  lr_min: 0.0001
+  total_iterations: 2000
+  amp: true
+arena: {arena_games: 160, arena_sims: 400, gate_threshold: 0.55, gate_lcb_z: 1.0,
+        arena_temp_moves: 16, arena_temperature: 0.8, arena_workers: 0}
+log: {log_interval_sec: 30.0, log_dir: logs, records_dir: records, train_log_interval: 100, tensorboard: true}
