@@ -1,0 +1,82 @@
+# 云端多 GPU·阶段六：Gumbel AlphaZero 续训（15×192+SE,从阶段三峰值 best0716 = iter_1498 重启)
+# ---------------------------------------------------------------------------
+# ⚠️⚠️ 本配置的 gumbel 参数【未通过离线目标质量验证,暂勿上云】(2026-07-29 对抗验证红灯):
+#   c_scale=1.0 在 600 sims/m=16 下 σ 乘子≈200,completed-Q 目标退化为"骑在噪声上的
+#   near-one-hot"(同局面换 Gumbel 种子 → one-hot 到不同着法,跨种子 TV≈0.5-0.67;
+#   与 PUCT-3200 基准的 argmax 一致率仅 25%)。根因:SH 摊薄后每决赛候选仅 ~150 sims,
+#   Q 的信噪比撑不起 ×200 的放大。(m, c_scale, num_sims) 网格扫描进行中,
+#   结论落地后本横幅移除、参数更新;若无操作点则阶段六改走 PUCT+num_sims 1000 后备方案。
+# ---------------------------------------------------------------------------
+# 【为什么换 Gumbel】阶段五(temp 0.75 回滚)确认修复了阶段四,但收敛于新平台:
+#   ploss≈entropy≈0.987(KL≈0 = 网络已把 visit 目标学到头)、晋升 4 次/百迭代。
+#   继续进步只能靠**更好的目标**:Gumbel(Danihelka et al. 2022)用 completed-Q 目标
+#   (信息量严格更大、低预算下有策略改进保证)替代 visit 计数目标,并整体移除
+#   π 锐化温度旋钮(阶段四实证的双稳态隐患)与 Dirichlet/温度采样。规范见 DESIGN §8。
+#
+# 云端 runbook(按序;起点 = 阶段三峰值 iter_1498,即本地 best0716):
+#   ① 备份阶段五 best,恢复 best 与 checkpoint 起点:
+#        cp ckpts/best.pt ckpts/best_stage5_iter1727.pt
+#        cp ckpts/iter_1498.pt ckpts/best.pt
+#        mkdir -p ckpts/stage5_archive && mv ckpts/iter_1[5-7][0-9][0-9].pt ckpts/stage5_archive/
+#        ls ckpts/iter_149*.pt      # 确认 iter_1498.pt / iter_1499.pt 还在
+#   ② 续训:
+#        git pull && bash scripts/train_cloud.sh --config configs/cloud_stage6_gumbel.yaml --resume
+#      预期日志:start_iter=1500、lr≈1.73e-4。
+#   ③ 预期与观测口径:
+#      - policy_loss/entropy 在边界处会**跳变**——completed-Q 目标与 visit 目标的熵尺度
+#        不同,跳变本身不是问题;看趋势(应在 20~30 迭代内重新单调下行)。
+#      - buffer 前 ~8 迭代仍是阶段五的 visit 目标数据(混合期),判断成效看 20 迭代之后。
+#      - 成效标志:晋升频率回到 15+/百迭代、arena 均值 > 0.52、开局 top1 先验维持高位。
+#      - 30~40 迭代后仍无起色 → 停下复盘,不要闷头烧卡(该实验假设是可证伪的)。
+#      - 照旧盯:openings X/160(去相关)、evals/s、红黑胜率口径。
+# ---------------------------------------------------------------------------
+model: {blocks: 15, filters: 192, se: true, history_steps: 2}
+mcts:
+  num_sims: 600
+  c_puct: 1.8               # 非根节点仍走 PUCT(工程简化,见 DESIGN §8)
+  dirichlet_alpha: 0.2      # gumbel 模式下根节点不使用(仅 PUCT 回退路径生效)
+  temp_moves: 32            # 同上:gumbel 模式下不使用(Gumbel 噪声即探索源)
+  temp_final: 0.15
+  batch_size: 96
+  # ── Gumbel 训练搜索(DESIGN §8)──────────────────────────────────────────
+  algorithm: gumbel
+  gumbel_m: 16              # 600 sims/4 phases: 16×9+8×18+4×37+2×75=586≤600
+  gumbel_c_visit: 50.0
+  gumbel_c_scale: 1.0
+  # π 锐化在 gumbel 模式下不适用,显式置中性值防误读:
+  policy_target_temp: 1.0
+  policy_target_prune_frac: 0.0
+  num_sims_late: 0
+  num_sims_late_start_iter: 0
+selfplay:
+  games_per_iteration: 2000
+  num_workers: 0
+  games_per_worker: 16
+  eval_max_batch: 4096
+  eval_wait_ms: 2.0
+  eval_fp16: true
+  max_game_plies: 400
+  value_blend_init: 0.5
+  value_blend_iters: 30
+  draw_penalty: -0.2
+  resign_start_iter: 10
+  root_value_weight: 0.3    # z 混根价值照旧(与目标构造方式无关)
+train:
+  device: cuda
+  num_gpus: 8
+  batch_size: 4096
+  train_steps_per_iteration: 0
+  sample_reuse: 3.0
+  buffer_window: 1500000
+  min_buffer_to_train: 100000
+  # resume@1500(加载 iter_1499 后 start_iter=1500):
+  #   progress = 1500/2000 = 0.75,cos(0.75π) = -0.7071
+  #   eff_lr = 1e-4 + 0.5·(6e-4-1e-4)·(1-0.7071) ≈ 1.73e-4,余弦退回 1e-4@2000。
+  lr: 0.0006
+  lr_min: 0.0001
+  total_iterations: 2000
+  amp: true
+# arena 保持 PUCT + 去相关(与前几阶段同口径,门控指标跨阶段可比)。
+arena: {arena_games: 160, arena_sims: 400, gate_threshold: 0.55, gate_lcb_z: 1.0,
+        arena_temp_moves: 16, arena_temperature: 0.8, arena_workers: 0}
+log: {log_interval_sec: 30.0, train_log_interval: 100, tensorboard: true}

@@ -14,6 +14,13 @@
 - 节点用 ``__slots__``，children 按 ``legal_moves`` 顺序存 numpy 数组（P/N/W/vloss），
   不为每个节点分配 8100 维数组。
 - ``visit_counts()`` 返回 **棋盘真实坐标** 下的 (8100,) 访问计数。
+- Gumbel 训练搜索模式（DESIGN §8）：``cfg.algorithm == "gumbel"`` 且 ``add_noise=True``
+  时，**根节点**改用 Gumbel-Top-m + Sequential Halving 调度（不混 Dirichlet），
+  **非根节点仍走 PUCT**（工程简化，偏离论文的非根确定性规则）；训练 π 目标改由
+  ``gumbel_policy_target()``（completed-Q）给出、落子由 ``gumbel_best_action()`` 给出。
+  ``algorithm="puct"``（默认）时本模块行为与加入该模式前逐 bit 一致：所有 Gumbel 分支
+  受 ``self._gumbel`` 单一开关保护，且**不从 self._rng 取任何随机数**（否则会平移后续
+  Dirichlet 抽样序列）。
 
 坐标 / 编码一律 import 自 ``xiangqi.constants`` 与 ``rl.encoding``，本模块不重复定义。
 """
@@ -49,6 +56,7 @@ class _Node:
         "terminal",
         "terminal_value",
         "terminal_draw",  # 该终局是否和棋（决定回传是否翻符号）
+        "net_value",     # 展开时网络给出的 value（**本节点走子方视角**），Gumbel v_mix 用
         "child_moves",   # list[(from_sq,to_sq)]，棋盘真实坐标，顺序 = legal_moves
         "child_nodes",   # list[_Node | None]，惰性创建
         "child_P",       # np.float32 (n,) 先验
@@ -63,6 +71,7 @@ class _Node:
         self.terminal = False
         self.terminal_value = 0.0
         self.terminal_draw = False
+        self.net_value = 0.0
         self.child_moves = None
         self.child_nodes = None
         self.child_P = None
@@ -77,6 +86,26 @@ def _terminal_value(result: str, side_to_move: int) -> float:
         return 0.0
     winner = RED if result == "1-0" else BLACK
     return 1.0 if winner == side_to_move else -1.0
+
+
+def _sh_schedule(m: int, num_sims: int) -> list:
+    """Sequential Halving 调度表（DESIGN §8）。
+
+    返回 [(m_phase, quota), ...]，长度 = phases = ceil(log2 m)（m=1 时 1）；
+    quota = max(1, floor(num_sims / (phases * m_phase)))，即该 phase 内**每个存活候选**
+    的模拟配额。下一 phase 的存活数 = ceil(m_phase/2)（至少 1）。
+    例：m=8, N=24 -> [(8,1),(4,2),(2,4)]（恰好 24）；m=16, N=600 -> 586，余量由
+    最终 phase 后的 round-robin 补齐。
+    """
+    m = max(1, int(m))
+    num_sims = max(0, int(num_sims))
+    phases = max(1, math.ceil(math.log2(m))) if m > 1 else 1
+    out = []
+    mp = m
+    for _ in range(phases):
+        out.append((mp, max(1, num_sims // (phases * mp))))
+        mp = max(1, -(-mp // 2))
+    return out
 
 
 def _leaf_policy_indices(legal: list, side: int) -> np.ndarray:
@@ -106,6 +135,7 @@ class SearchTree:
         add_noise: bool,
         history_steps: int = 2,
         rng: np.random.Generator | None = None,
+        num_sims: int | None = None,
     ) -> None:
         # 复制一份棋盘作为持久工作局面；select 时 push/pop，advance 时永久 push。
         self._board = board.copy()
@@ -122,6 +152,20 @@ class SearchTree:
         self._eps = float(cfg.dirichlet_eps)
         # 树内和棋终局回传值（不翻符号，双方同罚）。selfplay/arena 注入 draw_penalty。
         self._draw_value = float(cfg.draw_value)
+
+        # ---- Gumbel 模式（DESIGN §8）：仅 add_noise=True 的训练路径生效；
+        # arena/GUI（add_noise=False）恒走 PUCT。algorithm 默认 "puct" = 原行为。
+        # 精确匹配 "gumbel"（与 rl/selfplay.py 的 self.gumbel 判定逐字一致）：
+        # 两处判据必须完全同步，否则会出现"树跑 SH、selfplay 却按 visit 计数取目标"
+        # 的静默错配（SH 的访问分布本身不是策略目标）。
+        self._gumbel = str(getattr(cfg, "algorithm", "puct")) == "gumbel" and self._add_noise
+        self._g_m = int(getattr(cfg, "gumbel_m", 16))
+        self._g_c_visit = float(getattr(cfg, "gumbel_c_visit", 50.0))
+        self._g_c_scale = float(getattr(cfg, "gumbel_c_scale", 1.0))
+        # SH 总预算：外部驱动循环的 target（selfplay 的 sims_schedule 可能 != cfg.num_sims，
+        # 故允许构造时覆盖）。
+        self._g_num_sims = int(cfg.num_sims if num_sims is None else num_sims)
+        self._g_reset_state()
 
         self._root = _Node()
 
@@ -181,6 +225,161 @@ class SearchTree:
             if n > 0:
                 q[move_to_action(move)] = float(root.child_W[i]) / n
         return q
+
+    # ------------------------------------------------------------- Gumbel
+    # 以下方法仅在 self._gumbel 为真时被调用（algorithm="gumbel" 且 add_noise=True）。
+    # 关键视角约定：root.child_W 已按**根走子方视角**累计（backup 逐层取负后写入），
+    # 故 q̂(a) = W/N 直接就是根走子方视角，与 _select_child / q_values() 取法完全同向，
+    # **不得再取负**。node.net_value 同为该节点自身走子方视角；树复用后该节点成为根，
+    # 其视角即根视角（勿"修正"）。
+    def _g_reset_state(self) -> None:
+        self._g_ready = False       # 是否已对当前根惰性初始化
+        self._g_logits = None       # (n,) log(掩码归一先验 + 1e-12)
+        self._g_gum = None          # (n,) i.i.d. Gumbel(0,1)
+        self._g_cand = None         # 当前 phase 存活候选（root 子边索引，按分数降序）
+        self._g_sched = None        # [(m_phase, quota), ...]
+        self._g_phase = 0           # == len(_g_sched) 表示进入补齐（overflow）阶段
+        self._g_base = None         # 本 phase 起始时的 child_N 快照
+        self._g_block = None        # 本次 select_leaves 内各子边撞车次数（仅排序用）
+
+    def _g_init(self) -> None:
+        """根先验可用后的惰性初始化：采 Gumbel 噪声、取 top-m 候选、算 SH 调度表。"""
+        root = self._root
+        n = len(root.child_moves)
+        self._g_logits = np.log(root.child_P.astype(np.float64) + 1e-12)
+        self._g_gum = self._rng.gumbel(0.0, 1.0, size=n)
+        m = max(1, min(self._g_m, n))
+        # 候选按 g+logits 降序保留（预算不足以覆盖全部候选时，先访问分数高的）。
+        order = np.argsort(-(self._g_gum + self._g_logits), kind="stable")
+        self._g_cand = order[:m].copy()
+        # 树复用时根上已有访问，SH 预算按"剩余"算（与驱动循环 target - total_visits 一致）。
+        budget = max(1, self._g_num_sims - int(root.child_N.sum()))
+        self._g_sched = _sh_schedule(m, budget)
+        self._g_phase = 0
+        self._g_base = root.child_N.copy()
+        self._g_block = np.zeros(n, dtype=np.int64)
+        self._g_ready = True
+
+    def _g_v_mix(self) -> float:
+        """v_mix = (v_net(root) + ΣN·q̄_π) / (1 + ΣN)，q̄_π = Σ_{N>0}π(a)Q(a) / Σ_{N>0}π(a)。
+
+        π = 根先验（gumbel 模式下不含 Dirichlet），Q 与 v_net 均为根走子方视角。
+        无任何已访问子边时退化为 v_net(root)。
+        """
+        root = self._root
+        N = root.child_N
+        sn = float(N.sum())
+        v_net = float(root.net_value)
+        if sn <= 0:
+            return v_net
+        vis = N > 0
+        P = root.child_P.astype(np.float64)[vis]
+        q = root.child_W[vis] / N[vis]
+        pw = float(P.sum())
+        qbar = float((P * q).sum() / pw) if pw > 1e-12 else 0.0
+        return (v_net + sn * qbar) / (1.0 + sn)
+
+    def _g_qhat(self) -> np.ndarray:
+        """(n,) 各子边 q̂（根走子方视角）：已访问取 W/N，未访问用 v_mix 补全。"""
+        root = self._root
+        N = root.child_N
+        q = np.full(N.shape, self._g_v_mix(), dtype=np.float64)
+        vis = N > 0
+        if vis.any():
+            q[vis] = root.child_W[vis] / N[vis]
+        return q
+
+    def _g_sigma(self, qhat: np.ndarray) -> np.ndarray:
+        """σ(q̂) = (c_visit + max_b N(b)) · c_scale · q̂。"""
+        max_n = float(self._root.child_N.max()) if len(self._root.child_N) else 0.0
+        return (self._g_c_visit + max_n) * self._g_c_scale * qhat
+
+    def _g_scores(self) -> np.ndarray:
+        """(n,) g + logits + σ(q̂)：候选排序 / 落子选择用（含 Gumbel 噪声）。"""
+        return self._g_gum + self._g_logits + self._g_sigma(self._g_qhat())
+
+    def _g_advance_phase(self) -> None:
+        """当前 phase 所有存活候选均满配额时推进：折半保留前 ceil(m_phase/2)。
+
+        末 phase 结束后不再折半（无"下一 phase"），直接进入补齐阶段，对该 phase 的
+        存活候选 round-robin，直到外部驱动把预算用满。
+        """
+        root = self._root
+        while self._g_phase < len(self._g_sched):
+            cand = self._g_cand
+            quota = self._g_sched[self._g_phase][1]
+            # "实际访问 + 在途 virtual"（撞车会撤销 vloss，故自动重试）
+            used = (root.child_N[cand] - self._g_base[cand]) + root.child_vloss[cand]
+            if (used < quota).any():
+                return
+            self._g_phase += 1
+            if self._g_phase < len(self._g_sched):
+                keep = self._g_sched[self._g_phase][0]
+                scores = self._g_scores()[cand]
+                order = np.argsort(-scores, kind="stable")
+                self._g_cand = cand[order[:max(1, keep)]].copy()
+            self._g_base = root.child_N.copy()
+
+    def _g_select_root(self) -> int:
+        """根级 SH 选边（替代根 PUCT）：在当前 phase 内对未满配额的候选 round-robin。"""
+        root = self._root
+        self._g_advance_phase()
+        cand = self._g_cand
+        block = self._g_block[cand]
+        if self._g_phase < len(self._g_sched):
+            quota = self._g_sched[self._g_phase][1]
+            used = (root.child_N[cand] - self._g_base[cand]) + root.child_vloss[cand]
+            avail = np.nonzero(used < quota)[0]
+            if avail.size:
+                # 排序键：先按本次调用内的撞车次数（撞过的排后面，避免死磕同一候选），
+                # 再按已用配额 —— 即 round-robin。
+                j = avail[int(np.lexsort((used[avail], block[avail]))[0])]
+                return int(cand[j])
+        # 补齐阶段（或异常兜底）：对存活候选按有效访问数 round-robin。
+        eff = root.child_N[cand] + root.child_vloss[cand]
+        return int(cand[int(np.lexsort((eff, block))[0])])
+
+    # ------------------------------------------------------- Gumbel 对外 API
+    def gumbel_policy_target(self) -> np.ndarray:
+        """(8100,) completed-Q 训练目标 π'(a) ∝ exp(logits(a) + σ(q̂(a)))。
+
+        对**全部合法着法**归一（未访问着法 q̂ = v_mix 补全），棋盘真实坐标，和为 1。
+        搜索未完成时也可调（用当前统计）；根未展开/终局时返回全零（无统计可报）。
+        """
+        out = np.zeros(ACTION_SIZE, dtype=np.float64)
+        root = self._root
+        if not root.expanded or root.terminal or not len(root.child_moves):
+            return out
+        logits = (
+            self._g_logits
+            if self._g_ready
+            else np.log(root.child_P.astype(np.float64) + 1e-12)
+        )
+        x = logits + self._g_sigma(self._g_qhat())
+        x = x - x.max()
+        e = np.exp(x)
+        e /= e.sum()
+        for i, move in enumerate(root.child_moves):
+            out[move_to_action(move)] = e[i]
+        return out
+
+    def gumbel_best_action(self) -> int:
+        """最终存活候选中 argmax g+logits+σ(q̂) 对应的 action（棋盘真实坐标）。
+
+        根未展开/终局时返回 -1；Gumbel 状态尚未初始化时退化为按 logits+σ(q̂) 取全部
+        合法着法的 argmax（无噪声）。
+        """
+        root = self._root
+        if not root.expanded or root.terminal or not len(root.child_moves):
+            return -1
+        if not self._g_ready:
+            logits = np.log(root.child_P.astype(np.float64) + 1e-12)
+            i = int(np.argmax(logits + self._g_sigma(self._g_qhat())))
+            return int(move_to_action(root.child_moves[i]))
+        cand = self._g_cand
+        scores = self._g_scores()[cand]
+        i = int(cand[int(np.argmax(scores))])
+        return int(move_to_action(root.child_moves[i]))
 
     # ---------------------------------------------------------------- 选路
     def _select_child(self, node: _Node) -> int:
@@ -250,7 +449,8 @@ class SearchTree:
         返回：
           ("leaf", (state, token))  待网络评估的叶子（已施加 virtual loss）
           ("terminal", None)        终局叶子已直接 backup 并计 visits
-          ("collision", None)       撞到本 batch 已挂起的未展开节点，本次模拟跳过
+          ("collision", i)          撞到本 batch 已挂起的未展开节点，本次模拟跳过；
+                                    i 为该路径的根子边索引（仅 gumbel 模式记录，否则 None）
         """
         node = self._root
         board = self._board
@@ -269,7 +469,8 @@ class SearchTree:
                     for n, i in path:
                         n.child_vloss[i] -= 1
                     self._pop_n(len(path))
-                    return ("collision", None)
+                    root_i = path[0][1] if (self._gumbel and path) else None
+                    return ("collision", root_i)
 
                 # 单次生成合法着法，既用于终局判定又用于展开（消除双次 legal_moves）。
                 legal = board.legal_moves()
@@ -295,8 +496,14 @@ class SearchTree:
                 token = (node, path, legal, side)
                 return ("leaf", (state, token))
 
-            # 已展开：PUCT 选边并下行（施加 virtual loss）。
-            i = self._select_child(node)
+            # 已展开：选边并下行（施加 virtual loss）。
+            # gumbel 模式下**根**用 Sequential Halving 调度替代 PUCT；非根仍走 PUCT。
+            if self._gumbel and node is self._root:
+                if not self._g_ready:
+                    self._g_init()
+                i = self._g_select_root()
+            else:
+                i = self._select_child(node)
             node.child_vloss[i] += 1
             path.append((node, i))
             board.push(node.child_moves[i])
@@ -317,6 +524,9 @@ class SearchTree:
         empty = np.zeros((0, C, ROWS, COLS), dtype=np.float32)
         if max_leaves <= 0 or self._root.terminal:
             return empty, []
+
+        if self._gumbel and self._g_block is not None:
+            self._g_block[:] = 0    # 撞车计数只在本次调用内有效
 
         states: list = []
         tokens: list = []
@@ -339,6 +549,8 @@ class SearchTree:
                 produced += 1
                 since_progress = 0
             else:  # collision
+                if self._gumbel and data is not None:
+                    self._g_block[data] += 1
                 since_progress += 1
 
         if states:
@@ -372,8 +584,9 @@ class SearchTree:
         elif n > 0:
             prior = np.full(n, 1.0 / n, dtype=np.float64)
 
-        # 根节点 Dirichlet 噪声（仅训练时）。
-        if node is self._root and self._add_noise and n > 0:
+        # 根节点 Dirichlet 噪声（仅训练时）。gumbel 模式的探索源是 Gumbel 噪声，
+        # 根不混 Dirichlet（DESIGN §8），且不得从 self._rng 取数。
+        if node is self._root and self._add_noise and n > 0 and not self._gumbel:
             prior = self._mix_noise(prior)
 
         node.child_moves = list(legal)
@@ -384,6 +597,9 @@ class SearchTree:
         node.child_vloss = np.zeros(n, dtype=np.int64)
         node.expanded = True
         node.pending = False
+        # 网络 value 存该节点自身走子方视角（= backup 的叶值视角）；树复用后此节点
+        # 成为根时它就是根视角，Gumbel v_mix 直接取用，**勿再翻符号**。
+        node.net_value = float(value)
 
         self._backup(path, float(value))
 
@@ -445,11 +661,15 @@ class SearchTree:
                     break
 
         self._board.push(move)
+        # 换根 -> Gumbel 候选/调度全部作废，新根首次 select_leaves 时重新初始化。
+        if self._gumbel:
+            self._g_reset_state()
         if reuse is not None and (reuse.expanded or reuse.terminal):
             self._root = reuse
             # 树复用后新根需重新混入 Dirichlet 噪声（DESIGN §8：根节点每步加噪）。
             # 该子节点是在非根位置展开的，先验里尚无噪声，此处补上。
-            if self._add_noise and reuse.expanded and not reuse.terminal:
+            # gumbel 模式不加 Dirichlet（探索源是每步重采的 Gumbel 噪声）。
+            if self._add_noise and not self._gumbel and reuse.expanded and not reuse.terminal:
                 reuse.child_P = self._mix_noise(
                     reuse.child_P.astype(np.float64)
                 ).astype(np.float32)
@@ -475,7 +695,10 @@ def search(
     返回 (visit_counts[8100] 棋盘真实坐标, root_value 当前走子方视角)；
     return_q=True 时追加 q_values[8100]（根走子方视角，未访问边 NaN）。
     """
-    tree = SearchTree(board, cfg, add_noise, history_steps=history_steps)
+    # num_sims 透传给树（gumbel 的 SH 预算按它排；add_noise=False 时无影响）。
+    tree = SearchTree(
+        board, cfg, add_noise, history_steps=history_steps, num_sims=num_sims
+    )
 
     def _result():
         if return_q:

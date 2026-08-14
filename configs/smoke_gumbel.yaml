@@ -1,0 +1,25 @@
+# CPU 冒烟·Gumbel 模式（DESIGN §8）：验证 Gumbel 训练搜索全流水线（不追求棋力）
+# 与 smoke.yaml 仅差 mcts.algorithm/gumbel_m；num_sims=24 下 m=8 → SH 3 phases:
+# 8×1 + 4×2 + 2×4 = 24，预算恰好用满。
+model: {blocks: 2, filters: 32, history_steps: 2}
+mcts: {num_sims: 24, batch_size: 8, temp_moves: 8, algorithm: gumbel, gumbel_m: 8}
+selfplay:
+  games_per_iteration: 4
+  num_workers: 2
+  games_per_worker: 2
+  eval_max_batch: 64
+  eval_wait_ms: 1.0
+  max_game_plies: 60
+  resign_enabled: false
+  value_blend_iters: 2
+train:
+  device: cpu
+  num_gpus: 0
+  batch_size: 64
+  train_steps_per_iteration: 20
+  buffer_window: 50000
+  min_buffer_to_train: 64
+  total_iterations: 2
+  amp: false
+arena: {arena_games: 2, arena_sims: 16}
+log: {log_interval_sec: 5.0, train_log_interval: 5, tensorboard: false}
