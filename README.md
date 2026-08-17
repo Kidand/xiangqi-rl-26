@@ -194,13 +194,19 @@ tail -f logs/train.log
 ```bash
 cd ~/xiangqi-rl-26 && git pull
 
-# 两臂顺序各跑（从零；中断后续跑加 --resume）
-bash scripts/train_cloud.sh --config configs/ab_scratch_puct.yaml
-bash scripts/train_cloud.sh --config configs/ab_scratch_gumbel.yaml
+# 一键执行（tmux 内）：两臂并行（GPU 0-3 给 puct 臂、4-7 给 gumbel 臂，CPU 显式对半分）
+# → 跑完自动做终点裁决（400 盘去相关 arena + 两臂曲线并排）
+bash scripts/run_ab.sh
 
-# 终点裁决：400 盘去相关 arena（gumbel 视角计分）+ 两臂训练曲线并排对比
-python scripts/ab_judge.py
+# 变体：
+#   MODE=seq bash scripts/run_ab.sh      # 顺序模式（每臂独占全机，先 puct 后 gumbel）
+#   RESUME=1 bash scripts/run_ab.sh     # 中断后续跑（各臂从自己的 checkpoint 续）
+# 观察：tail -f logs_ab_meta/train_puct.log logs_ab_meta/train_gumbel.log
+# 单独重跑裁决：python scripts/ab_judge.py
 ```
+
+注：瓶颈在 CPU 端 MCTS，并行与顺序模式墙钟大致相当；并行的收益是一条命令同时出
+两臂结果、单臂崩溃不拖累另一臂。CPU/GPU 分配由脚本按容器感知的有效核数自动计算。
 
 预注册判据（写死在配置文件头与 ab_judge.py，跑前定稿勿事后挪动）：gumbel 臂
 score ≥ 0.55 → 升级全尺寸从零 Gumbel；0.45~0.55 → 平手，维持阶段六路线；
