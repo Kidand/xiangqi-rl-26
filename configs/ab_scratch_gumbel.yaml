@@ -1,0 +1,59 @@
+# A/B 预研·Gumbel 臂：从零训练,Gumbel 训练搜索(DESIGN §8)
+# ---------------------------------------------------------------------------
+# 与 ab_scratch_puct.yaml 的【唯一差异】= 本 mcts 段(algorithm gumbel 及附属字段);
+# 其余逐字段相同,单变量对照。实验目的/判据/目录隔离说明见 puct 臂文件头。
+# 为什么从零值得一试(离线门是对"成熟网"的裁决,不适用于此):从零时 visit 目标
+# 本就是近均匀浆糊(阶段一实证:2.54 熵平台卡了 600 迭代),Gumbel 的 completed-Q
+# 目标自带策略改进保证,且结构性移除锐化温度旋钮(阶段四双稳态事故根源)。
+# 参数依据:m=8(离线扫描中每决赛候选深度最优;300 sims → SH [(8,12),(4,25),(2,50)]
+# ≈296+补齐);c_scale=0.3 取中(论文默认 1.0 在成熟网上放大噪声;从零早期 Q 差大,
+# 0.3 足以饱和真实信号)。若本臂早期(前 30 迭代)熵不降/胜率异常,先试 c_scale 1.0
+# 再下结论。已知偏置(监控项):SH 稀释战术局面 root_value(赢方压向 0),经
+# root_value_weight=0.3 进入 z 目标——两臂同值保持单变量,若本臂 value_mae 异常高
+# 需在复盘时考虑此因素。
+# ---------------------------------------------------------------------------
+model: {blocks: 5, filters: 64, history_steps: 2}
+mcts:
+  num_sims: 300
+  c_puct: 1.8               # 非根节点仍走 PUCT(DESIGN §8 工程简化)
+  dirichlet_alpha: 0.2      # gumbel 模式下根节点不使用
+  temp_moves: 32            # 同上:不使用(Gumbel 噪声即探索源)
+  temp_final: 0.15
+  batch_size: 64
+  algorithm: gumbel
+  gumbel_m: 8
+  gumbel_c_visit: 50.0
+  gumbel_c_scale: 0.3
+  # π 锐化对 gumbel 目标不适用,置中性值。
+  policy_target_temp: 1.0
+  policy_target_prune_frac: 0.0
+selfplay:
+  games_per_iteration: 1000
+  num_workers: 0
+  games_per_worker: 16
+  eval_max_batch: 4096
+  eval_wait_ms: 2.0
+  eval_fp16: true
+  max_game_plies: 400
+  value_blend_init: 0.5
+  value_blend_iters: 30
+  draw_penalty: -0.2
+  resign_start_iter: 10
+  root_value_weight: 0.3
+train:
+  device: cuda
+  num_gpus: 8
+  batch_size: 2048
+  train_steps_per_iteration: 0
+  sample_reuse: 3.0
+  buffer_window: 500000
+  min_buffer_to_train: 50000
+  lr: 0.001
+  lr_min: 0.0001
+  total_iterations: 150
+  checkpoint_dir: ckpts_ab_gumbel
+  amp: true
+arena: {arena_games: 100, arena_sims: 200, gate_threshold: 0.55, gate_lcb_z: 1.0,
+        arena_temp_moves: 16, arena_temperature: 0.8, arena_workers: 0}
+log: {log_dir: logs_ab_gumbel, records_dir: records_ab_gumbel,
+      log_interval_sec: 30.0, train_log_interval: 100, tensorboard: false}

@@ -185,6 +185,27 @@ tail -f logs/train.log
 混合期，成效看 15 迭代之后——policy_loss/entropy 应脱离 ~0.99 地板继续下行、晋升回到
 15+/百迭代、arena 均值 > 0.52；30~40 迭代无起色即停下复盘（详见 cloud_stage6.yaml 头部）。
 
+### A/B 预研：从零 Gumbel vs 现行配方（决策实验，完整命令）
+
+小尺度等算力单变量对照（5×64 小网 × 150 迭代，单臂约 3-5h），回答"是否值得全尺寸
+从零 Gumbel 训练"。两臂写入各自 `ckpts_ab_*`/`logs_ab_*` 目录，**不碰主训练的 `ckpts/`**，
+与阶段六续训互斥占用 GPU（先后跑即可）：
+
+```bash
+cd ~/xiangqi-rl-26 && git pull
+
+# 两臂顺序各跑（从零；中断后续跑加 --resume）
+bash scripts/train_cloud.sh --config configs/ab_scratch_puct.yaml
+bash scripts/train_cloud.sh --config configs/ab_scratch_gumbel.yaml
+
+# 终点裁决：400 盘去相关 arena（gumbel 视角计分）+ 两臂训练曲线并排对比
+python scripts/ab_judge.py
+```
+
+预注册判据（写死在配置文件头与 ab_judge.py，跑前定稿勿事后挪动）：gumbel 臂
+score ≥ 0.55 → 升级全尺寸从零 Gumbel；0.45~0.55 → 平手，维持阶段六路线；
+< 0.45 → 关闭该路线。裁决脚本会拦截"零晋升臂的占位随机网"并对多样性不足告警。
+
 ### 云端环境（项目根目录，下文以 `~/xiangqi-rl-26` 代指）
 
 #### 初次配置

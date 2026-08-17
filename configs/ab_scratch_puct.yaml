@@ -1,0 +1,56 @@
+# A/B 预研·PUCT 臂：从零训练,现行最优配方(阶段一~五沉淀的全部杠杆)
+# ---------------------------------------------------------------------------
+# 目的(2026-07 决策实验):在承诺全尺寸从零 Gumbel 训练之前,用小尺度等算力 A/B
+# 回答"Gumbel 从零训是否优于现行配方从零训"。本臂 = 对照组。
+# 与 ab_scratch_gumbel.yaml 的【唯一差异】= mcts 段的搜索/目标构造(algorithm 及
+# 其附属字段);模型/数据量/LR/arena/启发式逐字段相同,单变量对照。
+# 两臂写入各自独立目录(ckpts_ab_*/logs_ab_*/records_ab_*),不碰主训练的 ckpts/。
+# 预注册判据(跑完由 scripts/ab_judge.py 裁决,400 盘去相关 arena;400 盘使
+# 低和棋率下的误 GO 率从 200 盘的 ~8% 压到 ~2%,判据在实验运行前定稿):
+#   gumbel 臂 score ≥ 0.55 → 升级全尺寸从零 Gumbel;
+#   0.45~0.55 → 平手,维持阶段六路线;< 0.45 → 关闭从零 Gumbel 路线。
+# 预计单臂 ~3-5h(8×GPU;5×64 小网,300 sims,1000 盘/迭代 × 150 迭代)。
+# ---------------------------------------------------------------------------
+model: {blocks: 5, filters: 64, history_steps: 2}
+mcts:
+  num_sims: 300
+  c_puct: 1.8
+  dirichlet_alpha: 0.2
+  temp_moves: 32
+  temp_final: 0.15
+  batch_size: 64
+  algorithm: puct
+  # 现行配方含 π 锐化(阶段二实证解封平台期;temp 0.75 是承重值)。
+  policy_target_temp: 0.75
+  policy_target_prune_frac: 0.03
+selfplay:
+  games_per_iteration: 1000
+  num_workers: 0
+  games_per_worker: 16
+  eval_max_batch: 4096
+  eval_wait_ms: 2.0
+  eval_fp16: true
+  max_game_plies: 400
+  value_blend_init: 0.5
+  value_blend_iters: 30
+  draw_penalty: -0.2
+  resign_start_iter: 10
+  root_value_weight: 0.3
+train:
+  device: cuda
+  num_gpus: 8
+  batch_size: 2048
+  train_steps_per_iteration: 0
+  sample_reuse: 3.0
+  buffer_window: 500000
+  min_buffer_to_train: 50000
+  # 从零:标准单条余弦 1e-3 → 1e-4,地平线 = 150 迭代。
+  lr: 0.001
+  lr_min: 0.0001
+  total_iterations: 150
+  checkpoint_dir: ckpts_ab_puct
+  amp: true
+arena: {arena_games: 100, arena_sims: 200, gate_threshold: 0.55, gate_lcb_z: 1.0,
+        arena_temp_moves: 16, arena_temperature: 0.8, arena_workers: 0}
+log: {log_dir: logs_ab_puct, records_dir: records_ab_puct,
+      log_interval_sec: 30.0, train_log_interval: 100, tensorboard: false}
