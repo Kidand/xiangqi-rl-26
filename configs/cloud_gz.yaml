@@ -1,0 +1,118 @@
+# 云端多 GPU·GZ 谱系(Gumbel-Zero):全尺寸从零 Gumbel 训练【条件 GO,先过两道硬门】
+# ---------------------------------------------------------------------------
+# 【裁决链,2026-08】A/B(5×64×150 迭代)按预注册判据 GO(gumbel 0.88 vs puct)。
+# 对抗复核修正解读:puct 臂并非"较慢"而是从未启动——它被冻在主线阶段一 iter 1-3
+# 的指纹上(和率 81%/红胜 9%/熵≈ln(legal),逐列吻合)。归因(实测):
+#   ① λ 材料退火 30 迭代关闭唯一教学信号 → 全和棋区梯度归零,绝对吸收态(置信 0.80);
+#   ② root_value_weight=0.3 从零启用:材料信号被稀释 30% + 自指反馈(β 是阶段二在
+#      成熟网上诊断的药,从零有害;置信 0.60);
+#   ③ π 锐化【无罪】:实测对平坦分布近乎恒等(熵只降 0.04-0.09,剪枝 44/44 存活)。
+# 因此 0.88 不可当效应量外推;GO 的硬证据是 gumbel 臂自身:熵 1.78 打穿主线
+# 420 迭代未破的 2.54 平台(1/10 参数、1/2 sims),且机制成立(completed-Q 提供
+# 不依赖价值头的策略侧自举,不吃 λ 窗口关闭这一刀)。
+# 注意:60 vs 5 的晋升差 ~10× 是和棋率改变门控噪声底的机械假象,勿引用。
+#
+# 【开跑前置,按序执行】
+#   ⓪ 冻结参照 + 兜底备份(里程碑与硬门都用 gz_ref,主线 best 永不裸奔):
+#        cp ckpts/best.pt ckpts/gz_ref.pt
+#        cp ckpts/best.pt ckpts/best_backup_pre_gz.pt
+#   ① 【硬门 1,~20 分钟】外部标尺:两臂各对冻结参照打 200 盘,补上 0.88 缺失的绝对刻度:
+#        python scripts/ab_judge.py --gumbel-ckpt ckpts_ab_gumbel/best.pt \
+#          --puct-ckpt ckpts/gz_ref.pt --skip-metrics --games 200 --sims 200
+#        python scripts/ab_judge.py --gumbel-ckpt ckpts_ab_puct/best.pt \
+#          --puct-ckpt ckpts/gz_ref.pt --skip-metrics --games 200 --sims 200
+#      (第二条把 puct 臂放在 gumbel 槽位,输出标签失义,只读 score 数字。)
+#      判据:gumbel 臂 score ≥ 0.10 且 ≥ puct 臂 + 0.08 → 放行;
+#            gumbel 臂 < 0.05 → 0.88 无绝对意义,停,回来复盘(β 修正后重跑 A/B)。
+#   ② 【硬门 2,~5 分钟】确认 puct 臂死法(repetition@~70ply = 归因成立;
+#      max_moves@400ply = 另一种病,归因重做):
+#        python -c "import json,glob,collections,statistics; rs=[json.loads(l) for f in sorted(glob.glob('records_ab_puct/selfplay/iter_014*.jsonl')) for l in open(f)]; print(collections.Counter(r['termination'] for r in rs)); print('avg_plies', round(statistics.mean(r['plies'] for r in rs),1))"
+#   ③ 两门都过 → 点火:
+#        tmux new -s gz
+#        bash scripts/train_cloud.sh --config configs/cloud_gz.yaml          # 从零
+#        bash scripts/train_cloud.sh --config configs/cloud_gz.yaml --resume # 续跑
+#
+# 【与 A/B 验证点的三处刻意偏离(均有依据,见对应字段注释)】
+#   root_value_weight 0.3→0.0、value_blend_iters 30→60、arena 降为 100×200。
+#
+# 【止损线,跑前写死】
+#   - iter 60 中检:draw_rate > 25% 或 entropy 仍 > 3.0 或 |红-黑胜率| < 1pt
+#     → 停,回退阶段六路线(configs/cloud_stage6.yaml)。
+#   - iter 200 中检:entropy < 0.8 且 arena 25 迭代均值 < 0.52 → 骑噪声实锤,
+#     gumbel_c_scale 砍半(0.3→0.15)重启或回退。
+# 【常规观测】首迭代:avg_batch≈4000、日志无 "buffer < min_buffer_to_train";
+#   前 30 迭代:和率应个位数(A/B 4%)、晋升密集、entropy 下行、红>黑、
+#   resign_fp_rate 0.008-0.015 口径;每 30 迭代:对 records_gz/selfplay 最新
+#   iter 的前 8 ply 指纹去重,distinct/2000 < 0.3 → 停(gumbel 无 Dirichlet 强制
+#   再探索,先验锐化后开局多样性只来自 Top-m 抽样,这是它独有的塌缩通道)。
+# 【时间账】selfplay ~350s + train ~28s + arena(100×200) ~220s ≈ 600s/iter,
+#   600 迭代(120 万盘)≈ 4-5 天。磁盘:ckpts_gz ≈ 76 GB(iter 检查点含优化器
+#   127MB×600),跑完记得归档。
+# 【里程碑,iter 300/600】对冻结参照定位强度(在两迭代之间跑,~20-60 分钟;
+#   或接受该迭代计时污染):
+#        python scripts/ab_judge.py --gumbel-ckpt ckpts_gz/best.pt \
+#          --puct-ckpt ckpts/gz_ref.pt --skip-metrics
+#   参照背后 ~400 万盘,GZ@600 迭代只有 120 万盘,输是预期——看随盘数的斜率。
+# ---------------------------------------------------------------------------
+model: {blocks: 15, filters: 192, se: true, history_steps: 2}
+mcts:
+  # SH m=8@600(新根):[(8,25),(4,50),(2,100)]=600 整除;树复用后稳态预算 ~426,
+  # 落子候选深度实测 ply0=175 / 稳态 138-152(A/B 300 sims 同口径:92/73,约 2×)。
+  num_sims: 600
+  c_puct: 1.8               # 非根节点仍走 PUCT(DESIGN §8 工程简化)
+  dirichlet_alpha: 0.2      # gumbel 模式下根节点不使用
+  temp_moves: 32            # 不使用(Gumbel 噪声即探索源)
+  temp_final: 0.15
+  batch_size: 96
+  algorithm: gumbel
+  gumbel_m: 8
+  gumbel_c_visit: 50.0
+  # c_scale 保持 0.3:σ 乘子虽随 sims 涨(37→60),但 q̂ 离散度同步缩小,
+  # 实测目标熵不变(0.473@300 vs 0.488@600 nats)——按"目标熵恒定"而非
+  # "乘子恒定"迁移。若前 30 迭代 entropy 掉得远快于 A/B 曲线,降 0.2(≈A/B 乘子)。
+  gumbel_c_scale: 0.3
+  policy_target_temp: 1.0   # π 锐化对 gumbel 不适用(且实测对平坦分布本就恒等)
+  policy_target_prune_frac: 0.0
+  num_sims_late: 0
+  num_sims_late_start_iter: 0
+selfplay:
+  games_per_iteration: 2000
+  num_workers: 0
+  games_per_worker: 16
+  eval_max_batch: 4096
+  eval_wait_ms: 2.0
+  eval_fp16: true
+  max_game_plies: 400
+  # λ 材料退火 30→60 迭代:大网从零逃逸更慢,λ 窗口是全程唯一的外源教学信号,
+  # 别提前关掉(主线 10×128 在 iter 7 靠 λ=0.38 逃出和棋盆地)。
+  value_blend_init: 0.5
+  value_blend_iters: 60
+  draw_penalty: -0.2
+  resign_start_iter: 10
+  # β 从零置 0(偏离 A/B 验证点,复核裁决):β=0.3 是阶段二在成熟网上治 z 噪声的药,
+  # 从零会稀释 λ 窗口内唯一的材料教学信号并引入自指反馈(puct 臂死因第二位,
+  # 置信 0.60);gumbel 的策略侧自举不依赖价值头,扛住了但没理由继续带着。
+  # β=0 从零 = 主线阶段一验证过的组合。首次暖重启(成熟期)再评估恢复 0.3。
+  root_value_weight: 0.0
+train:
+  device: cuda
+  num_gpus: 8
+  batch_size: 4096
+  train_steps_per_iteration: 0
+  sample_reuse: 3.0
+  buffer_window: 1500000
+  min_buffer_to_train: 100000
+  # 从零单余弦 1e-3→1e-4,地平线 600(progress = iteration/total_iterations,
+  # 与主线从零同起点;续段暖重启按惯例手算)。
+  lr: 0.001
+  lr_min: 0.0001
+  total_iterations: 600
+  checkpoint_dir: ckpts_gz
+  amp: true
+# arena 降为 100×200(偏离主线 160×400,复核 M1):160×400 在 15×192 fp32 arena
+# 路径下实测 ~700-2000s/iter,是为平台期设计的降噪包;从零阶段门控裕度极大
+# (A/B 150 迭代晋升 60 次),用 A/B 验证过的 100×200(~220s)。平台期临近再升档。
+arena: {arena_games: 100, arena_sims: 200, gate_threshold: 0.55, gate_lcb_z: 1.0,
+        arena_temp_moves: 16, arena_temperature: 0.8, arena_workers: 0}
+log: {log_dir: logs_gz, records_dir: records_gz,
+      log_interval_sec: 30.0, train_log_interval: 100, tensorboard: true}

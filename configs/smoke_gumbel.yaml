@@ -20,6 +20,10 @@ train:
   buffer_window: 50000
   min_buffer_to_train: 64
   total_iterations: 2
+  # 隔离输出目录——rl/train.py 启动时会无条件把随机初始网写成 <ckpt_dir>/best.pt,
+  # 不设此项直接跑本配置会【覆盖主线 ckpts/best.pt】(就绪评审 M2 地雷)。
+  checkpoint_dir: ckpts_smoke_gumbel
   amp: false
 arena: {arena_games: 2, arena_sims: 16}
-log: {log_interval_sec: 5.0, train_log_interval: 5, tensorboard: false}
+log: {log_dir: logs_smoke_gumbel, records_dir: records_smoke_gumbel,
+      log_interval_sec: 5.0, train_log_interval: 5, tensorboard: false}

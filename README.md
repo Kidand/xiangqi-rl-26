@@ -212,6 +212,32 @@ bash scripts/run_ab.sh
 score ≥ 0.55 → 升级全尺寸从零 Gumbel；0.45~0.55 → 平手，维持阶段六路线；
 < 0.45 → 关闭该路线。裁决脚本会拦截"零晋升臂的占位随机网"并对多样性不足告警。
 
+**A/B 结果（已裁决）**：gumbel 0.88（339W/26D/35L/400）→ GO。对抗复核修正解读：
+puct 臂被冻在初始和棋盆地（λ 退火窗口关闭 + β 从零启用之害），0.88 不可当效应量；
+GO 的硬证据是 gumbel 臂自身熵 1.78 打穿主线 420 迭代未破的 2.54 平台。
+
+### GZ 谱系：全尺寸从零 Gumbel（条件 GO，当前待执行）
+
+完整前置硬门 / 止损线 / 观测口径见 `configs/cloud_gz.yaml` 文件头（必读）。命令概要：
+
+```bash
+cd ~/xiangqi-rl-26 && git pull
+
+# ⓪ 冻结参照 + 兜底备份（主线 ckpts/ 不受 GZ 影响，写入全新 ckpts_gz/logs_gz）
+cp ckpts/best.pt ckpts/gz_ref.pt && cp ckpts/best.pt ckpts/best_backup_pre_gz.pt
+
+# ① 硬门 1（~20 分钟）：两臂各对冻结参照打 200 盘，给 0.88 补绝对刻度
+python scripts/ab_judge.py --gumbel-ckpt ckpts_ab_gumbel/best.pt --puct-ckpt ckpts/gz_ref.pt --skip-metrics --games 200 --sims 200
+python scripts/ab_judge.py --gumbel-ckpt ckpts_ab_puct/best.pt   --puct-ckpt ckpts/gz_ref.pt --skip-metrics --games 200 --sims 200
+# 判据：gumbel 臂 ≥ 0.10 且 ≥ puct 臂 + 0.08 → 放行；< 0.05 → 停，回来复盘
+
+# ② 硬门 2（~5 分钟）：确认 puct 臂死法（期望 repetition@~70ply）——命令见 cloud_gz.yaml 头
+
+# ③ 点火（600 迭代 ≈ 120 万盘 ≈ 4-5 天；中断 --resume 续）
+tmux new -s gz
+bash scripts/train_cloud.sh --config configs/cloud_gz.yaml
+```
+
 ### 云端环境（项目根目录，下文以 `~/xiangqi-rl-26` 代指）
 
 #### 初次配置
