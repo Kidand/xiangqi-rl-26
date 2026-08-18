@@ -48,12 +48,6 @@ class MCTSConfig:
     #（>0 时生效），用于收尾阶段灌高质量 π buffer（蒸馏热启动数据）。
     num_sims_late: int = 0
     num_sims_late_start_iter: int = 0
-    # Gumbel 训练搜索（DESIGN §8）：仅 selfplay 训练路径（add_noise=True）生效；
-    # arena/GUI 恒走 PUCT。"gumbel" 下 Dirichlet/温度采样/π 锐化均不使用。
-    algorithm: str = "puct"          # "puct" | "gumbel"
-    gumbel_m: int = 16               # 根候选数（Gumbel-Top-m）
-    gumbel_c_visit: float = 50.0     # σ(q̂) 变换的 visit 项
-    gumbel_c_scale: float = 1.0      # σ(q̂) 变换缩放
 
 
 @dataclass
@@ -164,12 +158,6 @@ class Config:
                 if k not in valid:
                     raise KeyError(f"unknown key {section}.{k}")
                 setattr(sub, k, v)
-        # algorithm 拼写校验：mcts 与 selfplay 两处判据均为精确匹配 "gumbel"，
-        # 若不在白名单会全局静默退回 PUCT——在加载期直接报错（防"看似在跑 gumbel"）。
-        if cfg.mcts.algorithm not in ("puct", "gumbel"):
-            raise ValueError(
-                f"mcts.algorithm={cfg.mcts.algorithm!r} 不合法，可选 'puct'/'gumbel'（区分大小写）"
-            )
         return cfg
 
     def to_dict(self) -> dict:

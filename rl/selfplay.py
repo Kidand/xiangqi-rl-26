@@ -275,10 +275,7 @@ class _GameSlot:
         "_calib_resign_side",
     )
 
-    def __init__(
-        self, game_id: int, cfg: Config, mcts_cfg, rng: np.random.Generator,
-        num_sims: "int | None" = None,
-    ) -> None:
+    def __init__(self, game_id: int, cfg: Config, mcts_cfg, rng: np.random.Generator) -> None:
         self.game_id = game_id
         self.board = Board(
             max_plies=int(cfg.selfplay.max_game_plies),
@@ -291,8 +288,6 @@ class _GameSlot:
             add_noise=True,  # 自博弈根节点加 Dirichlet 噪声
             history_steps=int(cfg.model.history_steps),
             rng=rng,
-            # SH 预算须与驱动 target 一致（sims_schedule 生效时 != cfg.num_sims）
-            num_sims=num_sims,
         )
         self.resign = ResignTracker(cfg.selfplay, game_id=game_id)
         self.state = "new_move"
@@ -376,9 +371,6 @@ class _WorkerEngine:
         # π 训练目标锐化参数（DESIGN §8）；默认 (1.0, 0.0) = 不锐化。
         self.policy_temp = float(cfg.mcts.policy_target_temp)
         self.policy_prune_frac = float(cfg.mcts.policy_target_prune_frac)
-        # Gumbel 训练搜索模式（DESIGN §8）：仅改 _decide 的目标/落子来源，
-        # 其余（搜索合批、认输、z 混根价值、一步杀）完全照旧。
-        self.gumbel = str(cfg.mcts.algorithm) == "gumbel"
 
         # 认输仅在 resign_enabled 且迭代 ≥ resign_start_iter 后启用（DESIGN §10.3）。
         self.resign_active = bool(cfg.selfplay.resign_enabled) and (
@@ -390,7 +382,7 @@ class _WorkerEngine:
     # -------------------------------------------------- slot 生命周期
     def new_slot(self, game_id: int) -> _GameSlot:
         child = np.random.default_rng(self.rng.integers(0, 2**63 - 1))
-        slot = _GameSlot(game_id, self.cfg, self.mcts_cfg, child, num_sims=self.num_sims)
+        slot = _GameSlot(game_id, self.cfg, self.mcts_cfg, child)
         self._advance_slot(slot)
         return slot
 
@@ -448,71 +440,8 @@ class _WorkerEngine:
         _record_sample(slot, board, idx, prob, self.history_steps, 1.0)
         self._push_move(slot, move)
 
-    def _sparse_from_target(self, target: np.ndarray, side: int) -> Tuple[np.ndarray, np.ndarray]:
-        """已归一的 π 目标（8100，棋盘真实坐标）→ 稀疏 π (idx int16, prob f32)。
-
-        Gumbel 模式专用：目标本身已是合法着法上的分布，**恒等**入库——不过
-        sharpen_counts（policy_target_temp/prune_frac 对 completed-Q 目标不适用，
-        DESIGN §8），也不重新归一（下游 replay_buffer/train 不再归一）。
-        """
-        nz = np.nonzero(target)[0]
-        idx = np.fromiter(
-            (move_to_policy_index(action_to_move(int(a)), side) for a in nz),
-            dtype=np.int16,
-            count=len(nz),
-        )
-        return idx, target[nz].astype(np.float32)
-
-    def _fallback_move(self, slot: _GameSlot) -> None:
-        """极端兜底：搜索无结果（不应发生）→ 走首个合法着法，不记样本。"""
-        board = slot.board
-        legal = board.legal_moves()
-        if not legal:
-            slot.result = board.result()
-            slot.termination = board.termination()
-            slot.state = "finished"
-            return
-        self._push_move(slot, legal[0])
-        self._advance_slot(slot)
-
-    def _decide_gumbel(self, slot: _GameSlot) -> None:
-        """Gumbel 模式决策（DESIGN §8）：π = completed-Q 目标、落子 = A*。
-
-        与 PUCT 分支的差异仅两点：目标来自 gumbel_policy_target（不锐化），
-        落子来自 gumbel_best_action（Gumbel 噪声即唯一探索源，故**不走**
-        sample_action_from_counts / temp_moves / temp_final / opening_random_plies）。
-        根价值、认输、校准、样本记录（含 z 混根价值）顺序与 PUCT 完全一致。
-        """
-        board = slot.board
-        root_value = slot.tree.root_value()
-        side = board.side_to_move
-
-        action = slot.tree.gumbel_best_action()
-        target = slot.tree.gumbel_policy_target()
-        if action is None or int(action) < 0 or not np.any(target):
-            self._fallback_move(slot)
-            return
-        move = action_to_move(int(action))
-
-        idx, prob = self._sparse_from_target(target, side)
-        _record_sample(slot, board, idx, prob, self.history_steps, root_value)
-
-        self._update_calibration(slot, side, root_value)
-        if self.resign_active and slot.resign.update(side, root_value):
-            winner = -side
-            slot.result = "1-0" if winner == RED else "0-1"
-            slot.termination = "resign"
-            slot.state = "finished"
-            return
-
-        self._push_move(slot, move)
-        self._advance_slot(slot)
-
     def _decide(self, slot: _GameSlot) -> None:
         """搜索完成后：按温度选着、记样本、认输判定、落子。"""
-        if self.gumbel:  # Gumbel 分支在最外层分流，PUCT 热路径零改动
-            self._decide_gumbel(slot)
-            return
         board = slot.board
         counts = slot.tree.visit_counts()
         root_value = slot.tree.root_value()

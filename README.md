@@ -185,59 +185,6 @@ tail -f logs/train.log
 混合期，成效看 15 迭代之后——policy_loss/entropy 应脱离 ~0.99 地板继续下行、晋升回到
 15+/百迭代、arena 均值 > 0.52；30~40 迭代无起色即停下复盘（详见 cloud_stage6.yaml 头部）。
 
-### A/B 预研：从零 Gumbel vs 现行配方（决策实验，完整命令）
-
-小尺度等算力单变量对照（5×64 小网 × 150 迭代，单臂约 3-5h），回答"是否值得全尺寸
-从零 Gumbel 训练"。两臂写入各自 `ckpts_ab_*`/`logs_ab_*` 目录，**不碰主训练的 `ckpts/`**，
-与阶段六续训互斥占用 GPU（先后跑即可）：
-
-```bash
-cd ~/xiangqi-rl-26 && git pull
-
-# 一键执行（tmux 内）：两臂并行（GPU 0-3 给 puct 臂、4-7 给 gumbel 臂，CPU 显式对半分）
-# → 跑完自动做终点裁决（400 盘去相关 arena + 两臂曲线并排）
-bash scripts/run_ab.sh
-
-# 变体：
-#   MODE=seq bash scripts/run_ab.sh      # 顺序模式（每臂独占全机，先 puct 后 gumbel）
-#   RESUME=1 bash scripts/run_ab.sh     # 中断后续跑（各臂从自己的 checkpoint 续）
-# 观察：tail -f logs_ab_meta/train_puct.log logs_ab_meta/train_gumbel.log
-# 单独重跑裁决：python scripts/ab_judge.py
-```
-
-注：瓶颈在 CPU 端 MCTS，并行与顺序模式墙钟大致相当；并行的收益是一条命令同时出
-两臂结果、单臂崩溃不拖累另一臂。CPU/GPU 分配由脚本按容器感知的有效核数自动计算。
-
-预注册判据（写死在配置文件头与 ab_judge.py，跑前定稿勿事后挪动）：gumbel 臂
-score ≥ 0.55 → 升级全尺寸从零 Gumbel；0.45~0.55 → 平手，维持阶段六路线；
-< 0.45 → 关闭该路线。裁决脚本会拦截"零晋升臂的占位随机网"并对多样性不足告警。
-
-**A/B 结果（已裁决）**：gumbel 0.88（339W/26D/35L/400）→ GO。对抗复核修正解读：
-puct 臂被冻在初始和棋盆地（λ 退火窗口关闭 + β 从零启用之害），0.88 不可当效应量；
-GO 的硬证据是 gumbel 臂自身熵 1.78 打穿主线 420 迭代未破的 2.54 平台。
-
-### GZ 谱系：全尺寸从零 Gumbel（条件 GO，当前待执行）
-
-完整前置硬门 / 止损线 / 观测口径见 `configs/cloud_gz.yaml` 文件头（必读）。命令概要：
-
-```bash
-cd ~/xiangqi-rl-26 && git pull
-
-# ⓪ 冻结参照 + 兜底备份（主线 ckpts/ 不受 GZ 影响，写入全新 ckpts_gz/logs_gz）
-cp ckpts/best.pt ckpts/gz_ref.pt && cp ckpts/best.pt ckpts/best_backup_pre_gz.pt
-
-# ① 硬门 1（~20 分钟）：两臂各对冻结参照打 200 盘，给 0.88 补绝对刻度
-python scripts/ab_judge.py --gumbel-ckpt ckpts_ab_gumbel/best.pt --puct-ckpt ckpts/gz_ref.pt --skip-metrics --games 200 --sims 200
-python scripts/ab_judge.py --gumbel-ckpt ckpts_ab_puct/best.pt   --puct-ckpt ckpts/gz_ref.pt --skip-metrics --games 200 --sims 200
-# 判据：gumbel 臂 ≥ 0.10 且 ≥ puct 臂 + 0.08 → 放行；< 0.05 → 停，回来复盘
-
-# ② 硬门 2（~5 分钟）：确认 puct 臂死法（期望 repetition@~70ply）——命令见 cloud_gz.yaml 头
-
-# ③ 点火（600 迭代 ≈ 120 万盘 ≈ 4-5 天；中断 --resume 续）
-tmux new -s gz
-bash scripts/train_cloud.sh --config configs/cloud_gz.yaml
-```
-
 ### 云端环境（项目根目录，下文以 `~/xiangqi-rl-26` 代指）
 
 #### 初次配置
@@ -331,7 +278,6 @@ scp -r /path/to/remote/ckpts/best.onnx ~/xiangqi-rl-26/ckpts/
 | 预设 | 场景 | 迭代耗时 | 适用 |
 |------|------|---------|------|
 | **smoke.yaml** | CPU 端到端验证 | 2-3 分钟 | 代码检查、ci/cd |
-| **smoke_gumbel.yaml** | CPU 验证 Gumbel 训练搜索流水线 | 2-3 分钟 | 代码检查（DESIGN §8） |
 | **laptop.yaml** | 本地试训（收敛趋势） | 10-30 min/iter | 参数调试、本地开发 |
 | **cloud.yaml** | 云端正式·初代小网（10×128≈3.2M） | ~6 min/iter | 阶段一~二历史配置 |
 | **cloud_stage6.yaml** | 云端正式·大网（15×192+SE≈10.5M）**当前生效** | ~11 min/iter | 实际训练 |
@@ -369,13 +315,12 @@ arena: {arena_games: 160, arena_sims: 400, gate_lcb_z: 1.0, arena_temperature: 0
 
 # cloud_stage6.yaml —— 大网续训（当前生效）
 model: {blocks: 15, filters: 192, se: true}   # ≈10.5M 参数（蒸馏迁移而来）
-mcts: {num_sims: 1000, algorithm: puct}       # 阶段六核心杠杆：600→1000 sims
+mcts: {num_sims: 1000}                        # 阶段六核心杠杆：600→1000 sims
 ```
 
 演进过程中沉淀的训练杠杆（均有 yaml 注释与 DESIGN 契约）：π 目标锐化（temp 0.75 是
 实证承重值，0.85 会崩盘）、z 混根价值去噪、arena LCB 门控 + 对局去相关、num_sims 按迭代
-调度、大模型蒸馏迁移工具链（`scripts/distill_bigmodel.py`）、Gumbel 训练搜索（已实现，
-离线质量门未过，默认关闭，档案见 `configs/cloud_stage6_gumbel.yaml`）。
+调度、大模型蒸馏迁移工具链（`scripts/distill_bigmodel.py`）。
 
 ### 关键超参调整指南
 

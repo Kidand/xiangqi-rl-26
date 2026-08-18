@@ -195,36 +195,6 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
   selfplay 中 iteration ≥ late_start_iter 且 num_sims_late>0 时，该迭代实际模拟数改用
   num_sims_late（收尾阶段灌高质量 π buffer，供大模型蒸馏热启动）。对局记录 meta.sims
   写实际生效值，事后可还原。
-- **Gumbel 训练搜索模式**（`mcts.algorithm: "gumbel"`，默认 `"puct"` = 原行为；仅作用于
-  selfplay 训练路径 `SearchTree(add_noise=True)`，**arena/GUI 恒走 PUCT 路径、完全不受影响**）。
-  依据 Danihelka et al. 2022《Policy improvement by planning with Gumbel》，动机：低模拟预算下
-  visit 计数目标又平又噪（本项目全程病灶），completed-Q 目标信息量更大且自带策略改进保证，
-  并使 π 锐化温度旋钮（阶段四实证的双稳态隐患）整体作废。
-  - **根候选**：对合法着法采 i.i.d. Gumbel(0,1) 噪声 g(a)，取 g(a)+logits(a) 的
-    top-m 为候选（m = min(`gumbel_m`, |legal|)，默认 16）。logits 取 log(掩码归一先验)
-    ——softmax 平移不变，与网络原始 logits 等价。该模式下**不使用** Dirichlet 噪声与
-    temp_moves/temperature/temp_final/opening_random_plies 采样：Gumbel 噪声即唯一探索源，
-    每个根（每步）重新采样。
-  - **预算分配**：Sequential Halving。phases = ceil(log2 m)；每 phase 给每个存活候选
-    `max(1, floor(num_sims/(phases·m_phase)))` 次模拟，phase 末按 g+logits+σ(q̂) 保留前半
-    （至少 1 个）；预算提前耗尽即止，用已有统计出结果。σ(q̂) = (c_visit + max_b N(b))·c_scale·q̂
-    （`gumbel_c_visit`=50、`gumbel_c_scale`=1.0；q̂ 为当前走子方视角 Q ∈ [-1,1]）。
-    根级 SH 调度替代根级 PUCT（phase 内对未达标候选 round-robin 下行，virtual loss 与
-    两阶段合批 API 语义不变）；**非根节点仍走既有 PUCT 选边**（工程简化，偏离论文的
-    非根确定性规则，实现处须注明）。
-  - **落子**：A* = 最终存活候选中 argmax g+logits+σ(q̂)。经 Gumbel-max 技巧这近似等价于
-    按改进策略采样——自带多样性、天然打破确定性循环，故不再需要温度采样。一步杀捷径优先级不变。
-  - **训练 π 目标（completed-Q）**：π'(a) ∝ exp(logits(a) + σ(q̂(a)))，对**全部**合法 a；
-    q̂(a) = Q(a)（N(a)>0）否则 v_mix（未访问补全）。
-    v_mix = (v_net(root) + ΣN·q̄_π) / (1 + ΣN)，其中 q̄_π = Σ_{a:N>0} π(a)Q(a) / Σ_{a:N>0} π(a)
-    （π 为根先验；与 mctx 参考实现同语义，实现处写明公式并配单测）。
-    π 目标锐化（policy_target_temp/prune_frac）在该模式下不适用（目标已是分布，恒等归一
-    入稀疏存储）。**新 API**：`SearchTree.gumbel_policy_target() -> np.ndarray(8100)`
-    （棋盘真实坐标、合法着法上归一）与 `SearchTree.gumbel_best_action() -> int`。
-    入库仍经 move_to_policy_index 转当前方视角，稀疏 idx/prob 格式不变。
-  - `root_value()/q_values()/visit_counts()/advance()` 语义不变（认输、z 混根价值、树复用照旧；
-    advance 后新根首次 select_leaves 时重新初始化 Gumbel 候选状态）。
-  - 配置：`mcts.algorithm`（"puct"/"gumbel"）、`gumbel_m`、`gumbel_c_visit`、`gumbel_c_scale`。
 
 ## 9. 自我博弈与训练流水线（同步迭代制，便于看日志调参）
 
