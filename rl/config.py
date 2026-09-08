@@ -66,7 +66,7 @@ class SelfPlayConfig:
     # 启发式（DESIGN §10）
     value_blend_init: float = 0.5    # 材料混合初始 λ
     value_blend_iters: int = 30      # λ 线性退火到 0 的迭代数
-    draw_penalty: float = -0.1       # 和棋 z 值（双方）
+    draw_penalty: float = 0.0        # 零和目标；历史负值仅兼容旧实验（不满足 negamax）
     resign_enabled: bool = True
     resign_start_iter: int = 10
     resign_threshold: float = -0.92
@@ -88,6 +88,7 @@ class TrainConfig:
     batch_size: int = 4096
     train_steps_per_iteration: int = 1000  # 0 = 自动：clamp(ceil(新样本×sample_reuse/batch), 10, 5000)
     sample_reuse: float = 3.0        # 自动步数下每个新样本的期望学习次数
+    mirror_prob: float = 0.0         # 训练左右镜像增强概率；独立镜像实验设 0.5
     buffer_window: int = 1_500_000   # 保留最近样本数
     min_buffer_to_train: int = 20_000
     optimizer: str = "adamw"         # "adamw" / "sgd"

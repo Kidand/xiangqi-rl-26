@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import math
 import random
@@ -36,11 +37,13 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import numpy as np
 
 from xiangqi.records import append_jsonl
-from rl.config import Config
+from rl.config import Config, ModelConfig
+from rl.augmentation import augment_horizontal
 from rl.evaluate import arena, passes_gate
 from rl.logger import TrainLogger
 from rl.model import create_model, save_checkpoint
 from rl.replay_buffer import ReplayBuffer
+from rl.targets import value_target_metadata
 from rl.inference_server import create_shared_buffers, eval_server_proc
 from rl.selfplay import (
     cpu_budget_summary,
@@ -473,6 +476,8 @@ def _train_phase(
         "policy_loss": 0.0,
         "value_loss": 0.0,
         "entropy": 0.0,
+        "target_entropy": 0.0,
+        "policy_kl": 0.0,
         "value_mae": 0.0,
         "grad_norm": 0.0,
     }
@@ -483,9 +488,11 @@ def _train_phase(
     # 以 non_blocking 异步拷到 GPU（overlap H2D 与计算）；cpu 设备走原路径，数值不变。
     use_cuda = dev.type == "cuda"
     pin_states = pin_policy = pin_values = None
+    mirror_rng = np.random.default_rng(int(cfg.seed) + 1_000_003 * iteration)
 
     for step in range(steps):
         states_np, policy_np, values_np = buffer.sample(batch)
+        states_np, policy_np = augment_horizontal(states_np, policy_np, cfg.train.mirror_prob, mirror_rng)
         if use_cuda:
             if pin_states is None:
                 pin_states = torch.empty(states_np.shape, dtype=torch.float32, pin_memory=True)
@@ -514,13 +521,13 @@ def _train_phase(
         if use_amp:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits, value_pred = model(states)
-                log_probs = F.log_softmax(logits, dim=1)
+                log_probs = F.log_softmax(logits.float(), dim=1)
                 policy_loss = -(policy_target * log_probs).sum(dim=1).mean()
                 value_loss = F.mse_loss(value_pred, value_target)
                 loss = policy_loss + cfg.train.value_loss_weight * value_loss
         else:
             logits, value_pred = model(states)
-            log_probs = F.log_softmax(logits, dim=1)
+            log_probs = F.log_softmax(logits.float(), dim=1)
             policy_loss = -(policy_target * log_probs).sum(dim=1).mean()
             value_loss = F.mse_loss(value_pred, value_target)
             loss = policy_loss + cfg.train.value_loss_weight * value_loss
@@ -535,6 +542,8 @@ def _train_phase(
         with torch.no_grad():
             probs = log_probs.exp()
             entropy = -(probs * log_probs).sum(dim=1).mean()
+            target_entropy = -(policy_target * policy_target.clamp_min(1e-30).log()).sum(dim=1).mean()
+            policy_kl = policy_loss.detach() - target_entropy
             value_mae = (value_pred - value_target).abs().mean()
 
         elapsed = max(1e-6, time.monotonic() - t_start)
@@ -544,6 +553,8 @@ def _train_phase(
         pl = float(policy_loss.item())
         vl = float(value_loss.item())
         ent = float(entropy.item())
+        target_ent = float(target_entropy.item())
+        kl = float(policy_kl.item())
         vmae = float(value_mae.item())
         gn = float(grad_norm)
 
@@ -551,6 +562,8 @@ def _train_phase(
         sums["policy_loss"] += pl
         sums["value_loss"] += vl
         sums["entropy"] += ent
+        sums["target_entropy"] += target_ent
+        sums["policy_kl"] += kl
         sums["value_mae"] += vmae
         sums["grad_norm"] += gn
         n += 1
@@ -567,6 +580,8 @@ def _train_phase(
                 samples_per_sec=samples_per_sec,
                 grad_norm=gn,
                 iteration=iteration,
+                target_entropy=target_ent,
+                policy_kl=kl,
             )
 
     model.eval()
@@ -576,6 +591,8 @@ def _train_phase(
         "policy_loss": sums["policy_loss"] / n,
         "value_loss": sums["value_loss"] / n,
         "entropy": sums["entropy"] / n,
+        "target_entropy": sums["target_entropy"] / n,
+        "policy_kl": sums["policy_kl"] / n,
         "value_mae": sums["value_mae"] / n,
         "grad_norm": sums["grad_norm"] / n,
         "lr": last_lr,
@@ -686,10 +703,58 @@ class _BufferSaver:
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
-def run_training(cfg: Config, resume: bool = False) -> Dict[str, object]:
+def _check_checkpoint_contract(ckpt, cfg, expected, allow_legacy=False):
+    """A resume must preserve architecture and known value-label semantics."""
+    actual = ModelConfig(**ckpt["model_config"])
+    if actual != cfg.model:
+        raise ValueError(f"模型结构不匹配：checkpoint={actual}, config={cfg.model}")
+    if expected is None:  # Weight-only initialization deliberately starts new targets.
+        return
+    saved = ckpt.get("meta", {}).get("value_target")
+    if saved is None and allow_legacy:
+        return
+    if saved != expected:
+        raise ValueError("checkpoint 价值目标契约缺失或不匹配；改目标请用独立目录和 --init-from")
+
+
+def _require_empty_outputs(cfg):
+    for location in (cfg.train.checkpoint_dir, cfg.log.log_dir, cfg.log.records_dir):
+        path = Path(location)
+        if path.exists() and any(p.name != ".gitkeep" for p in path.iterdir()):
+            raise ValueError(f"新实验输出目录必须为空，续训请用 --resume：{path}")
+
+
+def run_training(
+    cfg: Config, resume: bool = False, init_from: Optional[str] = None,
+    allow_legacy_buffer: bool = False,
+) -> Dict[str, object]:
     """执行完整训练循环。返回摘要 dict（供 smoke_test 校验）。"""
     import torch
 
+    if resume and init_from:
+        raise ValueError("--resume 与 --init-from 互斥")
+    if allow_legacy_buffer and (not resume or cfg.selfplay.draw_penalty == 0):
+        raise ValueError("--allow-legacy-buffer 仅用于原非零和棋设置的历史续训；零和实验须用新 buffer")
+    target_metadata = value_target_metadata(cfg)
+    mirror_prob = float(cfg.train.mirror_prob)
+    if not math.isfinite(mirror_prob) or not 0 <= mirror_prob <= 1:
+        raise ValueError("train.mirror_prob 必须在 [0,1]")
+    if not resume:
+        _require_empty_outputs(cfg)
+    initial_ckpt = None
+    origin = None
+    if init_from:
+        source_path = Path(init_from).resolve()
+        source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        initial_ckpt = torch.load(source_path, map_location="cpu", weights_only=False)
+        if hashlib.sha256(source_path.read_bytes()).hexdigest() != source_hash:
+            raise ValueError("初始化模型在读取期间发生变化，请使用冻结的检查点")
+        _check_checkpoint_contract(initial_ckpt, cfg, None)
+        origin = {
+            "path": str(source_path), "sha256": source_hash,
+            "iteration": initial_ckpt.get("iteration"),
+            "value_target": initial_ckpt.get("meta", {}).get("value_target"),
+        }
     _set_global_seed(int(cfg.seed))
     device = _train_device(cfg)
 
@@ -700,204 +765,244 @@ def run_training(cfg: Config, resume: bool = False) -> Dict[str, object]:
     buf_dir = _buffer_dir(ckpt_dir)
 
     logger = TrainLogger(log_dir=cfg.log.log_dir, tensorboard=bool(cfg.log.tensorboard))
-
-    C = cfg.model.in_channels
-    state_shape = (C, 10, 9)
-
-    model = create_model(cfg.model).to(device)
-    optimizer = _build_optimizer(model, cfg)
-
-    best_path = _best_ckpt_path(ckpt_dir)
-    start_iter = 0
-
-    def _save_iter(iteration: int) -> Path:
-        path = _iter_ckpt_path(ckpt_dir, iteration)
-        save_checkpoint(
-            model,
-            cfg.model,
-            path,
-            iteration=iteration,
-            optimizer_state=optimizer.state_dict(),
-            meta={"seed": cfg.seed, "device": device},
-        )
-        return path
-
-    if resume:
-        # 从新到旧逐个尝试，跳过被 Ctrl-C 截断/损坏的检查点（全坏才报错）。
-        ckpt, ckpt_path = load_latest_checkpoint(ckpt_dir, device, warn=logger.warn)
-        if ckpt is not None and ckpt_path is not None:
-            latest = int(ckpt_path.stem.split("_")[1])
-            model.load_state_dict(ckpt["model_state"])
-            if ckpt.get("optimizer_state") is not None:
-                try:
-                    optimizer.load_state_dict(ckpt["optimizer_state"])
-                except Exception as e:  # 优化器结构变更时容错
-                    logger.warn(f"optimizer 状态加载失败，重置: {e}")
-            start_iter = latest + 1
-            logger.info(f"--resume：从 {ckpt_path.name} 续训，start_iter={start_iter}")
-        else:
-            logger.warn("--resume 但未找到 iter_XXXX.pt，从头开始")
-        # buffer 容错加载：主目录损坏时回退 <buffer>.old，都不可用则新建空 buffer。
-        if buf_dir.exists() or (buf_dir.with_name(buf_dir.name + ".old")).exists():
-            buffer = ReplayBuffer.load(
-                buf_dir,
-                capacity=int(cfg.train.buffer_window),
-                state_shape=state_shape,
-                warn=logger.warn,
-            )
-            logger.info(f"buffer 续载，size={len(buffer)}")
-        else:
-            buffer = ReplayBuffer(int(cfg.train.buffer_window), state_shape)
-        if not best_path.exists():
-            save_checkpoint(model, cfg.model, best_path, iteration=start_iter, meta={"init": True})
-    else:
-        buffer = ReplayBuffer(int(cfg.train.buffer_window), state_shape)
-        # 初始 best：随机模型（自博弈冷启动用）。
-        save_checkpoint(model, cfg.model, best_path, iteration=-1, meta={"init": True})
-        logger.info(f"初始化完成，device={device}，模型 {cfg.model.blocks}b×{cfg.model.filters}f")
-
-    total_iterations = int(cfg.train.total_iterations)
-    last_summary: Dict[str, object] = {}
-
-    # buffer 后台保存编排器：把 ~100-150s 的 npz 压缩落盘挪出主循环、与下一迭代重叠。
-    # 缺省 "snapshot"（配置未声明该字段时的默认）；getattr 兜底以免依赖 configs/ 改动。
-    saver = _BufferSaver(
-        buf_dir,
-        mode=str(getattr(cfg.train, "async_buffer_save", "snapshot")),
-        warn=logger.warn,
-    )
-
-    # try/finally：所有退出路径（正常跑完 / 异常 / Ctrl-C）都 join 后台保存，避免留下
-    # 半写状态或丢最后一迭代 buffer（save 内部 tmp+rename+.old 原子，最坏也可回退 .old）。
     try:
-        for iteration in range(start_iter, total_iterations):
-            iter_t0 = time.monotonic()
-            # freeze_window 模式：下一迭代 selfplay 会 add_game 原地改写活 buffer，
-            # 须在此 join 上一份「活 buffer」后台保存（snapshot/sync 模式此处 no-op，
-            # 快照与活 buffer 解耦、可继续跨入本迭代 selfplay）。
-            saver.before_selfplay()
-            records_path = records_dir / f"iter_{iteration:04d}.jsonl"
-            # --resume 崩溃重跑同一迭代时，该文件可能是上次中途写入的部分残留；
-            # append_jsonl 是纯追加，不清理会导致行数混入两次运行、超过 games_per_iteration。
-            records_path.unlink(missing_ok=True)
+        if cfg.selfplay.draw_penalty != 0:
+            logger.warn("使用历史非零和棋目标：普通网络叶子的 negamax 与双方同罚不完全相容；仅作旧实验对照")
+        if allow_legacy_buffer:
+            logger.warn("显式接受旧产物缺失标签契约；请确保当前价值配置与原训练完全一致")
 
-            # 1) Self-play（best 模型执双方）。
-            sp_t0 = time.monotonic()
-            sp_stats = _selfplay_phase(cfg, iteration, best_path, logger, buffer, records_path)
-            selfplay_sec = time.monotonic() - sp_t0
+        C = cfg.model.in_channels
+        state_shape = (C, 10, 9)
 
-            # 2) buffer 持久化发起（后台线程）。此刻起到下一迭代 selfplay 的首个
-            #    add_game 之前 buffer 只读：snapshot 模式在此取快照可与 train+arena+
-            #    下一迭代 selfplay 全程重叠；freeze_window 模式恰好把压缩藏进
-            #    train+arena（before_selfplay 会在下次改写前 join）。save 内部先 join
-            #    上一次保存（buf_dir 单写者、释放上份快照 RAM）；失败在线程内
-            #    logger.warn，不中断训练（保持 ed69f24 语义）。
-            saver.save(buffer)
+        model = create_model(cfg.model).to(device)
+        optimizer = _build_optimizer(model, cfg)
 
-            # 3) Train（buffer 达阈值才训练）。
-            tr_t0 = time.monotonic()
-            trained = len(buffer) >= int(cfg.train.min_buffer_to_train)
-            if trained:
-                new_samples = int(sp_stats.get("new_samples", 0))
-                steps = resolve_train_steps(new_samples, cfg)
-                mode = "自动" if int(cfg.train.train_steps_per_iteration) == 0 else "固定"
-                logger.info(
-                    f"[iter {iteration}] 本迭代新样本 {new_samples}，训练步数 {steps}（{mode}）"
-                )
-                tr_stats = _train_phase(model, optimizer, buffer, cfg, iteration, device, logger, steps)
-            else:
-                logger.info(
-                    f"[iter {iteration}] buffer {len(buffer)} < min_buffer_to_train "
-                    f"{cfg.train.min_buffer_to_train}，跳过训练"
-                )
-                tr_stats = {}
-            train_sec = time.monotonic() - tr_t0
+        best_path = _best_ckpt_path(ckpt_dir)
+        start_iter = 0
+        legacy_metadata_accepted = bool(allow_legacy_buffer)
 
-            # 4) 存本迭代 checkpoint（含 optimizer），供 arena 与续训使用。
-            iter_path = _save_iter(iteration)
+        def checkpoint_meta(**extra):
+            return {"seed": cfg.seed, "device": device, "config": cfg.to_dict(),
+                    "value_target": target_metadata, "init_from": origin,
+                    "legacy_metadata_accepted": legacy_metadata_accepted, **extra}
 
-            # 5) Arena 门控（新 iter vs best）。多进程并行铺满全部 GPU（rl/evaluate.py）。
-            ar_t0 = time.monotonic()
-            arena_stats = arena(str(iter_path), str(best_path), cfg, device)
-            arena_sec = time.monotonic() - ar_t0
-            promoted = bool(trained and passes_gate(arena_stats, cfg.arena))
-            if promoted:
-                save_checkpoint(
-                    model, cfg.model, best_path, iteration=iteration, meta={"promoted_from": iteration}
-                )
-
-            logger.arena_result(
-                wins=arena_stats["wins"],
-                draws=arena_stats["draws"],
-                losses=arena_stats["losses"],
-                red_wins=arena_stats["red_wins"],
-                red_draws=arena_stats["red_draws"],
-                red_losses=arena_stats["red_losses"],
-                black_wins=arena_stats["black_wins"],
-                black_draws=arena_stats["black_draws"],
-                black_losses=arena_stats["black_losses"],
-                score=arena_stats["score"],
-                threshold=float(cfg.arena.gate_threshold),
-                promoted=promoted,
+        def _save_iter(iteration: int) -> Path:
+            path = _iter_ckpt_path(ckpt_dir, iteration)
+            save_checkpoint(
+                model,
+                cfg.model,
+                path,
                 iteration=iteration,
-                elapsed_sec=arena_sec,
+                optimizer_state=optimizer.state_dict(),
+                meta=checkpoint_meta(),
             )
-            logger.info(
-                f"[iter {iteration} | arena] se {arena_stats['score_se']:.3f}"
-                f" | openings {arena_stats['distinct_openings']}/{arena_stats['games']}"
-                f"（gate_lcb_z={float(cfg.arena.gate_lcb_z):.2f}）"
-            )
+            return path
 
-            # 6) CSV 汇总行（buffer 落盘已在步骤 2 后台进行）。
-            total_sec = time.monotonic() - iter_t0
-            row = {
-                "iter": iteration,
-                "games": sp_stats["games"],
-                "red_win": sp_stats["red_win"],
-                "black_win": sp_stats["black_win"],
-                "draw": sp_stats["draw"],
-                "red_winrate": round(sp_stats["red_winrate"], 4),
-                "black_winrate": round(sp_stats["black_winrate"], 4),
-                "draw_rate": round(sp_stats["draw_rate"], 4),
-                "avg_plies": round(sp_stats["avg_plies"], 2),
-                "resign_rate": round(sp_stats["resign_rate"], 4),
-                "resign_fp_rate": round(sp_stats["resign_fp_rate"], 4),
-                "buffer_size": len(buffer),
-                "loss": round(tr_stats["loss"], 5) if trained else "",
-                "policy_loss": round(tr_stats["policy_loss"], 5) if trained else "",
-                "value_loss": round(tr_stats["value_loss"], 5) if trained else "",
-                "entropy": round(tr_stats["entropy"], 5) if trained else "",
-                "value_mae": round(tr_stats["value_mae"], 5) if trained else "",
-                "lr": (f"{tr_stats['lr']:.3e}" if trained else ""),
-                "arena_score": round(arena_stats["score"], 4),
-                "arena_red_score": round(arena_stats["red_score"], 4),
-                "arena_black_score": round(arena_stats["black_score"], 4),
-                "promoted": promoted,
-                "selfplay_sec": round(selfplay_sec, 2),
-                "train_sec": round(train_sec, 2),
-                "total_sec": round(total_sec, 2),
-            }
-            logger.iteration_summary(row)
-            last_summary = row
+        if resume:
+            # 从新到旧逐个尝试，跳过被 Ctrl-C 截断/损坏的检查点（全坏才报错）。
+            ckpt, ckpt_path = load_latest_checkpoint(ckpt_dir, device, warn=logger.warn)
+            if ckpt is not None and ckpt_path is not None:
+                _check_checkpoint_contract(ckpt, cfg, target_metadata, allow_legacy_buffer)
+                origin = ckpt.get("meta", {}).get("init_from")
+                legacy_metadata_accepted |= bool(ckpt.get("meta", {}).get("legacy_metadata_accepted"))
+                latest = int(ckpt_path.stem.split("_")[1])
+                model.load_state_dict(ckpt["model_state"])
+                if ckpt.get("optimizer_state") is not None:
+                    try:
+                        optimizer.load_state_dict(ckpt["optimizer_state"])
+                    except Exception as e:  # 优化器结构变更时容错
+                        logger.warn(f"optimizer 状态加载失败，重置: {e}")
+                start_iter = latest + 1
+                logger.info(f"--resume：从 {ckpt_path.name} 续训，start_iter={start_iter}")
+            else:
+                raise ValueError("--resume 未找到 iter_XXXX.pt；新实验请使用 --init-from 或空目录冷启动")
+            # Validate both model contracts before buffer recovery can clean old backups.
+            if best_path.exists():
+                best_ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
+                _check_checkpoint_contract(best_ckpt, cfg, target_metadata, allow_legacy_buffer)
+            # buffer 容错加载：主目录损坏时回退 <buffer>.old，都不可用则新建空 buffer。
+            if buf_dir.exists() or (buf_dir.with_name(buf_dir.name + ".old")).exists():
+                buffer = ReplayBuffer.load(
+                    buf_dir,
+                    capacity=int(cfg.train.buffer_window),
+                    state_shape=state_shape,
+                    warn=logger.warn,
+                    expected_target_metadata=target_metadata,
+                    allow_missing_target_metadata=allow_legacy_buffer,
+                )
+                # Unknown legacy labels remain unknown even after a save/resume cycle.
+                # Mixing new games into this buffer does not certify its older samples.
+                logger.info(f"buffer 续载，size={len(buffer)}")
+            else:
+                buffer = ReplayBuffer(int(cfg.train.buffer_window), state_shape, target_metadata=target_metadata)
+            if not best_path.exists():
+                save_checkpoint(model, cfg.model, best_path, iteration=start_iter - 1, meta=checkpoint_meta(init=True))
+        else:
+            buffer = ReplayBuffer(int(cfg.train.buffer_window), state_shape, target_metadata=target_metadata)
+            if initial_ckpt is not None:
+                model.load_state_dict(initial_ckpt["model_state"], strict=True)
+                logger.info(f"从 {origin['path']} 只载权重，独立 buffer/optimizer，start_iter=0")
+            save_checkpoint(model, cfg.model, best_path, iteration=-1, meta=checkpoint_meta(init=True))
+            logger.info(f"初始化完成，device={device}，模型 {cfg.model.blocks}b×{cfg.model.filters}f")
+
+        total_iterations = int(cfg.train.total_iterations)
+        last_summary: Dict[str, object] = {}
+
+        # buffer 后台保存编排器：把 ~100-150s 的 npz 压缩落盘挪出主循环、与下一迭代重叠。
+        # 缺省 "snapshot"（配置未声明该字段时的默认）；getattr 兜底以免依赖 configs/ 改动。
+        saver = _BufferSaver(
+            buf_dir,
+            mode=str(getattr(cfg.train, "async_buffer_save", "snapshot")),
+            warn=logger.warn,
+        )
+
+        # try/finally：所有退出路径（正常跑完 / 异常 / Ctrl-C）都 join 后台保存，避免留下
+        # 半写状态或丢最后一迭代 buffer（save 内部 tmp+rename+.old 原子，最坏也可回退 .old）。
+        try:
+            for iteration in range(start_iter, total_iterations):
+                iter_t0 = time.monotonic()
+                # freeze_window 模式：下一迭代 selfplay 会 add_game 原地改写活 buffer，
+                # 须在此 join 上一份「活 buffer」后台保存（snapshot/sync 模式此处 no-op，
+                # 快照与活 buffer 解耦、可继续跨入本迭代 selfplay）。
+                save_t0 = time.monotonic()
+                saver.before_selfplay()
+                buffer_save_wait_sec = time.monotonic() - save_t0
+                records_path = records_dir / f"iter_{iteration:04d}.jsonl"
+                # --resume 崩溃重跑同一迭代时，该文件可能是上次中途写入的部分残留；
+                # append_jsonl 是纯追加，不清理会导致行数混入两次运行、超过 games_per_iteration。
+                records_path.unlink(missing_ok=True)
+
+                # 1) Self-play（best 模型执双方）。
+                sp_t0 = time.monotonic()
+                sp_stats = _selfplay_phase(cfg, iteration, best_path, logger, buffer, records_path)
+                selfplay_sec = time.monotonic() - sp_t0
+
+                # 2) buffer 持久化发起（后台线程）。此刻起到下一迭代 selfplay 的首个
+                #    add_game 之前 buffer 只读：snapshot 模式在此取快照可与 train+arena+
+                #    下一迭代 selfplay 全程重叠；freeze_window 模式恰好把压缩藏进
+                #    train+arena（before_selfplay 会在下次改写前 join）。save 内部先 join
+                #    上一次保存（buf_dir 单写者、释放上份快照 RAM）；失败在线程内
+                #    logger.warn，不中断训练（保持 ed69f24 语义）。
+                save_t0 = time.monotonic()
+                saver.save(buffer)
+                buffer_save_wait_sec += time.monotonic() - save_t0
+
+                # 3) Train（buffer 达阈值才训练）。
+                tr_t0 = time.monotonic()
+                trained = len(buffer) >= int(cfg.train.min_buffer_to_train)
+                if trained:
+                    new_samples = int(sp_stats.get("new_samples", 0))
+                    steps = resolve_train_steps(new_samples, cfg)
+                    mode = "自动" if int(cfg.train.train_steps_per_iteration) == 0 else "固定"
+                    logger.info(
+                        f"[iter {iteration}] 本迭代新样本 {new_samples}，训练步数 {steps}（{mode}）"
+                    )
+                    tr_stats = _train_phase(model, optimizer, buffer, cfg, iteration, device, logger, steps)
+                else:
+                    logger.info(
+                        f"[iter {iteration}] buffer {len(buffer)} < min_buffer_to_train "
+                        f"{cfg.train.min_buffer_to_train}，跳过训练"
+                    )
+                    tr_stats = {}
+                train_sec = time.monotonic() - tr_t0
+
+                # 4) 存本迭代 checkpoint（含 optimizer），供 arena 与续训使用。
+                iter_path = _save_iter(iteration)
+
+                # 5) Arena 门控（新 iter vs best）。多进程并行铺满全部 GPU（rl/evaluate.py）。
+                ar_t0 = time.monotonic()
+                arena_stats = arena(str(iter_path), str(best_path), cfg, device)
+                arena_sec = time.monotonic() - ar_t0
+                promoted = bool(trained and passes_gate(arena_stats, cfg.arena))
+                if promoted:
+                    save_checkpoint(
+                        model, cfg.model, best_path, iteration=iteration, meta=checkpoint_meta(promoted_from=iteration)
+                    )
+
+                logger.arena_result(
+                    wins=arena_stats["wins"],
+                    draws=arena_stats["draws"],
+                    losses=arena_stats["losses"],
+                    red_wins=arena_stats["red_wins"],
+                    red_draws=arena_stats["red_draws"],
+                    red_losses=arena_stats["red_losses"],
+                    black_wins=arena_stats["black_wins"],
+                    black_draws=arena_stats["black_draws"],
+                    black_losses=arena_stats["black_losses"],
+                    score=arena_stats["score"],
+                    threshold=float(cfg.arena.gate_threshold),
+                    promoted=promoted,
+                    iteration=iteration,
+                    elapsed_sec=arena_sec,
+                )
+                logger.info(
+                    f"[iter {iteration} | arena] se {arena_stats['score_se']:.3f}"
+                    f" | openings {arena_stats['distinct_openings']}/{arena_stats['games']}"
+                    f"（gate_lcb_z={float(cfg.arena.gate_lcb_z):.2f}）"
+                )
+
+                # 6) 最后一迭代计入退出等待，避免保存耗时漏出总时间。
+                if iteration == total_iterations - 1:
+                    save_t0 = time.monotonic()
+                    saver.close()
+                    buffer_save_wait_sec += time.monotonic() - save_t0
+                total_sec = time.monotonic() - iter_t0
+                row = {
+                    "iter": iteration,
+                    "games": sp_stats["games"],
+                    "red_win": sp_stats["red_win"],
+                    "black_win": sp_stats["black_win"],
+                    "draw": sp_stats["draw"],
+                    "red_winrate": round(sp_stats["red_winrate"], 4),
+                    "black_winrate": round(sp_stats["black_winrate"], 4),
+                    "draw_rate": round(sp_stats["draw_rate"], 4),
+                    "avg_plies": round(sp_stats["avg_plies"], 2),
+                    "resign_rate": round(sp_stats["resign_rate"], 4),
+                    "resign_fp_rate": round(sp_stats["resign_fp_rate"], 4),
+                    "buffer_size": len(buffer),
+                    "loss": round(tr_stats["loss"], 5) if trained else "",
+                    "policy_loss": round(tr_stats["policy_loss"], 5) if trained else "",
+                    "value_loss": round(tr_stats["value_loss"], 5) if trained else "",
+                    "entropy": round(tr_stats["entropy"], 5) if trained else "",
+                    "target_entropy": round(tr_stats["target_entropy"], 6) if trained else "",
+                    "policy_kl": round(tr_stats["policy_kl"], 6) if trained else "",
+                    "value_mae": round(tr_stats["value_mae"], 5) if trained else "",
+                    "lr": (f"{tr_stats['lr']:.3e}" if trained else ""),
+                    "arena_score": round(arena_stats["score"], 4),
+                    "arena_red_score": round(arena_stats["red_score"], 4),
+                    "arena_black_score": round(arena_stats["black_score"], 4),
+                    "promoted": promoted,
+                    "selfplay_sec": round(selfplay_sec, 2),
+                    "train_sec": round(train_sec, 2),
+                    "total_sec": round(total_sec, 2),
+                    "arena_sec": round(arena_sec, 2),
+                    "buffer_save_wait_sec": round(buffer_save_wait_sec, 2),
+                }
+                logger.iteration_summary(row)
+                last_summary = row
+        finally:
+            # 所有退出路径（正常跑完 / 异常 / Ctrl-C）都 join 最后一份未落盘的后台保存——
+            # 否则进程退出可能停在 rename 中途或丢最后一迭代 buffer（虽 save 原子换名 + load
+            # 回退 .old 能兜底，但不必冒险）。必须在 logger.close() 之前完成。
+            saver.close()
+
+        logger.info("训练循环结束")
+        return {"iterations": total_iterations, "last_row": last_summary, "checkpoint_dir": str(ckpt_dir)}
     finally:
-        # 所有退出路径（正常跑完 / 异常 / Ctrl-C）都 join 最后一份未落盘的后台保存——
-        # 否则进程退出可能停在 rename 中途或丢最后一迭代 buffer（虽 save 原子换名 + load
-        # 回退 .old 能兜底，但不必冒险）。必须在 logger.close() 之前完成。
-        saver.close()
-
-    logger.info("训练循环结束")
-    logger.close()
-    return {"iterations": total_iterations, "last_row": last_summary, "checkpoint_dir": str(ckpt_dir)}
+        logger.close()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Xiangqi AlphaZero 训练主循环")
     parser.add_argument("--config", required=True, help="YAML 配置路径")
-    parser.add_argument("--resume", action="store_true", help="从最新 checkpoint 续训")
+    start = parser.add_mutually_exclusive_group()
+    start.add_argument("--resume", action="store_true", help="从最新 checkpoint 续训")
+    start.add_argument("--init-from", help="仅载同结构权重，在空目录启动独立实验")
+    parser.add_argument("--allow-legacy-buffer", action="store_true", help="仅历史非零和棋续训：接受缺失标签契约的旧产物")
     args = parser.parse_args()
 
     cfg = Config.from_yaml(args.config)
-    run_training(cfg, resume=args.resume)
+    run_training(cfg, resume=args.resume, init_from=args.init_from, allow_legacy_buffer=args.allow_legacy_buffer)
 
 
 if __name__ == "__main__":

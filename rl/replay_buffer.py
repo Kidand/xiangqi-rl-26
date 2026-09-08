@@ -8,7 +8,7 @@
 环形覆盖策略：写入位置循环至 capacity 后从头覆盖旧样本。
 
 save/load：
-  meta.json          — capacity / state_shape / size / pos
+  meta.json          — capacity / state_shape / size / pos / target_metadata
   states_NNNN.npz    — 状态分片（每片至多 SHARD_SIZE 条）
   values.npy         — 价值数组（有效顺序）
   sparse_policy.npz  — flat 索引+概率+lengths（有效顺序）
@@ -17,6 +17,7 @@ save/load：
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import logging
 import os
 import shutil
@@ -33,6 +34,10 @@ _SHARD_SIZE = 100_000
 _LOG = logging.getLogger(__name__)
 
 
+class ReplayBufferCompatibilityError(ValueError):
+    """数据存在但与调用方的契约不兼容，不得当作磁盘损坏而静默重建。"""
+
+
 class ReplayBuffer:
     """环形经验回放缓冲区。
 
@@ -40,13 +45,17 @@ class ReplayBuffer:
     ----------
     capacity    : 最大样本数（满后环形覆盖最旧样本）
     state_shape : 单个状态的形状，如 (31, 10, 9)
+    target_metadata : 价值标签契约；None 表示旧格式、标签来源未知
     """
 
-    def __init__(self, capacity: int, state_shape: tuple) -> None:
+    def __init__(
+        self, capacity: int, state_shape: tuple, target_metadata: Optional[dict] = None
+    ) -> None:
         if capacity <= 0:
             raise ValueError(f"capacity 必须 > 0，得到 {capacity}")
         self.capacity: int = capacity
         self.state_shape: tuple = tuple(state_shape)
+        self.target_metadata: Optional[dict] = deepcopy(target_metadata)
 
         # 当前有效样本数（≤ capacity）
         self._size: int = 0
@@ -129,6 +138,7 @@ class ReplayBuffer:
             绝不动被引用的旧数组，快照读到的始终是取快照时的一致数据。
           - ``_size`` / ``_pos``：**冻结标量**。``save()`` 的 valid_idx 依赖二者确定有效槽位
             与环形顺序，必须一并冻结。
+          - ``target_metadata``：**深拷贝**，避免后续修改污染已捕获样本的标签契约。
 
         RAM 峰值：快照对整块 ``_states`` 做实体拷贝，体量≈活 buffer 的 states
         （configs/cloud 满 buffer ~1.5M×2790B≈4.2GB）。故后台保存期间系统 RAM
@@ -140,6 +150,7 @@ class ReplayBuffer:
         snap = object.__new__(ReplayBuffer)
         snap.capacity = self.capacity
         snap.state_shape = self.state_shape
+        snap.target_metadata = deepcopy(self.target_metadata)
         snap._size = self._size          # 冻结（valid_idx 依赖）
         snap._pos = self._pos            # 冻结（valid_idx 依赖）
         snap._states = self._states.copy()   # 实体拷贝（add_game 原地写）
@@ -263,6 +274,7 @@ class ReplayBuffer:
             "state_shape": list(self.state_shape),
             "size": n,
             "pos": self._pos,
+            "target_metadata": deepcopy(self.target_metadata),
         }
 
         if n == 0:
@@ -333,6 +345,8 @@ class ReplayBuffer:
         capacity: Optional[int] = None,
         state_shape: Optional[tuple] = None,
         warn: Optional[Callable[[str], None]] = None,
+        expected_target_metadata: Optional[dict] = None,
+        allow_missing_target_metadata: bool = False,
     ) -> "ReplayBuffer":
         """容错加载 buffer。
 
@@ -351,6 +365,12 @@ class ReplayBuffer:
         warn : 容错告警回调（单参数字符串消息），默认 None 时回退 ``_LOG.warning``。
                供调用方接入自身日志系统（如 rl/train.py 的 TrainLogger.warn），
                否则告警只落 stderr、进不了 train.log。
+        expected_target_metadata : 非 None 时，在分配/加载样本数组之前检查标签契约。
+               已知不匹配立即抛 ValueError，不回退旧份或重建空 buffer。
+        allow_missing_target_metadata : 显式兼容缺少契约的历史 buffer 并告警；
+               保留 target_metadata=None，不给未知标签补写预期契约。
+               对已有契约但不匹配的 buffer 不生效。
+        state_shape : 提供时同时校验磁盘状态形状；仍用于损坏时重建空 buffer。
         """
         if warn is None:
             warn = _LOG.warning
@@ -360,25 +380,38 @@ class ReplayBuffer:
 
         buf: Optional["ReplayBuffer"] = None
         try:
-            buf = cls._load_from_dir(load_dir)
+            buf = cls._load_from_dir(
+                load_dir, expected_target_metadata, state_shape,
+                allow_missing_target_metadata,
+            )
+        except ReplayBufferCompatibilityError:
+            raise
         except Exception as e_primary:
             # 回退到上一份完整数据 <dir>.old。
             try:
-                buf = cls._load_from_dir(old_dir)
+                buf = cls._load_from_dir(
+                    old_dir, expected_target_metadata, state_shape,
+                    allow_missing_target_metadata,
+                )
                 warn(
                     f"主 buffer 损坏（{type(e_primary).__name__}: {e_primary}），"
                     f"已回退上一份 {old_dir.name}"
                 )
+            except ReplayBufferCompatibilityError:
+                raise
             except Exception as e_old:
                 if capacity is not None and state_shape is not None:
                     warn(
                         f"主 buffer 与备份均不可用（主: {e_primary}；备: {e_old}），"
                         f"新建空 buffer"
                     )
-                    buf = cls(int(capacity), tuple(state_shape))
+                    buf = cls(int(capacity), tuple(state_shape), expected_target_metadata)
                 else:
                     # 无法重建：抛出主目录的原始异常。
                     raise e_primary
+
+        if expected_target_metadata is not None and buf.target_metadata is None:
+            warn("已显式允许加载缺少 target_metadata 的历史 buffer；标签契约仍未知")
 
         # 清理遗留 .tmp / .old（数据已在内存中，下次 save 会原子重建各份）。
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -386,7 +419,13 @@ class ReplayBuffer:
         return buf
 
     @classmethod
-    def _load_from_dir(cls, dir: "str | Path") -> "ReplayBuffer":
+    def _load_from_dir(
+        cls,
+        dir: "str | Path",
+        expected_target_metadata: Optional[dict] = None,
+        expected_state_shape: Optional[tuple] = None,
+        allow_missing_target_metadata: bool = False,
+    ) -> "ReplayBuffer":
         """严格加载给定目录（任一环节缺失/损坏均抛异常）。供 load() 的容错链调用。"""
         load_dir = Path(dir)
         meta_path = load_dir / "meta.json"
@@ -394,12 +433,34 @@ class ReplayBuffer:
             raise FileNotFoundError(f"meta.json 不存在：{meta_path}")
 
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        target_metadata = meta.get("target_metadata")
+        if expected_target_metadata is not None:
+            if target_metadata is None:
+                if not allow_missing_target_metadata:
+                    raise ReplayBufferCompatibilityError(
+                        f"buffer 缺少 target_metadata，无法验证标签契约：{load_dir}"
+                    )
+            elif target_metadata != expected_target_metadata:
+                raise ReplayBufferCompatibilityError(
+                    f"buffer target_metadata 与预期标签契约不匹配：{load_dir}；"
+                    f"磁盘={target_metadata!r}，预期={expected_target_metadata!r}"
+                )
         capacity: int = meta["capacity"]
         state_shape: tuple = tuple(meta["state_shape"])
         n: int = meta["size"]
         pos: int = meta["pos"]
 
-        buf = cls(capacity, state_shape)
+        if expected_state_shape is not None and state_shape != tuple(expected_state_shape):
+            raise ReplayBufferCompatibilityError(
+                f"buffer state_shape 不匹配：磁盘={state_shape}，"
+                f"预期={tuple(expected_state_shape)}"
+            )
+        if not (0 <= n <= capacity and 0 <= pos < capacity):
+            raise ValueError(f"buffer size/pos 超出 capacity：{n=}, {pos=}, {capacity=}")
+        if n < capacity and pos != n:
+            raise ValueError(f"未满 buffer 的 pos 必须等于 size：{n=}, {pos=}")
+
+        buf = cls(capacity, state_shape, target_metadata)
         buf._size = n
         buf._pos = pos
 
@@ -416,18 +477,36 @@ class ReplayBuffer:
             shard_path = load_dir / f"states_{shard:04d}.npz"
             if not shard_path.exists():
                 raise FileNotFoundError(f"状态分片不存在：{shard_path}")
-            data = np.load(str(shard_path))
-            all_states.append(data["states"])
+            with np.load(str(shard_path)) as data:
+                chunk = data["states"]
+            expected_shape = (min(_SHARD_SIZE, n - shard * _SHARD_SIZE), *state_shape)
+            if chunk.shape != expected_shape:
+                raise ValueError(
+                    f"状态分片 shape 不匹配：{shard_path}，"
+                    f"得到 {chunk.shape}，预期 {expected_shape}"
+                )
+            all_states.append(chunk)
         states_ordered = np.concatenate(all_states, axis=0)  # (n, *state_shape)
 
         # ── 读取价值 ─────────────────────────────────────────────────────
         values_ordered = np.load(str(load_dir / "values.npy"))
+        if values_ordered.shape != (n,):
+            raise ValueError(f"values shape 不匹配：得到 {values_ordered.shape}，预期 {(n,)}")
 
         # ── 读取稀疏策略 ─────────────────────────────────────────────────
-        sp = np.load(str(load_dir / "sparse_policy.npz"))
-        flat_indices: np.ndarray = sp["indices"]
-        flat_probs: np.ndarray = sp["probs"]
-        pol_lens: np.ndarray = sp["lengths"]
+        with np.load(str(load_dir / "sparse_policy.npz")) as sp:
+            flat_indices: np.ndarray = sp["indices"]
+            flat_probs: np.ndarray = sp["probs"]
+            pol_lens: np.ndarray = sp["lengths"]
+        if (
+            pol_lens.shape != (n,)
+            or not np.issubdtype(pol_lens.dtype, np.integer)
+            or np.any(pol_lens < 0)
+            or flat_indices.ndim != 1
+            or flat_probs.shape != flat_indices.shape
+            or int(pol_lens.sum(dtype=np.int64)) != len(flat_indices)
+        ):
+            raise ValueError("sparse_policy shape/lengths 不匹配")
 
         # 写回正确槽位
         buf._states[valid_idx] = states_ordered

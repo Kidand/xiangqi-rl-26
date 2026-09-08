@@ -1,0 +1,936 @@
+{
+  "date": "2026-09-07",
+  "model": {
+    "path": "ckpts/best0716.pt",
+    "sha256": "d334d71a0dbe8a2d1a1314f930abc1f0c76af6b9bee80594ab71118fb6c0e3ee",
+    "iteration": 1498,
+    "config": {
+      "blocks": 15,
+      "filters": 192,
+      "se": true,
+      "history_steps": 2
+    },
+    "parameters": 10539835
+  },
+  "method": "Mirror all 31 input planes across columns; mirror both action endpoints; side and value target stay unchanged. Probabilities renormalized over legal moves. CPU float32 eval mode, no search or training.",
+  "random_probe": {
+    "checks": {
+      "positions": 480,
+      "legal_action_index_checks": 19720,
+      "red_positions": 240,
+      "black_positions": 240
+    },
+    "results": {
+      "positions": 48,
+      "policy_tv_mean": 0.30454914074895595,
+      "policy_tv_median": 0.29381807148456573,
+      "top1_agreement": 0.6458333333333334,
+      "value_absdiff_mean": 0.357696931110695,
+      "value_absdiff_max": 1.2594976425170898,
+      "per_position": [
+        {
+          "game": 0,
+          "ply": 5,
+          "policy_tv": 0.002851324388757348,
+          "top1_agrees": true,
+          "value": 0.6021509170532227,
+          "mirrored_value": -0.08511743694543839,
+          "value_absdiff": 0.6872683763504028
+        },
+        {
+          "game": 0,
+          "ply": 15,
+          "policy_tv": 0.25685355067253113,
+          "top1_agrees": true,
+          "value": 0.7036385536193848,
+          "mirrored_value": 0.2478039711713791,
+          "value_absdiff": 0.4558345675468445
+        },
+        {
+          "game": 0,
+          "ply": 25,
+          "policy_tv": 0.4345131516456604,
+          "top1_agrees": false,
+          "value": 0.363798588514328,
+          "mirrored_value": -0.029450485482811928,
+          "value_absdiff": 0.3932490646839142
+        },
+        {
+          "game": 0,
+          "ply": 35,
+          "policy_tv": 0.08523701876401901,
+          "top1_agrees": true,
+          "value": 0.2042998969554901,
+          "mirrored_value": -0.26368385553359985,
+          "value_absdiff": 0.46798375248908997
+        },
+        {
+          "game": 0,
+          "ply": 45,
+          "policy_tv": 0.560949444770813,
+          "top1_agrees": false,
+          "value": 0.5380173921585083,
+          "mirrored_value": -0.30857083201408386,
+          "value_absdiff": 0.8465882539749146
+        },
+        {
+          "game": 0,
+          "ply": 55,
+          "policy_tv": 0.2971436381340027,
+          "top1_agrees": true,
+          "value": 0.2771475911140442,
+          "mirrored_value": 0.5492333173751831,
+          "value_absdiff": 0.2720857262611389
+        },
+        {
+          "game": 1,
+          "ply": 5,
+          "policy_tv": 0.06058519333600998,
+          "top1_agrees": true,
+          "value": -0.46885329484939575,
+          "mirrored_value": 0.4471966624259949,
+          "value_absdiff": 0.9160499572753906
+        },
+        {
+          "game": 1,
+          "ply": 15,
+          "policy_tv": 0.07677415013313293,
+          "top1_agrees": true,
+          "value": -0.08960974961519241,
+          "mirrored_value": -0.09652695804834366,
+          "value_absdiff": 0.006917208433151245
+        },
+        {
+          "game": 1,
+          "ply": 25,
+          "policy_tv": 0.14753548800945282,
+          "top1_agrees": true,
+          "value": -0.4276585280895233,
+          "mirrored_value": -0.13765791058540344,
+          "value_absdiff": 0.2900006175041199
+        },
+        {
+          "game": 1,
+          "ply": 35,
+          "policy_tv": 0.2157784104347229,
+          "top1_agrees": true,
+          "value": -0.006570484954863787,
+          "mirrored_value": -0.13595473766326904,
+          "value_absdiff": 0.12938424944877625
+        },
+        {
+          "game": 1,
+          "ply": 45,
+          "policy_tv": 0.4389497637748718,
+          "top1_agrees": false,
+          "value": -0.3528684377670288,
+          "mirrored_value": -0.268985778093338,
+          "value_absdiff": 0.0838826596736908
+        },
+        {
+          "game": 1,
+          "ply": 55,
+          "policy_tv": 0.7471426725387573,
+          "top1_agrees": false,
+          "value": -0.9754185080528259,
+          "mirrored_value": -0.9561389684677124,
+          "value_absdiff": 0.019279539585113525
+        },
+        {
+          "game": 2,
+          "ply": 5,
+          "policy_tv": 0.028595980256795883,
+          "top1_agrees": true,
+          "value": -0.1535046249628067,
+          "mirrored_value": 0.2042965590953827,
+          "value_absdiff": 0.3578011989593506
+        },
+        {
+          "game": 2,
+          "ply": 15,
+          "policy_tv": 0.18092648684978485,
+          "top1_agrees": true,
+          "value": 0.5152274966239929,
+          "mirrored_value": 0.4135420024394989,
+          "value_absdiff": 0.10168549418449402
+        },
+        {
+          "game": 2,
+          "ply": 25,
+          "policy_tv": 0.251029372215271,
+          "top1_agrees": true,
+          "value": 0.7283965349197388,
+          "mirrored_value": 0.5282901525497437,
+          "value_absdiff": 0.20010638236999512
+        },
+        {
+          "game": 2,
+          "ply": 35,
+          "policy_tv": 0.4670107662677765,
+          "top1_agrees": false,
+          "value": 0.3102739751338959,
+          "mirrored_value": 0.1611407995223999,
+          "value_absdiff": 0.14913317561149597
+        },
+        {
+          "game": 2,
+          "ply": 45,
+          "policy_tv": 0.8900259733200073,
+          "top1_agrees": false,
+          "value": 0.847660481929779,
+          "mirrored_value": 0.8344859480857849,
+          "value_absdiff": 0.01317453384399414
+        },
+        {
+          "game": 2,
+          "ply": 55,
+          "policy_tv": 0.8256361484527588,
+          "top1_agrees": false,
+          "value": -0.021622678264975548,
+          "mirrored_value": 0.5647673606872559,
+          "value_absdiff": 0.5863900184631348
+        },
+        {
+          "game": 3,
+          "ply": 5,
+          "policy_tv": 0.38440755009651184,
+          "top1_agrees": true,
+          "value": -0.4180457592010498,
+          "mirrored_value": -0.29569628834724426,
+          "value_absdiff": 0.12234947085380554
+        },
+        {
+          "game": 3,
+          "ply": 15,
+          "policy_tv": 0.09520503878593445,
+          "top1_agrees": true,
+          "value": 0.19901785254478455,
+          "mirrored_value": 0.31622663140296936,
+          "value_absdiff": 0.11720877885818481
+        },
+        {
+          "game": 3,
+          "ply": 25,
+          "policy_tv": 0.5464380383491516,
+          "top1_agrees": false,
+          "value": 0.23145830631256104,
+          "mirrored_value": 0.5399035811424255,
+          "value_absdiff": 0.3084452748298645
+        },
+        {
+          "game": 3,
+          "ply": 35,
+          "policy_tv": 0.2037719339132309,
+          "top1_agrees": true,
+          "value": 0.05857487767934799,
+          "mirrored_value": 0.26293879747390747,
+          "value_absdiff": 0.20436391234397888
+        },
+        {
+          "game": 3,
+          "ply": 45,
+          "policy_tv": 0.4898446798324585,
+          "top1_agrees": false,
+          "value": 0.9409608244895935,
+          "mirrored_value": 0.7865340113639832,
+          "value_absdiff": 0.15442681312561035
+        },
+        {
+          "game": 3,
+          "ply": 55,
+          "policy_tv": 0.2904925048351288,
+          "top1_agrees": true,
+          "value": 0.3949410617351532,
+          "mirrored_value": 0.8166328072547913,
+          "value_absdiff": 0.42169174551963806
+        },
+        {
+          "game": 4,
+          "ply": 5,
+          "policy_tv": 0.43740856647491455,
+          "top1_agrees": false,
+          "value": 0.42687878012657166,
+          "mirrored_value": 0.04404511675238609,
+          "value_absdiff": 0.38283365964889526
+        },
+        {
+          "game": 4,
+          "ply": 15,
+          "policy_tv": 0.0024331912863999605,
+          "top1_agrees": true,
+          "value": 0.9527676105499268,
+          "mirrored_value": 0.5638085007667542,
+          "value_absdiff": 0.3889591097831726
+        },
+        {
+          "game": 4,
+          "ply": 25,
+          "policy_tv": 0.46318310499191284,
+          "top1_agrees": true,
+          "value": -0.48748037219047546,
+          "mirrored_value": 0.25500279664993286,
+          "value_absdiff": 0.7424831390380859
+        },
+        {
+          "game": 4,
+          "ply": 35,
+          "policy_tv": 0.09065596014261246,
+          "top1_agrees": true,
+          "value": -0.3582785725593567,
+          "mirrored_value": 0.9012191295623779,
+          "value_absdiff": 1.2594976425170898
+        },
+        {
+          "game": 4,
+          "ply": 45,
+          "policy_tv": 0.3557419180870056,
+          "top1_agrees": true,
+          "value": -0.1936017870903015,
+          "mirrored_value": -0.7892994284629822,
+          "value_absdiff": 0.5956976413726807
+        },
+        {
+          "game": 4,
+          "ply": 55,
+          "policy_tv": 0.09468148648738861,
+          "top1_agrees": true,
+          "value": 0.040964823216199875,
+          "mirrored_value": 0.08884584158658981,
+          "value_absdiff": 0.04788101837038994
+        },
+        {
+          "game": 5,
+          "ply": 5,
+          "policy_tv": 0.1559627652168274,
+          "top1_agrees": false,
+          "value": -0.37990784645080566,
+          "mirrored_value": -0.2908506989479065,
+          "value_absdiff": 0.08905714750289917
+        },
+        {
+          "game": 5,
+          "ply": 15,
+          "policy_tv": 0.3377727270126343,
+          "top1_agrees": true,
+          "value": -0.1160418689250946,
+          "mirrored_value": -0.6319423913955688,
+          "value_absdiff": 0.5159004926681519
+        },
+        {
+          "game": 5,
+          "ply": 25,
+          "policy_tv": 0.5375139117240906,
+          "top1_agrees": false,
+          "value": 0.563384473323822,
+          "mirrored_value": -0.4223722219467163,
+          "value_absdiff": 0.9857566952705383
+        },
+        {
+          "game": 5,
+          "ply": 35,
+          "policy_tv": 0.4966612756252289,
+          "top1_agrees": false,
+          "value": 0.355255126953125,
+          "mirrored_value": -0.42978635430336,
+          "value_absdiff": 0.7850414514541626
+        },
+        {
+          "game": 5,
+          "ply": 45,
+          "policy_tv": 0.3575572669506073,
+          "top1_agrees": true,
+          "value": 0.7984746098518372,
+          "mirrored_value": 0.6569318771362305,
+          "value_absdiff": 0.1415427327156067
+        },
+        {
+          "game": 5,
+          "ply": 55,
+          "policy_tv": 0.5891223549842834,
+          "top1_agrees": false,
+          "value": 0.6117805242538452,
+          "mirrored_value": 0.5577205419540405,
+          "value_absdiff": 0.05405998229980469
+        },
+        {
+          "game": 6,
+          "ply": 5,
+          "policy_tv": 0.051386285573244095,
+          "top1_agrees": true,
+          "value": -0.11658007651567459,
+          "mirrored_value": 0.31614747643470764,
+          "value_absdiff": 0.43272754549980164
+        },
+        {
+          "game": 6,
+          "ply": 15,
+          "policy_tv": 0.6771515011787415,
+          "top1_agrees": false,
+          "value": 0.14176630973815918,
+          "mirrored_value": -0.1318521350622177,
+          "value_absdiff": 0.2736184597015381
+        },
+        {
+          "game": 6,
+          "ply": 25,
+          "policy_tv": 0.4375702738761902,
+          "top1_agrees": false,
+          "value": -0.4875538647174835,
+          "mirrored_value": -0.46626612544059753,
+          "value_absdiff": 0.021287739276885986
+        },
+        {
+          "game": 6,
+          "ply": 35,
+          "policy_tv": 0.005776832811534405,
+          "top1_agrees": true,
+          "value": -0.5919332504272461,
+          "mirrored_value": -0.41894829273223877,
+          "value_absdiff": 0.17298495769500732
+        },
+        {
+          "game": 6,
+          "ply": 45,
+          "policy_tv": 0.01470583863556385,
+          "top1_agrees": true,
+          "value": -0.8659655451774597,
+          "mirrored_value": 0.26388201117515564,
+          "value_absdiff": 1.129847526550293
+        },
+        {
+          "game": 6,
+          "ply": 55,
+          "policy_tv": 0.6476267576217651,
+          "top1_agrees": false,
+          "value": 0.4312695562839508,
+          "mirrored_value": 0.5251736640930176,
+          "value_absdiff": 0.09390410780906677
+        },
+        {
+          "game": 7,
+          "ply": 5,
+          "policy_tv": 0.05015338957309723,
+          "top1_agrees": true,
+          "value": -0.3158068358898163,
+          "mirrored_value": -0.15931867063045502,
+          "value_absdiff": 0.15648816525936127
+        },
+        {
+          "game": 7,
+          "ply": 15,
+          "policy_tv": 0.07231242954730988,
+          "top1_agrees": true,
+          "value": 0.294930100440979,
+          "mirrored_value": 0.38401541113853455,
+          "value_absdiff": 0.08908531069755554
+        },
+        {
+          "game": 7,
+          "ply": 25,
+          "policy_tv": 0.01686597801744938,
+          "top1_agrees": true,
+          "value": -0.015234746038913727,
+          "mirrored_value": -0.27511414885520935,
+          "value_absdiff": 0.2598794102668762
+        },
+        {
+          "game": 7,
+          "ply": 35,
+          "policy_tv": 0.013091115280985832,
+          "top1_agrees": true,
+          "value": 0.7074266076087952,
+          "mirrored_value": 0.6706414222717285,
+          "value_absdiff": 0.03678518533706665
+        },
+        {
+          "game": 7,
+          "ply": 45,
+          "policy_tv": 0.3116130828857422,
+          "top1_agrees": true,
+          "value": 0.7038888931274414,
+          "mirrored_value": -0.42468616366386414,
+          "value_absdiff": 1.128575086593628
+        },
+        {
+          "game": 7,
+          "ply": 55,
+          "policy_tv": 0.42371246218681335,
+          "top1_agrees": true,
+          "value": -0.6869029998779297,
+          "mirrored_value": -0.7671607136726379,
+          "value_absdiff": 0.08025771379470825
+        }
+      ]
+    }
+  },
+  "recorded_probe": {
+    "source": {
+      "path": "records\\gui\\20260716-160758_ava_和棋.json",
+      "sha256": "c7c84c030a506db208016d07e487ca36470c66db047b09d319436b2a190f4f9c",
+      "record_meta": {
+        "mode": "ava",
+        "sims": 400,
+        "time": "2026-07-16T16:07:58"
+      },
+      "red": "ai",
+      "black": "ai",
+      "result": "1/2-1/2",
+      "termination": "repetition",
+      "model_identity_caveat": "Record names both players ai and records mode/sims/time only; no model checkpoint identity or hash. Its date does not prove best0716 produced the game."
+    },
+    "checks": {
+      "positions": 54,
+      "legal_action_index_checks": 1833,
+      "red_positions": 27,
+      "black_positions": 27
+    },
+    "results": {
+      "positions": 54,
+      "policy_tv_mean": 0.45731329874029647,
+      "policy_tv_median": 0.39102883636951447,
+      "top1_agreement": 0.5925925925925926,
+      "value_absdiff_mean": 0.210075058620768,
+      "value_absdiff_max": 0.5781297087669373,
+      "per_position": [
+        {
+          "ply": 0,
+          "policy_tv": 0.931188702583313,
+          "top1_agrees": false,
+          "value": 0.012122191488742828,
+          "mirrored_value": 0.012122191488742828,
+          "value_absdiff": 0.0
+        },
+        {
+          "ply": 1,
+          "policy_tv": 0.9868825078010559,
+          "top1_agrees": false,
+          "value": -0.10454017668962479,
+          "mirrored_value": -0.13695372641086578,
+          "value_absdiff": 0.032413549721241
+        },
+        {
+          "ply": 2,
+          "policy_tv": 0.22569699585437775,
+          "top1_agrees": true,
+          "value": 0.004600641317665577,
+          "mirrored_value": 0.2725423574447632,
+          "value_absdiff": 0.2679417133331299
+        },
+        {
+          "ply": 3,
+          "policy_tv": 0.8958954215049744,
+          "top1_agrees": false,
+          "value": -0.14044544100761414,
+          "mirrored_value": -0.04997953027486801,
+          "value_absdiff": 0.09046591073274612
+        },
+        {
+          "ply": 4,
+          "policy_tv": 0.05943811312317848,
+          "top1_agrees": true,
+          "value": 0.012122191488742828,
+          "mirrored_value": -0.07146939635276794,
+          "value_absdiff": 0.08359158784151077
+        },
+        {
+          "ply": 5,
+          "policy_tv": 0.0033037876710295677,
+          "top1_agrees": true,
+          "value": -0.12894447147846222,
+          "mirrored_value": -0.10480868816375732,
+          "value_absdiff": 0.024135783314704895
+        },
+        {
+          "ply": 6,
+          "policy_tv": 0.9722875952720642,
+          "top1_agrees": false,
+          "value": 0.012122191488742828,
+          "mirrored_value": -0.039985693991184235,
+          "value_absdiff": 0.05210788547992706
+        },
+        {
+          "ply": 7,
+          "policy_tv": 0.1021103784441948,
+          "top1_agrees": true,
+          "value": -0.16005779802799225,
+          "mirrored_value": -0.2663474678993225,
+          "value_absdiff": 0.10628966987133026
+        },
+        {
+          "ply": 8,
+          "policy_tv": 0.42262783646583557,
+          "top1_agrees": true,
+          "value": 0.010713792406022549,
+          "mirrored_value": 0.018764935433864594,
+          "value_absdiff": 0.008051143027842045
+        },
+        {
+          "ply": 9,
+          "policy_tv": 0.22956861555576324,
+          "top1_agrees": true,
+          "value": -0.15356241166591644,
+          "mirrored_value": -0.4136698246002197,
+          "value_absdiff": 0.2601073980331421
+        },
+        {
+          "ply": 10,
+          "policy_tv": 0.08230732381343842,
+          "top1_agrees": true,
+          "value": 0.023499853909015656,
+          "mirrored_value": 0.09337220340967178,
+          "value_absdiff": 0.06987234950065613
+        },
+        {
+          "ply": 11,
+          "policy_tv": 0.3875651955604553,
+          "top1_agrees": true,
+          "value": -0.1205378845334053,
+          "mirrored_value": -0.08527159690856934,
+          "value_absdiff": 0.03526628762483597
+        },
+        {
+          "ply": 12,
+          "policy_tv": 0.0024141622707247734,
+          "top1_agrees": true,
+          "value": 0.0038598510436713696,
+          "mirrored_value": -0.10663679242134094,
+          "value_absdiff": 0.1104966402053833
+        },
+        {
+          "ply": 13,
+          "policy_tv": 0.004208621568977833,
+          "top1_agrees": true,
+          "value": -0.13295026123523712,
+          "mirrored_value": -0.16170208156108856,
+          "value_absdiff": 0.02875182032585144
+        },
+        {
+          "ply": 14,
+          "policy_tv": 0.12518207728862762,
+          "top1_agrees": true,
+          "value": 0.03633430227637291,
+          "mirrored_value": -0.1680489033460617,
+          "value_absdiff": 0.20438320934772491
+        },
+        {
+          "ply": 15,
+          "policy_tv": 0.001959610264748335,
+          "top1_agrees": true,
+          "value": -0.12850582599639893,
+          "mirrored_value": -0.23624150454998016,
+          "value_absdiff": 0.10773567855358124
+        },
+        {
+          "ply": 16,
+          "policy_tv": 0.0028596522752195597,
+          "top1_agrees": true,
+          "value": -0.002458215458318591,
+          "mirrored_value": 0.3899998068809509,
+          "value_absdiff": 0.3924580216407776
+        },
+        {
+          "ply": 17,
+          "policy_tv": 5.305447484715842e-05,
+          "top1_agrees": true,
+          "value": -0.1276918202638626,
+          "mirrored_value": -0.33977511525154114,
+          "value_absdiff": 0.21208329498767853
+        },
+        {
+          "ply": 18,
+          "policy_tv": 0.17697979509830475,
+          "top1_agrees": true,
+          "value": -0.008672387339174747,
+          "mirrored_value": 0.5694572925567627,
+          "value_absdiff": 0.5781297087669373
+        },
+        {
+          "ply": 19,
+          "policy_tv": 0.2737984359264374,
+          "top1_agrees": true,
+          "value": -0.12934510409832,
+          "mirrored_value": -0.490068256855011,
+          "value_absdiff": 0.3607231378555298
+        },
+        {
+          "ply": 20,
+          "policy_tv": 0.9986853003501892,
+          "top1_agrees": false,
+          "value": -0.017133312299847603,
+          "mirrored_value": 0.1420171856880188,
+          "value_absdiff": 0.15915049612522125
+        },
+        {
+          "ply": 21,
+          "policy_tv": 0.9994595646858215,
+          "top1_agrees": false,
+          "value": -0.1419982612133026,
+          "mirrored_value": 0.10192514955997467,
+          "value_absdiff": 0.24392341077327728
+        },
+        {
+          "ply": 22,
+          "policy_tv": 0.9543374180793762,
+          "top1_agrees": false,
+          "value": -0.014077399857342243,
+          "mirrored_value": -0.4878597855567932,
+          "value_absdiff": 0.47378239035606384
+        },
+        {
+          "ply": 23,
+          "policy_tv": 0.9923918843269348,
+          "top1_agrees": false,
+          "value": -0.16734817624092102,
+          "mirrored_value": -0.33172404766082764,
+          "value_absdiff": 0.16437587141990662
+        },
+        {
+          "ply": 24,
+          "policy_tv": 0.9986575841903687,
+          "top1_agrees": false,
+          "value": -0.002882413100451231,
+          "mirrored_value": 0.06543664634227753,
+          "value_absdiff": 0.06831905990839005
+        },
+        {
+          "ply": 25,
+          "policy_tv": 0.23576754331588745,
+          "top1_agrees": true,
+          "value": -0.1679566651582718,
+          "mirrored_value": -0.13850337266921997,
+          "value_absdiff": 0.02945329248905182
+        },
+        {
+          "ply": 26,
+          "policy_tv": 0.9694755673408508,
+          "top1_agrees": false,
+          "value": -0.01298544742166996,
+          "mirrored_value": 0.42116859555244446,
+          "value_absdiff": 0.43415403366088867
+        },
+        {
+          "ply": 27,
+          "policy_tv": 0.02146337367594242,
+          "top1_agrees": true,
+          "value": -0.09799157828092575,
+          "mirrored_value": 0.4573078453540802,
+          "value_absdiff": 0.5552994012832642
+        },
+        {
+          "ply": 28,
+          "policy_tv": 0.3834575116634369,
+          "top1_agrees": true,
+          "value": 0.006361539475619793,
+          "mirrored_value": -0.10763706266880035,
+          "value_absdiff": 0.11399859935045242
+        },
+        {
+          "ply": 29,
+          "policy_tv": 0.7107083201408386,
+          "top1_agrees": false,
+          "value": -0.09328210353851318,
+          "mirrored_value": -0.21218247711658478,
+          "value_absdiff": 0.1189003735780716
+        },
+        {
+          "ply": 30,
+          "policy_tv": 0.07985733449459076,
+          "top1_agrees": true,
+          "value": -0.010291459038853645,
+          "mirrored_value": -0.005140626337379217,
+          "value_absdiff": 0.005150832701474428
+        },
+        {
+          "ply": 31,
+          "policy_tv": 0.9747579097747803,
+          "top1_agrees": false,
+          "value": -0.020998960360884666,
+          "mirrored_value": -0.05678597465157509,
+          "value_absdiff": 0.03578701615333557
+        },
+        {
+          "ply": 32,
+          "policy_tv": 0.1605074107646942,
+          "top1_agrees": true,
+          "value": -0.023122694343328476,
+          "mirrored_value": -0.3513492941856384,
+          "value_absdiff": 0.32822659611701965
+        },
+        {
+          "ply": 33,
+          "policy_tv": 0.785057008266449,
+          "top1_agrees": false,
+          "value": -0.11829964071512222,
+          "mirrored_value": -0.14735618233680725,
+          "value_absdiff": 0.029056541621685028
+        },
+        {
+          "ply": 34,
+          "policy_tv": 0.37996217608451843,
+          "top1_agrees": true,
+          "value": 0.00464335922151804,
+          "mirrored_value": -0.3563869297504425,
+          "value_absdiff": 0.3610302805900574
+        },
+        {
+          "ply": 35,
+          "policy_tv": 0.0026177680119872093,
+          "top1_agrees": true,
+          "value": -0.18369528651237488,
+          "mirrored_value": -0.12858910858631134,
+          "value_absdiff": 0.05510617792606354
+        },
+        {
+          "ply": 36,
+          "policy_tv": 0.48181185126304626,
+          "top1_agrees": true,
+          "value": 0.10961302369832993,
+          "mirrored_value": -0.1596793234348297,
+          "value_absdiff": 0.26929235458374023
+        },
+        {
+          "ply": 37,
+          "policy_tv": 0.9349198341369629,
+          "top1_agrees": false,
+          "value": -0.17122499644756317,
+          "mirrored_value": 0.22394077479839325,
+          "value_absdiff": 0.3951657712459564
+        },
+        {
+          "ply": 38,
+          "policy_tv": 0.292671799659729,
+          "top1_agrees": true,
+          "value": 0.12399019300937653,
+          "mirrored_value": -0.15296809375286102,
+          "value_absdiff": 0.27695828676223755
+        },
+        {
+          "ply": 39,
+          "policy_tv": 0.7209288477897644,
+          "top1_agrees": false,
+          "value": -0.18953368067741394,
+          "mirrored_value": -0.22458894550800323,
+          "value_absdiff": 0.035055264830589294
+        },
+        {
+          "ply": 40,
+          "policy_tv": 0.45743292570114136,
+          "top1_agrees": true,
+          "value": 0.14294376969337463,
+          "mirrored_value": 0.10424602031707764,
+          "value_absdiff": 0.038697749376297
+        },
+        {
+          "ply": 41,
+          "policy_tv": 0.3944924771785736,
+          "top1_agrees": true,
+          "value": -0.18052737414836884,
+          "mirrored_value": -0.33381012082099915,
+          "value_absdiff": 0.1532827466726303
+        },
+        {
+          "ply": 42,
+          "policy_tv": 0.5110782384872437,
+          "top1_agrees": false,
+          "value": -0.07337649911642075,
+          "mirrored_value": 0.0805094763636589,
+          "value_absdiff": 0.15388597548007965
+        },
+        {
+          "ply": 43,
+          "policy_tv": 0.7201545238494873,
+          "top1_agrees": false,
+          "value": -0.04531368613243103,
+          "mirrored_value": -0.35617485642433167,
+          "value_absdiff": 0.31086117029190063
+        },
+        {
+          "ply": 44,
+          "policy_tv": 0.498324453830719,
+          "top1_agrees": true,
+          "value": -0.0770810917019844,
+          "mirrored_value": 0.3555682599544525,
+          "value_absdiff": 0.4326493442058563
+        },
+        {
+          "ply": 45,
+          "policy_tv": 0.7389661073684692,
+          "top1_agrees": false,
+          "value": 0.003958320245146751,
+          "mirrored_value": -0.5370244979858398,
+          "value_absdiff": 0.5409828424453735
+        },
+        {
+          "ply": 46,
+          "policy_tv": 0.39721930027008057,
+          "top1_agrees": false,
+          "value": -0.09817866235971451,
+          "mirrored_value": 0.11238035559654236,
+          "value_absdiff": 0.21055901050567627
+        },
+        {
+          "ply": 47,
+          "policy_tv": 0.13663321733474731,
+          "top1_agrees": true,
+          "value": -0.11097833514213562,
+          "mirrored_value": -0.26262927055358887,
+          "value_absdiff": 0.15165093541145325
+        },
+        {
+          "ply": 48,
+          "policy_tv": 0.17049521207809448,
+          "top1_agrees": true,
+          "value": -0.09947217255830765,
+          "mirrored_value": 0.2673097550868988,
+          "value_absdiff": 0.36678192019462585
+        },
+        {
+          "ply": 49,
+          "policy_tv": 0.880807101726532,
+          "top1_agrees": false,
+          "value": -0.14015138149261475,
+          "mirrored_value": -0.600034773349762,
+          "value_absdiff": 0.4598833918571472
+        },
+        {
+          "ply": 50,
+          "policy_tv": 0.637556254863739,
+          "top1_agrees": false,
+          "value": -0.10508476942777634,
+          "mirrored_value": 0.2642253041267395,
+          "value_absdiff": 0.36931008100509644
+        },
+        {
+          "ply": 51,
+          "policy_tv": 0.13663211464881897,
+          "top1_agrees": true,
+          "value": -0.11097849905490875,
+          "mirrored_value": -0.2626303434371948,
+          "value_absdiff": 0.15165184438228607
+        },
+        {
+          "ply": 52,
+          "policy_tv": 0.17049521207809448,
+          "top1_agrees": true,
+          "value": -0.09947217255830765,
+          "mirrored_value": 0.2673097550868988,
+          "value_absdiff": 0.36678192019462585
+        },
+        {
+          "ply": 53,
+          "policy_tv": 0.880807101726532,
+          "top1_agrees": false,
+          "value": -0.14015138149261475,
+          "mirrored_value": -0.600034773349762,
+          "value_absdiff": 0.4598833918571472
+        }
+      ]
+    }
+  },
+  "limitations": [
+    "Random legal trajectories may be outside the training distribution.",
+    "The recorded sample is one 54-ply game, and adjacent positions are correlated.",
+    "Policy asymmetry may choose equally good mirror alternatives; neither disagreement metric establishes Elo loss.",
+    "No held-out game-strength test or augmentation-training experiment was performed."
+  ]
+}

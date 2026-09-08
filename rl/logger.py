@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import csv
 import datetime
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -68,7 +70,39 @@ CSV_COLUMNS: list[str] = [
     "selfplay_sec",
     "train_sec",
     "total_sec",
+    "target_entropy",
+    "policy_kl",
+    "arena_sec",
+    "buffer_save_wait_sec",
 ]
+
+
+def _prepare_csv(path: Path) -> bool:
+    """Upgrade a known older header atomically; never append rows under a wrong schema."""
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    with path.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        header = reader.fieldnames
+        if header == CSV_COLUMNS:
+            return True
+        if not header or header != CSV_COLUMNS[:len(header)]:
+            raise ValueError(f"不兼容的 metrics.csv 表头，使用独立 log_dir: {path}")
+        fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", newline="", encoding="utf-8") as target:
+                writer = csv.DictWriter(target, fieldnames=CSV_COLUMNS)
+                writer.writeheader()
+                for row in reader:
+                    if None in row or any(v is None for v in row.values()):
+                        raise ValueError(f"metrics.csv 行宽与表头不符，拒绝迁移: {path}")
+                    writer.writerow(row)
+            # Windows cannot replace a file while its read handle is open.
+            source.close()
+            os.replace(temp_name, path)
+        finally:
+            Path(temp_name).unlink(missing_ok=True)
+    return True
 
 
 def _fmt_elapsed(seconds: float) -> str:
@@ -96,6 +130,9 @@ class TrainLogger:
         self._log_dir = Path(log_dir)
         self._log_dir.mkdir(parents=True, exist_ok=True)
 
+        self._csv_path = self._log_dir / "metrics.csv"
+        self._csv_initialized = _prepare_csv(self._csv_path)
+
         # ── 文件日志（带时间戳，直接 open() 写入，绕过 logging 模块捕获问题）──
         self._log_file_path = self._log_dir / "train.log"
         # 以追加模式打开，确保在 Windows 上立即创建文件
@@ -107,9 +144,7 @@ class TrainLogger:
             self._log_file_handle = None
 
         # ── metrics.csv（追加模式，首次写入时写 header）──────────────────
-        self._csv_path = self._log_dir / "metrics.csv"
-        # 若文件已存在，认为 header 已写
-        self._csv_initialized: bool = self._csv_path.exists()
+        # 表头在打开日志前已验证/迁移；旧列值不变，新列留空。
 
         # ── TensorBoard（可选）────────────────────────────────────────────
         self._tb_writer: Any = None
@@ -225,6 +260,8 @@ class TrainLogger:
         samples_per_sec: float = 0.0,
         grad_norm: float = 0.0,
         iteration: int = 0,
+        target_entropy: Optional[float] = None,
+        policy_kl: Optional[float] = None,
     ) -> None:
         """输出训练步日志（DESIGN §11，每 `train_log_interval` 步调用一次）。"""
         line = (
@@ -233,6 +270,8 @@ class TrainLogger:
             f"entropy {entropy:.3f} | value_mae {value_mae:.4f} | "
             f"lr {lr:.2e} | samples/s {samples_per_sec:.0f} | grad_norm {grad_norm:.3f}"
         )
+        if target_entropy is not None and policy_kl is not None:
+            line += f" | target_entropy {target_entropy:.3f} | policy_kl {policy_kl:.5f}"
         self._emit(line)
 
         # TensorBoard 标量
@@ -243,6 +282,10 @@ class TrainLogger:
                 self._tb_writer.add_scalar("train/policy_loss", policy_loss, global_step)
                 self._tb_writer.add_scalar("train/value_loss", value_loss, global_step)
                 self._tb_writer.add_scalar("train/entropy", entropy, global_step)
+                if target_entropy is not None:
+                    self._tb_writer.add_scalar("train/target_entropy", target_entropy, global_step)
+                if policy_kl is not None:
+                    self._tb_writer.add_scalar("train/policy_kl", policy_kl, global_step)
                 self._tb_writer.add_scalar("train/value_mae", value_mae, global_step)
                 self._tb_writer.add_scalar("train/lr", lr, global_step)
                 self._tb_writer.add_scalar("train/grad_norm", grad_norm, global_step)
@@ -329,7 +372,8 @@ class TrainLogger:
                 "resign_rate", "resign_fp_rate", "buffer_size",
                 "loss", "policy_loss", "value_loss", "entropy", "value_mae",
                 "lr", "arena_score", "arena_red_score", "arena_black_score",
-                "selfplay_sec", "train_sec", "total_sec",
+                "selfplay_sec", "train_sec", "total_sec", "arena_sec", "buffer_save_wait_sec",
+                "target_entropy", "policy_kl",
             ]
             for k in scalar_keys:
                 v = row.get(k)

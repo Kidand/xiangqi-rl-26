@@ -754,9 +754,9 @@ class TestTrainLoggerCSV:
         )
 
     def test_csv_column_count(self):
-        """CSV_COLUMNS 应包含 DESIGN §11 规定的 25 列。"""
-        assert len(CSV_COLUMNS) == 25, (
-            f"CSV_COLUMNS 应有 25 列，实际 {len(CSV_COLUMNS)}"
+        """保留历史 25 列，追加四个训练诊断列。"""
+        assert len(CSV_COLUMNS) == 29, (
+            f"CSV_COLUMNS 应有 29 列，实际 {len(CSV_COLUMNS)}"
         )
 
     def test_csv_required_columns_present(self):
@@ -765,6 +765,7 @@ class TestTrainLoggerCSV:
             "iter", "red_winrate", "black_winrate", "draw_rate",
             "avg_plies", "buffer_size", "loss", "arena_score",
             "promoted", "selfplay_sec", "train_sec", "total_sec",
+            "target_entropy", "policy_kl", "arena_sec", "buffer_save_wait_sec",
         ]
         for col in required:
             assert col in CSV_COLUMNS, f"CSV_COLUMNS 缺少列 '{col}'"

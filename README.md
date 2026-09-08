@@ -157,17 +157,16 @@ h2e2 h9g7 e2e9
 
 ## 云端训练全流程
 
-> **当前进度**：已完成六个训练阶段、约 400 万盘自博弈（小网 10×128 三阶段 → 蒸馏迁移
-> 大网 15×192+SE → 大网续训）。**当前生效配置为 `configs/cloud_stage6.yaml`**（PUCT +
-> 1000 sims，从阶段三峰值 iter_1498 续训）；各阶段的配置与决策依据记录在对应 yaml
-> 文件头注释与 git log 中。
+> **历史进度**：本地日志覆盖到阶段五；阶段六 `configs/cloud_stage6.yaml` 是 PUCT+
+> 1000 sims 的续训方案，未找到本地阶段六实测日志。以下保留历史操作记录；
+> 比较不同训练方法可参考[从已有模型开始新的训练](#从已有模型开始新的训练)。
 
 ### 阶段六续训（当前完整命令）
 
 ```bash
 cd ~/xiangqi-rl-26 && git pull
 
-# ① 备份阶段五 best，把起点恢复到阶段三峰值（iter_1498，即本地存档 best0716）
+# ① 备份阶段五 best，把起点恢复到阶段三峰值（iter_1498）
 cp ckpts/best.pt ckpts/best_stage5_final.pt
 cp ckpts/iter_1498.pt ckpts/best.pt
 mkdir -p ckpts/stage5_archive && mv ckpts/iter_1[5-7][0-9][0-9].pt ckpts/stage5_archive/
@@ -175,7 +174,7 @@ ls ckpts/iter_149*.pt        # 确认 iter_1498.pt / iter_1499.pt 还在
 
 # ② 续训（tmux 内；启动后确认日志 start_iter=1500、lr≈1.73e-4）
 tmux new -s xiangqi          # 已有会话则 tmux attach -t xiangqi
-bash scripts/train_cloud.sh --config configs/cloud_stage6.yaml --resume
+bash scripts/train_cloud.sh --config configs/cloud_stage6.yaml --resume --allow-legacy-buffer
 
 # ③ 另开终端观察
 tail -f logs/train.log
@@ -183,7 +182,8 @@ tail -f logs/train.log
 
 观测口径：selfplay 约 650s/迭代（1000 sims，较 600 增 ~65%）；前 ~7 迭代为旧 buffer
 混合期，成效看 15 迭代之后——policy_loss/entropy 应脱离 ~0.99 地板继续下行、晋升回到
-15+/百迭代、arena 均值 > 0.52；30~40 迭代无起色即停下复盘（详见 cloud_stage6.yaml 头部）。
+15+/百迭代、arena 均值 > 0.52。以上是当时的观察指标，不能替代独立棋力评测；现应按
+[棋力评测](#棋力评测)流程判断效果，不能将 policy_loss 与预测熵接近解释为 KL≈0。
 
 ### 云端环境（项目根目录，下文以 `~/xiangqi-rl-26` 代指）
 
@@ -230,6 +230,28 @@ bash scripts/train_cloud.sh --resume
 # 脚本自动从最新 checkpoint 和 buffer 续训
 ```
 
+#### 从已有模型开始新的训练
+
+调整训练方法时，可以从同一个检查点分别开始训练，比较不同配置的效果。
+`--init-from` 只加载权重，使用新的优化器和空经验池，迭代编号从 0 开始；模型结构须与配置一致。
+先将选定的起点保存为 `ckpts/baseline.pt`，例如复制已有的 `ckpts/best.pt`，再选择一组配置运行：
+
+```bash
+python -m rl.train --config configs/experiments/mirror.yaml --init-from ckpts/baseline.pt
+```
+
+`configs/experiments/` 提供[训练实验配置](#训练实验配置)，各组分别指定输出目录。
+新训练要求 checkpoint、log、records 目录为空；中断后使用同一配置和 `--resume` 接续：
+
+```bash
+python -m rl.train --config configs/experiments/mirror.yaml --resume
+```
+
+检查点会记录初始化来源、文件哈希和价值标签设置。改变和棋值或价值混合参数时，应另建训练，
+避免混入旧标签。没有标签记录的历史经验池，仅在保持原非零和棋配置时允许通过
+`--resume --allow-legacy-buffer` 加载；它仍保留未知标签状态，后续续训也需要该选项。
+零和目标训练使用新经验池，让旧权重逐步适应新的价值尺度。
+
 #### 监控训练进度
 
 **实时统计**（每 30 秒更新一次，汇总所有 worker）：
@@ -250,6 +272,34 @@ bash scripts/train_cloud.sh --resume
 ```
 
 **指标汇总行**写入 `logs/metrics.csv`，可用 Excel 或 Python 绘图分析。
+
+#### 棋力评测
+
+训练中的 Arena 用于筛选候选模型。比较不同训练配置的效果时，可以用
+`scripts/benchmark_models.py` 与固定的基线模型对战。
+
+准备一份独立生成并固定保存的自博弈 JSON/JSONL 记录，例如 `benchmarks/frozen_selfplay.jsonl`，
+作为各组共用的开局来源。记录需包含训练程序写入的 `selfplay-*` 双方标签。
+将下面的候选路径替换为相应配置 `train.checkpoint_dir` 下的模型文件：
+
+```bash
+python scripts/benchmark_models.py \
+  --candidate /path/to/candidate.pt --baseline ckpts/baseline.pt \
+  --records benchmarks/frozen_selfplay.jsonl --config configs/experiments/zero.yaml \
+  --opening-plies 12 --pairs 400 --seed 42 --sims 400 \
+  --candidate-draw-value 0 --baseline-draw-value -0.2 \
+  --device cuda:0 --out reports/candidate_vs_baseline.json
+```
+
+工具会重演开局历史，每个开局交换红黑各下一盘，之后不加探索噪声。
+400 个开局对对应 800 盘，重复前缀会去重；结果保存模型哈希、搜索配置、完整棋谱和
+按开局对计算的近似 95% 置信区间。单个开局对或零观察方差时，区间留空。
+评测支持 CPU/CUDA，目前按盘串行运行并显示进度，结果文件不会覆盖已有文件。
+
+双方和棋值必须显式指定：示例中的 -0.2 保留历史训练 Arena 的设置；若以 GUI 搜索为基线，
+则使用其原设置 0。可通过 `--candidate-config` 和 `--baseline-config` 分别指定其余搜索参数。
+比较各组时保持开局文件、seed、模拟次数和基线设置一致；若调整了搜索，也应评测基线权重在
+新搜索设置下的表现，以区分搜索和权重带来的变化。最终复验使用未参与训练或调参的开局。
 
 #### 导出模型
 
@@ -321,6 +371,26 @@ mcts: {num_sims: 1000}                        # 阶段六核心杠杆：600→10
 演进过程中沉淀的训练杠杆（均有 yaml 注释与 DESIGN 契约）：π 目标锐化（temp 0.75 是
 实证承重值，0.85 会崩盘）、z 混根价值去噪、arena LCB 门控 + 对局去相关、num_sims 按迭代
 调度、大模型蒸馏迁移工具链（`scripts/distill_bigmodel.py`）。
+
+### 训练实验配置
+
+`configs/experiments/` 用于比较镜像增强和价值目标的效果。四组均采用
+15×192+SE、history_steps=2 的网络，包含 10,539,835 个参数，其余搜索与训练预算一致。
+
+| 配置 | 左右镜像概率 | 和棋目标 | 用途 |
+|---|---:|---:|---|
+| control.yaml | 0 | -0.2 | 保留历史价值设置的对照组 |
+| mirror.yaml | 0.5 | -0.2 | 单独检查镜像增强 |
+| zero.yaml | 0 | 0 | 单独检查零和目标 |
+| zero_mirror.yaml | 0.5 | 0 | 检查两项改动的组合效果 |
+
+这些配置用于从已有权重继续学习：关闭材料暖启动，初始学习率为 1.73e-4，预算为 40 迭代，
+根价值混合权重均为 0.3。默认每组使用 8 GPU，可顺序运行，或先划分各组的 GPU 配置。
+启动方式见[从已有模型开始新的训练](#从已有模型开始新的训练)。
+
+先比较单项改动，再验证组合效果。各组保留独立输出目录，并使用相同的基线进行
+[棋力评测](#棋力评测)。训练内的 160 盘、55%+1σ 门控用于候选筛选；在这组参数下，
+1σ 条件没有额外筛选作用，不能仅凭晋升次数或熵下降判断棋力。
 
 ### 关键超参调整指南
 
@@ -484,13 +554,22 @@ mcts: {num_sims: 1000}                        # 阶段六核心杠杆：600→10
 | `resign_fp_rate` | 认输误判率（翻盘对局 / 认输对局） |
 | `buffer_size` | 缓冲样本数 |
 | `loss, policy_loss, value_loss` | 损失（总、策略、价值） |
-| `entropy, value_mae` | 指标 |
+| `entropy` | 网络预测熵 H(p) |
+| `target_entropy` | 训练目标熵 H(π) |
+| `policy_kl` | 策略交叉熵减去目标熵，即 KL(π‖p) |
+| `value_mae` | 价值预测的平均绝对误差 |
 | `lr` | 学习率 |
 | `arena_score, arena_red_score, arena_black_score` | Arena 评分 |
 | `promoted` | 1=晋升，0=未晋升 |
-| `selfplay_sec, train_sec, total_sec` | 耗时统计 |
+| `selfplay_sec, train_sec, total_sec` | 自博弈、训练与整轮耗时 |
+| `arena_sec` | Arena 评测耗时 |
+| `buffer_save_wait_sec` | 主线程提交或等待经验池保存的耗时，含快照、同步保存和 join |
 
-用途：用 pandas/Excel 绘制曲线，观察收敛趋势。
+可用 pandas/Excel 绘制曲线，观察收敛趋势。KL 计算使用目标熵，不能用网络预测熵代替。
+旧版 25 列 CSV 会自动补齐新增列，历史行留空；保存耗时列不等于后台压缩的总时间。
+
+分析回滚后的训练日志时，脚本按迭代号回退的位置切段，默认只分析最后一段；
+`--segment 0` 可查看第一段，避免把回滚前后的同号迭代混合比较。
 
 ## FEN 与对局记录格式
 

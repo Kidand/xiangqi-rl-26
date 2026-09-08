@@ -426,6 +426,40 @@ def test_terminal_draw_root_returns_draw_value():
     assert value == pytest.approx(draw_value, abs=1e-9)
 
 
+@pytest.mark.parametrize("max_plies", [1, 2, 3, 4])
+def test_zero_sum_draw_prediction_and_terminal_backup_agree_at_all_depths(max_plies):
+    """零和价值 0 经奇偶深度翻转后，须与真实和棋终局回传完全一致。
+
+    关闭探索项并单叶搜索，使短轨迹先评估普通叶、再抵达 max_plies 和棋；
+    覆盖双方走子视角，避免只检验立即和棋而漏掉网络叶子的回传路径。
+    """
+    board = Board(_START_FEN, max_plies=max_plies)
+    cfg = MCTSConfig(num_sims=12, batch_size=1, c_puct=0.0, draw_value=0.0)
+    evaluated_batches = []
+
+    def eval_fn(states):
+        evaluated_batches.append(len(states))
+        return _const_eval(0.0)(states)
+
+    tree = _run_tree(board, cfg, eval_fn, num_sims=12)
+    assert tree.total_visits == 12
+    assert tree.root_value() == pytest.approx(0.0, abs=1e-9)
+    # 根及每一层普通叶各调用网络一次；最后一层终局不调用网络。
+    assert len(evaluated_batches) == max_plies
+
+    node = tree._root
+    depth = 0
+    while not node.terminal:
+        visited = node.child_N > 0
+        assert int(visited.sum()) == 1
+        np.testing.assert_allclose(node.child_W[visited] / node.child_N[visited], 0.0, atol=1e-9)
+        node = node.child_nodes[int(np.flatnonzero(visited)[0])]
+        depth += 1
+    assert depth == max_plies
+    assert node.terminal_draw
+    assert node.terminal_value == pytest.approx(0.0, abs=1e-9)
+
+
 # --------------------------------------------------------------------------- q_values
 def test_q_values_alignment_scale_and_perspective():
     """q_values 三守护（DESIGN §8）：坐标对齐、与 root_value 同尺度、根走子方视角。

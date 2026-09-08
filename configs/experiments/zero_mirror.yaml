@@ -1,0 +1,55 @@
+# 组合组：先比较单变量组，再验证组合收益。
+# 0716 独立续训实验；使用 --init-from，编号从0开始，禁止载旧buffer。
+# 所有组结构与训练预算相同；control/mirror 保留历史价值目标供对照。
+model: {blocks: 15, filters: 192, se: true, history_steps: 2}
+seed: 42
+mcts:
+  num_sims: 1000
+  c_puct: 1.8
+  dirichlet_alpha: 0.2
+  temp_moves: 32
+  temp_final: 0.15
+  batch_size: 96
+  policy_target_temp: 0.75
+  policy_target_prune_frac: 0.02
+selfplay:
+  games_per_iteration: 2000
+  num_workers: 0
+  games_per_worker: 16
+  eval_max_batch: 4096
+  eval_wait_ms: 2.0
+  eval_fp16: true
+  max_game_plies: 400
+  value_blend_init: 0.0
+  value_blend_iters: 0
+  draw_penalty: 0.0
+  resign_start_iter: 0
+  root_value_weight: 0.3
+train:
+  device: cuda
+  num_gpus: 8
+  batch_size: 4096
+  train_steps_per_iteration: 0
+  sample_reuse: 3.0
+  mirror_prob: 0.5
+  buffer_window: 1500000
+  min_buffer_to_train: 100000
+  lr: 0.000173
+  lr_min: 0.0001
+  total_iterations: 40
+  amp: true
+  checkpoint_dir: runs/0716_zero_mirror/ckpts
+arena:
+  arena_games: 160
+  arena_sims: 400
+  gate_threshold: 0.55
+  gate_lcb_z: 1.0
+  arena_temp_moves: 16
+  arena_temperature: 0.8
+  arena_workers: 0
+log:
+  log_interval_sec: 30.0
+  train_log_interval: 100
+  tensorboard: true
+  log_dir: runs/0716_zero_mirror/logs
+  records_dir: runs/0716_zero_mirror/records

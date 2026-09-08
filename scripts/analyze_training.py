@@ -8,6 +8,9 @@
     # 基础分析（秒级，纯 stdlib）
     python scripts/analyze_training.py
 
+    # 默认只分析最后一次回滚之后的训练段；也可选第 0 段
+    python scripts/analyze_training.py --segment 0
+
     # 加终局类型分布（采样 records/selfplay/*.jsonl，约几十秒）
     python scripts/analyze_training.py --records
 
@@ -41,7 +44,8 @@ if str(_REPO_ROOT) not in sys.path:
 def _f(v, default=None):
     """安全转 float（metrics.csv 缺失列为空字符串）。"""
     try:
-        return float(v)
+        number = float(v)
+        return number if math.isfinite(number) else default
     except (TypeError, ValueError):
         return default
 
@@ -73,18 +77,45 @@ def _elo_from_score(score: float, games: int) -> float:
 # ────────────────────────────────────────────────────────────────
 # metrics.csv
 # ────────────────────────────────────────────────────────────────
-def load_metrics(csv_path: Path) -> list[dict]:
-    """读取 metrics.csv；resume 重跑产生的重复迭代号只保留最后一行。"""
+def load_metric_segments(csv_path: Path) -> list[list[dict]]:
+    """按文件行序读取，迭代号下降时开启新段；仅在同段内去重。
+
+    回滚后的同号迭代属于不同训练轨迹，不能全局合并或按迭代号排序。
+    同段内相同迭代号保留最后一行；缺失、非有限或非整数迭代号跳过。
+    """
     if not csv_path.exists():
         return []
+    segments: list[list[dict]] = []
     by_iter: dict[int, dict] = {}
-    with open(csv_path, newline="", encoding="utf-8") as fh:
+    previous_iter = None
+    with open(csv_path, newline="", encoding="utf-8-sig") as fh:
         for row in csv.DictReader(fh):
             it = _f(row.get("iter"))
-            if it is None:
+            if it is None or not it.is_integer():
                 continue
-            by_iter[int(it)] = row
-    return [by_iter[k] for k in sorted(by_iter)]
+            it = int(it)
+            if previous_iter is not None and it < previous_iter:
+                segments.append(list(by_iter.values()))
+                by_iter = {}
+            by_iter[it] = row
+            previous_iter = it
+    if by_iter:
+        segments.append(list(by_iter.values()))
+    return segments
+
+
+def _segment_index(segments: list[list[dict]], segment: int) -> int:
+    if segment < -1 or segment >= len(segments) or not segments:
+        raise IndexError(f"segment={segment} 越界：共 {len(segments)} 段，使用 0 起的段号或 -1（最后段）")
+    return len(segments) - 1 if segment == -1 else segment
+
+
+def load_metrics(csv_path: Path, segment: int = -1) -> list[dict]:
+    """返回指定训练段（0 起；-1 为最后段），默认不混合回滚前后的日志。"""
+    segments = load_metric_segments(csv_path)
+    if not segments and segment == -1:
+        return []
+    return segments[_segment_index(segments, segment)]
 
 
 def window_summary(rows: list[dict], window: int) -> list[dict]:
@@ -109,6 +140,8 @@ def window_summary(rows: list[dict], window: int) -> list[dict]:
             "v_loss": _mean(_f(r.get("value_loss")) for r in rs),
             "v_mae": _mean(_f(r.get("value_mae")) for r in rs),
             "entropy": _mean(_f(r.get("entropy")) for r in rs),
+            "target_entropy": _mean(_f(r.get("target_entropy")) for r in rs),
+            "policy_kl": _mean(_f(r.get("policy_kl")) for r in rs),
             "lr": _mean(_f(r.get("lr")) for r in rs),
             "arena": _mean(_f(r.get("arena_score")) for r in rs),
             "promo": sum(1 for r in rs if _truthy(r.get("promoted"))),
@@ -132,18 +165,21 @@ def report_metrics(rows: list[dict], window: int, recent: int, lines: list[str])
     total_sec = [_f(r.get("total_sec")) for r in rows if _f(r.get("total_sec"))]
     if total_sec:
         lines.append(f"- 每迭代耗时：中位 {statistics.median(total_sec):.0f}s，最近 10 迭代均值 {_mean(total_sec[-10:]):.0f}s")
+    lines.append("- 策略指标：entropy=预测熵 H(p)，target_entropy=目标熵 H(π)，"
+                 "policy_kl=KL(π‖p)。缺失值显示为 -（未知），不能用 CE-H(p) 推算 KL。")
 
     lines.append("")
     lines.append(f"## 2. 分窗口汇总（每 {window} 迭代）")
     hdr = ("| iter 段 | 和棋 | 红胜 | 黑胜 | 均步数 | 认输率 | loss | p_loss | v_loss | v_mae "
-           "| entropy | lr | arena均分 | 晋升 | selfplay_s |")
+           "| H(p) | H(π) | policy_kl | lr | arena均分 | 晋升 | selfplay_s |")
     lines.append(hdr)
-    lines.append("|" + "---|" * 15)
+    lines.append("|" + "---|" * 17)
     for w in window_summary(rows, window):
         lines.append(
             f"| {w['range']} | {_pct(w['draw'])} | {_pct(w['red'])} | {_pct(w['black'])} "
             f"| {_num(w['plies'], 0)} | {_pct(w['resign'])} | {_num(w['loss'])} | {_num(w['p_loss'])} "
-            f"| {_num(w['v_loss'])} | {_num(w['v_mae'])} | {_num(w['entropy'])} | {_num(w['lr'], 6)} "
+            f"| {_num(w['v_loss'])} | {_num(w['v_mae'])} | {_num(w['entropy'])} "
+            f"| {_num(w['target_entropy'])} | {_num(w['policy_kl'], 5)} | {_num(w['lr'], 6)} "
             f"| {_num(w['arena'])} | {w['promo']}/{w['n']} | {_num(w['sp_sec'], 0)} |"
         )
 
@@ -166,12 +202,13 @@ def report_metrics(rows: list[dict], window: int, recent: int, lines: list[str])
 
     lines.append("")
     lines.append(f"## 4. 最近 {recent} 迭代明细")
-    lines.append("| iter | 和棋 | 均步数 | loss | v_mae | entropy | arena | 晋升 |")
-    lines.append("|" + "---|" * 8)
+    lines.append("| iter | 和棋 | 均步数 | loss | v_mae | H(p) | H(π) | policy_kl | arena | 晋升 |")
+    lines.append("|" + "---|" * 10)
     for r in rows[-recent:]:
         lines.append(
             f"| {int(_f(r['iter']))} | {_pct(_f(r.get('draw_rate')))} | {_num(_f(r.get('avg_plies')), 0)} "
             f"| {_num(_f(r.get('loss')))} | {_num(_f(r.get('value_mae')))} | {_num(_f(r.get('entropy')))} "
+            f"| {_num(_f(r.get('target_entropy')))} | {_num(_f(r.get('policy_kl')), 5)} "
             f"| {_num(_f(r.get('arena_score')))} | {'Y' if _truthy(r.get('promoted')) else ''} |"
         )
 
@@ -367,7 +404,8 @@ def report_ladder(ckpt_dir: Path, offsets: list[int], games: int, sims: int,
 
     lines.append(f"## 6. checkpoint 天梯（每对 {games} 盘 × {sims} sims，"
                  f"{workers} workers × {len(devices)} 设备并行）")
-    lines.append(f"- 基准：iter_{latest:04d}（最新）为\"新\"方；score>0.5 即最新更强")
+    lines.append(f"- 基准：iter_{latest:04d}（最新）为\"新\"方；score 是本批对局得分，"
+                 "棋力差异需结合置信区间与独立复验判断。")
     print(f"[ladder] {len(pairs)} 对 × {games} 盘 → {len(tasks)} 个任务块，"
           f"workers={workers}，devices={devices}", file=sys.stderr)
 
@@ -410,7 +448,6 @@ def report_flags(rows: list[dict], lines: list[str]) -> None:
     lines.append("")
     lines.append("## 7. 自动观察")
     flags = []
-    last = int(_f(rows[-1]["iter"]))
 
     def tail_mean(key, n):
         return _mean(_f(r.get(key)) for r in rows[-n:])
@@ -420,18 +457,35 @@ def report_flags(rows: list[dict], lines: list[str]) -> None:
 
     draw = tail_mean("draw_rate", 25)
     if draw is not None and draw > 0.55:
-        flags.append(f"最近 25 迭代和棋率 {_pct(draw)} 偏高——考虑加大 draw_penalty 或提高 temp_final")
+        flags.append(f"最近 {min(25, len(rows))} 迭代和棋率 {_pct(draw)} 偏高——"
+                     "先检查终局类型、对局长度与开局重复率；保持训练目标与搜索的零和语义一致")
     promo_recent = sum(1 for r in rows[-50:] if _truthy(r.get("promoted")))
     if promo_recent <= 2:
-        flags.append(f"最近 50 迭代仅晋升 {promo_recent} 次——同配方接近瓶颈或 arena 噪声淹没增益（建议加大 arena_games）")
-    ent_now, ent_prev = tail_mean("entropy", 25), head_mean("entropy", -100, -75) if len(rows) >= 100 else (None,)
-    if isinstance(ent_prev, tuple):
-        ent_prev = None
+        flags.append(f"最近 {min(50, len(rows))} 迭代晋升 {promo_recent} 次——"
+                     "晋升数受移动对手与门控噪声影响，不能据此认定棋力停滞；需对冻结基线独立复验")
+    recent_rows = rows[-25:]
+    kl_values = [_f(r.get("policy_kl")) for r in recent_rows]
+    kl_values = [v for v in kl_values if v is not None]
+    target_entropies = [_f(r.get("target_entropy")) for r in recent_rows]
+    target_entropies = [v for v in target_entropies if v is not None]
+    if kl_values:
+        flags.append(f"真实 policy_kl 均值 {_num(_mean(kl_values), 5)}"
+                     f"（最近 {len(recent_rows)} 行中 {len(kl_values)} 行有效）；"
+                     "它衡量当前自博弈策略目标的拟合误差，不能直接判断棋力")
+    else:
+        flags.append("真实 policy_kl 未记录，KL 未知；policy_loss 接近预测熵 entropy 不能说明目标已学完")
+    if target_entropies:
+        flags.append(f"目标熵 target_entropy 均值 {_num(_mean(target_entropies), 5)}"
+                     f"（最近 {len(recent_rows)} 行中 {len(target_entropies)} 行有效）")
+    else:
+        flags.append("目标熵 target_entropy 未记录（未知）；预测熵 H(p) 不能替代目标熵 H(π)")
+    ent_now = tail_mean("entropy", 25)
+    ent_prev = head_mean("entropy", -100, -75) if len(rows) >= 100 else None
     if ent_now is not None and ent_prev is not None and ent_now < ent_prev * 0.7:
-        flags.append(f"策略熵从 {_num(ent_prev)} 降到 {_num(ent_now)}（-30%+）——探索收窄，注意开局多样性")
-    vmae_now, vmae_prev = tail_mean("value_mae", 25), head_mean("value_mae", -100, -75) if len(rows) >= 100 else (None,)
-    if isinstance(vmae_prev, tuple):
-        vmae_prev = None
+        flags.append(f"预测熵从 {_num(ent_prev)} 降到 {_num(ent_now)}（-30%+）——"
+                     "网络预测分布更集中，需结合实际走子分布与开局重复率判断探索情况")
+    vmae_now = tail_mean("value_mae", 25)
+    vmae_prev = head_mean("value_mae", -100, -75) if len(rows) >= 100 else None
     if vmae_now is not None and vmae_prev is not None and vmae_now > vmae_prev * 1.15:
         flags.append(f"value_mae 从 {_num(vmae_prev)} 升到 {_num(vmae_now)}——价值头拟合变差，检查和棋/长局占比")
     lr_now = _f(rows[-1].get("lr"))
@@ -449,6 +503,8 @@ def report_flags(rows: list[dict], lines: list[str]) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="训练日志分析（在 logs/ ckpts/ records/ 的父目录运行）")
     ap.add_argument("--log-dir", default="logs")
+    ap.add_argument("--segment", type=int, default=-1,
+                    help="按 iter 回退切分日志，选择 0 起的训练段；默认 -1（最后段）")
     ap.add_argument("--records-dir", default="records/selfplay")
     ap.add_argument("--ckpt-dir", default="ckpts")
     ap.add_argument("--window", type=int, default=25, help="分桶窗口大小（迭代数）")
@@ -475,10 +531,19 @@ def main(argv=None) -> int:
                  f"records={args.records} ladder={args.ladder}")
     lines.append("")
 
-    rows = load_metrics(Path(args.log_dir) / "metrics.csv")
-    if not rows:
+    segments = load_metric_segments(Path(args.log_dir) / "metrics.csv")
+    if not segments:
         print(f"错误：找不到或无法解析 {args.log_dir}/metrics.csv（请在训练目录下运行）", file=sys.stderr)
         return 1
+    try:
+        selected_segment = _segment_index(segments, args.segment)
+    except IndexError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 2
+    rows = segments[selected_segment]
+    lines.append(f"训练分段：共 {len(segments)} 段，已选 segment={selected_segment}"
+                 "（段号从 0 开始；每次 iter 下降开启新段）。")
+    lines.append("")
 
     report_metrics(rows, args.window, args.recent, lines)
     if args.records:

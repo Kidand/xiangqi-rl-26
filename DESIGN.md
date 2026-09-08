@@ -129,6 +129,11 @@ def policy_index_to_move(idx, side_to_move) -> tuple[int,int]
 def legal_move_mask(board) -> np.ndarray                          # bool (8100,)
 ```
 
+训练左右镜像增强（`rl/augmentation.py`）：`augment_horizontal(states, policies, probability, rng=None)`
+接收 `(B,C,10,9)` 与 `(B,8100)`，返回同形数组。各样本以 `train.mirror_prob` 概率同时左右
+翻转全部输入平面和动作的起终点（`row*9+col -> row*9+8-col`）；价值、颜色与红黑视角不变。
+不修改调用方数组，不增加模型参数。默认概率 0 保持历史训练；新镜像实验显式设 0.5。
+
 ## 7. 网络结构（rl/model.py）
 
 AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
@@ -223,6 +228,26 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
 
 多进程结构：`train.py` 主进程 spawn EvalServer（每 GPU 一个）与 CPU selfplay workers（`torch.multiprocessing` spawn），worker 通过共享内存+队列向 server 请求评估、通过 `Queue` 上报完成的对局（样本+统计），主进程聚合并监控 server 存活（server 死亡→置 stop_event 终止迭代）。worker 自动数（`num_workers: 0`）基于**容器感知的有效核数**（cpu_count / sched_getaffinity / cgroup CFS 配额取最小，`rl/selfplay.py: effective_cpu_count`）：核充裕时 `max(8, eff - num_gpus - 4)`，小配额容器 `clamp(ceil(eff×1.5), 8, 64)`；每迭代日志打印核数信号一览。**必须支持 `device=cpu` 无 GPU 降级**（本地冒烟）。中断恢复：`--resume` 从最新 checkpoint + buffer 续训。
 
+**0716 后独立实验契约（2026-09）**：
+
+- `--init-from PATH` 从指定检查点只载入同结构权重，在空输出目录建立独立实验；优化器、
+  buffer 与迭代编号重新开始，源模型不改。与 `--resume` 互斥；输出已有训练产物时拒绝覆盖。
+  检查点 meta 保存完整配置、初始化来源/哈希及训练标签契约。编号重新开始时，预训练续训
+  预设须显式关闭材料暖启动并采用较低学习率，不能误用从零学习的调度。
+- `rl/targets.py:value_target_metadata(cfg)` 返回版本化的标签生成契约，包含和棋值、根价值
+  混合权重、材料混合参数。`ReplayBuffer(..., target_metadata=None)` 支持保存此元数据；
+  snapshot 保留它，`ReplayBuffer.load(..., expected_target_metadata=None)` 在提供预期契约时
+  对缺失/不匹配元数据报错，防止跨价值语义混用。旧读取工具不指定预期值时仍可读旧 buffer。
+  新实验必须携带并校验契约；历史非零和棋 resume 若无元数据须显式 `--allow-legacy-buffer`。
+  该路径调用 load 的 `allow_missing_target_metadata=True`，只接受缺失，不豁免已知不匹配；
+  续存时继承记录用户接受旧配置假设的标记，未知 buffer 元数据仍保持未知，再次续训仍须
+  显式兼容；不得把未验证的旧标签盖成已知契约。新零和实验禁止使用此兼容开关。
+- 固定基线复验独立于逐迭代晋升，见 `rl/benchmark.py` 和 `scripts/benchmark_models.py`。
+  开局由完整起始 FEN + 已存自博弈着法前缀构成，逐着验证并重演，保留重复/长将/无吃子上下文。
+  每个开局交换红黑各下一盘，无探索噪声、开局后 argmax；双方分别配置搜索参数/和棋值，
+  固定预算与规则一致。结果保存双方模型哈希、配置、开局指纹、逐盘记录和按开局对统计的
+  得分/标准误/置信区间，不自动晋升。区间是近似诊断，不能在少量或重复开局上声称统计显著。
+
 ## 10. 启发式收敛加速（rl/heuristics.py，全部可配置开关）
 
 1. **材料价值混合**：`z_target = (1-λ)·z + λ·tanh(material_diff/材料尺度)`，λ 从 `value_blend_init`（0.5）线性退火到 0（前 `value_blend_iters` 个迭代）。材料分：车9 炮4.5 马4 象2 士2 兵1(过河2)。
@@ -231,7 +256,10 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
    视角——z、材料分、root_value 三量同视角，混合**无需任何翻转**）。一步杀捷径样本无搜索，
    root_value 取 +1.0（当前方必胜）。压低对等对局 ±1 结果目标的方差（KataGo 式）；
    buffer 落盘仍是混合后的单个 float，schema 不变。
-2. **和棋惩罚**：和棋的 z = `draw_penalty`（默认 -0.1，双方同罚），提高进取性（象棋和棋率高，防止塌缩到互相闲逛）。
+2. **和棋目标**：新默认 `draw_penalty=0`，与单标量网络逐层取负的零和回传一致。
+   历史负和棋值仅为旧实验兼容：双方同罚与网络叶子逐层取负不完全相容，训练启动须提示。
+   改成 0 不会自动修复旧权重，必须用独立 buffer 的新标签校准。旧非零终局专用回传保留，
+   方便冻结旧搜索设置作对照；新零和实验真实和棋与预测和棋均以 0 回传。
 3. **认输机制**：迭代 ≥ `resign_start_iter`（默认 10）后启用；双方连续 `resign_consecutive`（4）个己方回合 root value < `resign_threshold`（-0.92）即判负提前结束；10% 对局禁用认输以校准误判率（日志输出 false-positive 率）。
 4. **开局多样化**：前 `opening_random_plies`（8）步温度 1.25 采样，防止开局塌缩。
 5. **一步杀捷径**：self-play 每步先查一步将死，存在则直接走（目标 π 为该着 one-hot），加速终局信号传播。
@@ -244,6 +272,12 @@ AlphaZero 风格 ResNet，尺寸由 `ModelConfig` 决定：
   | avg_plies 121.4 | moves/s 84.2 | nn_evals/s 21030 | resign 31.5% | buffer 812k | elapsed 06:12
 ```
 **训练**（每 100 步）：loss 总/policy/value、policy entropy、value MAE、lr、samples/s、grad_norm。
+额外记录 `target_entropy=H(π)` 与 `policy_kl=CE(π,p)-H(π)`，使用同一 8100 动作支持集、
+float32 概率计算；已有 entropy 保持网络预测熵 H(p)，不得把它当目标熵或将 CE-H(p) 当 KL。
+新增迭代指标还包括 `arena_sec`、`buffer_save_wait_sec`（主线程保存提交/阻塞时间，含快照、
+同步保存和 join，不等于后台压缩总耗时；最后一迭代包含退出时 join）。CSV 追加新列；已有
+旧表头必须原子迁移补空列后再追加，历史数值不改变。分析脚本按物理文件内迭代回退切段，
+默认只分析最后一段；`--segment` 可指定历史段，禁止跨回滚按迭代号混合比较。
 **Arena**（结束时）：`new vs best: 24W 6D 10L (score 67.5%) | 执红 14W2D4L 执黑 10W4D6L | GATE: PROMOTED`。
 **每迭代汇总行**写入 `logs/metrics.csv`（列固定：iter, games, red_win, black_win, draw, red_winrate, black_winrate, draw_rate, avg_plies, resign_rate, resign_fp_rate, buffer_size, loss, policy_loss, value_loss, entropy, value_mae, lr, arena_score, arena_red_score, arena_black_score, promoted, selfplay_sec, train_sec, total_sec）。
 同时输出 TensorBoard（logs/tb/）。所有实时行同步写 `logs/train.log`（带时间戳）。

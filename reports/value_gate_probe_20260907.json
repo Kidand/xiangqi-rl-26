@@ -1,0 +1,50 @@
+{
+  "draw_backup": {
+    "description": "Same predicted draw payoff becomes positive at a network leaf but remains negative at a terminal leaf.",
+    "note": "With max_plies=2 every child is nonterminal but will draw after one further quiet initial-position move. This isolates backup semantics, not trained-model strength.",
+    "rows": [
+      {
+        "max_plies": 1,
+        "network_leaf": false,
+        "root_q": -0.2,
+        "completed_root_visits": 1
+      },
+      {
+        "max_plies": 2,
+        "network_leaf": true,
+        "root_q": 0.20000000298023224,
+        "completed_root_visits": 1
+      },
+      {
+        "max_plies": 400,
+        "network_leaf": true,
+        "root_q": 0.20000000298023224,
+        "completed_root_visits": 1
+      }
+    ]
+  },
+  "arena_gate": {
+    "games": 160,
+    "gate_threshold": 0.55,
+    "gate_lcb_z": 1.0,
+    "wdl_combinations_checked": 13041,
+    "lcb_changed_decisions": 0,
+    "false_promotion_probability_equal_strength_independent_no_draws": 0.11779121323463487,
+    "note": "The probability is an illustrative exact binomial calculation, not an estimate for actual correlated games with draws."
+  },
+  "historical_gumbel": {
+    "revision": "f7aee4d",
+    "description": "Sequential Halving eliminates candidates using in-flight visits before their Q values are returned.",
+    "before_results": {
+      "phase": 1,
+      "completed_root_visits": 0,
+      "pending_root_visits": 8,
+      "initial_candidates": 8,
+      "surviving_candidates": 4,
+      "pending_tokens": 8
+    },
+    "best_delayed_candidate_was_eliminated": true,
+    "delayed_candidate_root_q": 1.0,
+    "note": "This proves a defect in the removed implementation; it does not establish the cause of previous training outcomes or predict a corrected implementation's strength."
+  }
+}

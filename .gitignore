@@ -14,4 +14,5 @@ records/
 *.onnx
 *.pt
 .pytest_cache/
+runs/
 .DS_Store

@@ -1,0 +1,995 @@
+{
+  "analysis_date": "2026-09-07",
+  "method": "Split metrics0729.csv on physical row order when iteration decreases; split first monotonic segment using documented historical boundaries. Never deduplicate by iteration across phases.",
+  "files": [
+    {
+      "path": "logs/metrics.csv",
+      "row_count": 600,
+      "monotonic_segments": [
+        {
+          "data_row_range_1based": [
+            1,
+            600
+          ],
+          "csv_line_range_1based": [
+            2,
+            601
+          ],
+          "iteration_range": [
+            0,
+            599
+          ]
+        }
+      ],
+      "identical_prefix_rows_vs_0729_first_segment": 600
+    },
+    {
+      "path": "logs/metrics0716.csv",
+      "row_count": 1499,
+      "monotonic_segments": [
+        {
+          "data_row_range_1based": [
+            1,
+            1499
+          ],
+          "csv_line_range_1based": [
+            2,
+            1500
+          ],
+          "iteration_range": [
+            0,
+            1499
+          ]
+        }
+      ],
+      "identical_prefix_rows_vs_0729_first_segment": 1499
+    },
+    {
+      "path": "logs/metrics0720.csv",
+      "row_count": 1999,
+      "monotonic_segments": [
+        {
+          "data_row_range_1based": [
+            1,
+            1999
+          ],
+          "csv_line_range_1based": [
+            2,
+            2000
+          ],
+          "iteration_range": [
+            0,
+            1999
+          ]
+        }
+      ],
+      "identical_prefix_rows_vs_0729_first_segment": 1999
+    },
+    {
+      "path": "logs/metrics0729.csv",
+      "row_count": 2252,
+      "monotonic_segments": [
+        {
+          "data_row_range_1based": [
+            1,
+            1999
+          ],
+          "csv_line_range_1based": [
+            2,
+            2000
+          ],
+          "iteration_range": [
+            0,
+            1999
+          ]
+        },
+        {
+          "data_row_range_1based": [
+            2000,
+            2252
+          ],
+          "csv_line_range_1based": [
+            2001,
+            2253
+          ],
+          "iteration_range": [
+            1500,
+            1753
+          ]
+        }
+      ],
+      "identical_prefix_rows_vs_0729_first_segment": 1999
+    },
+    {
+      "path": "logs/metrics260709.csv",
+      "row_count": 1000,
+      "monotonic_segments": [
+        {
+          "data_row_range_1based": [
+            1,
+            1000
+          ],
+          "csv_line_range_1based": [
+            2,
+            1001
+          ],
+          "iteration_range": [
+            0,
+            999
+          ]
+        }
+      ],
+      "identical_prefix_rows_vs_0729_first_segment": 1000
+    }
+  ],
+  "stages": [
+    {
+      "stage": 1,
+      "documented_iteration_range": [
+        0,
+        599
+      ],
+      "source": "logs/metrics0729.csv first monotonic segment",
+      "actual_iteration_range": [
+        0,
+        599
+      ],
+      "row_count": 600,
+      "missing_inside_actual_range": [],
+      "games": 1200000,
+      "logged_total_hours": 82.77323055555556,
+      "promotions": 153,
+      "last_promotion_iteration": 593,
+      "tail100": {
+        "iteration_range": [
+          500,
+          599
+        ],
+        "row_count": 100,
+        "promotions": 11,
+        "metrics": {
+          "policy_loss": {
+            "n": 100,
+            "mean": 2.5437863,
+            "median": 2.54335,
+            "min": 2.53128,
+            "max": 2.55957,
+            "p90_nearest_rank": 2.55172
+          },
+          "value_loss": {
+            "n": 100,
+            "mean": 0.48510689999999995,
+            "median": 0.48860499999999996,
+            "min": 0.46621,
+            "max": 0.49893,
+            "p90_nearest_rank": 0.49484
+          },
+          "entropy": {
+            "n": 100,
+            "mean": 2.5441675,
+            "median": 2.54376,
+            "min": 2.53215,
+            "max": 2.56153,
+            "p90_nearest_rank": 2.55193
+          },
+          "value_mae": {
+            "n": 100,
+            "mean": 0.5430454,
+            "median": 0.546115,
+            "min": 0.52813,
+            "max": 0.55465,
+            "p90_nearest_rank": 0.55081
+          },
+          "draw_rate": {
+            "n": 100,
+            "mean": 0.12898500000000002,
+            "median": 0.12875,
+            "min": 0.1085,
+            "max": 0.147,
+            "p90_nearest_rank": 0.138
+          },
+          "avg_plies": {
+            "n": 100,
+            "mean": 86.9266,
+            "median": 86.83,
+            "min": 84.41,
+            "max": 90.61,
+            "p90_nearest_rank": 88.54
+          },
+          "arena_score": {
+            "n": 100,
+            "mean": 0.501255,
+            "median": 0.5,
+            "min": 0.4062,
+            "max": 0.6375,
+            "p90_nearest_rank": 0.55
+          },
+          "arena_red_score": {
+            "n": 100,
+            "mean": 0.508625,
+            "median": 0.5125,
+            "min": 0.375,
+            "max": 0.725,
+            "p90_nearest_rank": 0.5875
+          },
+          "arena_black_score": {
+            "n": 100,
+            "mean": 0.493875,
+            "median": 0.4875,
+            "min": 0.325,
+            "max": 0.625,
+            "p90_nearest_rank": 0.575
+          },
+          "selfplay_sec": {
+            "n": 100,
+            "mean": 331.2757,
+            "median": 330.025,
+            "min": 313.69,
+            "max": 371.98,
+            "p90_nearest_rank": 346.33
+          },
+          "train_sec": {
+            "n": 100,
+            "mean": 14.8277,
+            "median": 14.82,
+            "min": 14.29,
+            "max": 15.46,
+            "p90_nearest_rank": 15.16
+          },
+          "total_sec": {
+            "n": 100,
+            "mean": 387.9866,
+            "median": 386.19,
+            "min": 367.58,
+            "max": 427.2,
+            "p90_nearest_rank": 402.03
+          },
+          "resign_rate": {
+            "n": 100,
+            "mean": 0.29022,
+            "median": 0.28974999999999995,
+            "min": 0.261,
+            "max": 0.315,
+            "p90_nearest_rank": 0.3025
+          },
+          "resign_fp_rate": {
+            "n": 100,
+            "mean": 0.015382,
+            "median": 0.015449999999999998,
+            "min": 0.0,
+            "max": 0.0606,
+            "p90_nearest_rank": 0.028
+          },
+          "lr": {
+            "n": 100,
+            "mean": 0.000108878,
+            "median": 0.00010664999999999999,
+            "min": 0.0001,
+            "max": 0.0001263,
+            "p90_nearest_rank": 0.0001213
+          }
+        },
+        "resign_fp_nonzero_rows": 87,
+        "unallocated_total_minus_selfplay_minus_train_seconds": {
+          "n": 100,
+          "mean": 41.883199999999995,
+          "median": 41.97499999999998,
+          "min": 37.94000000000001,
+          "max": 48.13000000000001,
+          "p90_nearest_rank": 45.079999999999984
+        },
+        "unallocated_time_fraction": 0.1079501199268222
+      }
+    },
+    {
+      "stage": 2,
+      "documented_iteration_range": [
+        600,
+        999
+      ],
+      "source": "logs/metrics0729.csv first monotonic segment",
+      "actual_iteration_range": [
+        600,
+        999
+      ],
+      "row_count": 400,
+      "missing_inside_actual_range": [],
+      "games": 800000,
+      "logged_total_hours": 64.75899722222222,
+      "promotions": 86,
+      "last_promotion_iteration": 997,
+      "tail100": {
+        "iteration_range": [
+          900,
+          999
+        ],
+        "row_count": 100,
+        "promotions": 22,
+        "metrics": {
+          "policy_loss": {
+            "n": 100,
+            "mean": 1.0635579,
+            "median": 1.073075,
+            "min": 1.02835,
+            "max": 1.08828,
+            "p90_nearest_rank": 1.08202
+          },
+          "value_loss": {
+            "n": 100,
+            "mean": 0.23208839999999997,
+            "median": 0.23472,
+            "min": 0.21181,
+            "max": 0.24114,
+            "p90_nearest_rank": 0.238
+          },
+          "entropy": {
+            "n": 100,
+            "mean": 1.0634166,
+            "median": 1.069675,
+            "min": 1.03058,
+            "max": 1.0876,
+            "p90_nearest_rank": 1.08077
+          },
+          "value_mae": {
+            "n": 100,
+            "mean": 0.3765555,
+            "median": 0.3806,
+            "min": 0.34889,
+            "max": 0.38708,
+            "p90_nearest_rank": 0.38399
+          },
+          "draw_rate": {
+            "n": 100,
+            "mean": 0.22209,
+            "median": 0.222,
+            "min": 0.1885,
+            "max": 0.2475,
+            "p90_nearest_rank": 0.236
+          },
+          "avg_plies": {
+            "n": 100,
+            "mean": 94.947,
+            "median": 91.36,
+            "min": 87.98,
+            "max": 114.36,
+            "p90_nearest_rank": 110.93
+          },
+          "arena_score": {
+            "n": 100,
+            "mean": 0.489062,
+            "median": 0.4844,
+            "min": 0.0187,
+            "max": 0.9906,
+            "p90_nearest_rank": 0.7438
+          },
+          "arena_red_score": {
+            "n": 100,
+            "mean": 0.37831400000000004,
+            "median": 0.19690000000000002,
+            "min": 0.0,
+            "max": 1.0,
+            "p90_nearest_rank": 0.9938
+          },
+          "arena_black_score": {
+            "n": 100,
+            "mean": 0.5998129999999999,
+            "median": 0.6875,
+            "min": 0.0063,
+            "max": 0.9938,
+            "p90_nearest_rank": 0.975
+          },
+          "selfplay_sec": {
+            "n": 100,
+            "mean": 447.6534,
+            "median": 394.67,
+            "min": 369.09,
+            "max": 730.8,
+            "p90_nearest_rank": 672.76
+          },
+          "train_sec": {
+            "n": 100,
+            "mean": 15.702,
+            "median": 15.125,
+            "min": 14.53,
+            "max": 19.27,
+            "p90_nearest_rank": 18.32
+          },
+          "total_sec": {
+            "n": 100,
+            "mean": 705.4057,
+            "median": 616.355,
+            "min": 558.92,
+            "max": 1184.05,
+            "p90_nearest_rank": 1043.46
+          },
+          "resign_rate": {
+            "n": 100,
+            "mean": 0.225085,
+            "median": 0.219,
+            "min": 0.1885,
+            "max": 0.279,
+            "p90_nearest_rank": 0.2615
+          },
+          "resign_fp_rate": {
+            "n": 100,
+            "mean": 0.007733,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0396,
+            "p90_nearest_rank": 0.0217
+          },
+          "lr": {
+            "n": 100,
+            "mean": 0.00010241800000000001,
+            "median": 0.0001018,
+            "min": 0.0001,
+            "max": 0.0001072,
+            "p90_nearest_rank": 0.0001058
+          }
+        },
+        "resign_fp_nonzero_rows": 47,
+        "unallocated_total_minus_selfplay_minus_train_seconds": {
+          "n": 100,
+          "mean": 242.0503,
+          "median": 210.055,
+          "min": 173.18999999999994,
+          "max": 492.76,
+          "p90_nearest_rank": 372.24999999999994
+        },
+        "unallocated_time_fraction": 0.34313629731089496
+      }
+    },
+    {
+      "stage": 3,
+      "documented_iteration_range": [
+        1000,
+        1499
+      ],
+      "source": "logs/metrics0729.csv first monotonic segment",
+      "actual_iteration_range": [
+        1001,
+        1499
+      ],
+      "row_count": 499,
+      "missing_inside_actual_range": [],
+      "games": 998000,
+      "logged_total_hours": 110.29831666666666,
+      "promotions": 115,
+      "last_promotion_iteration": 1498,
+      "tail100": {
+        "iteration_range": [
+          1400,
+          1499
+        ],
+        "row_count": 100,
+        "promotions": 43,
+        "metrics": {
+          "policy_loss": {
+            "n": 100,
+            "mean": 0.9957758,
+            "median": 1.02483,
+            "min": 0.85869,
+            "max": 1.07734,
+            "p90_nearest_rank": 1.056
+          },
+          "value_loss": {
+            "n": 100,
+            "mean": 0.1614014,
+            "median": 0.16391499999999998,
+            "min": 0.14077,
+            "max": 0.17072,
+            "p90_nearest_rank": 0.16807
+          },
+          "entropy": {
+            "n": 100,
+            "mean": 0.9958678000000001,
+            "median": 1.025195,
+            "min": 0.85877,
+            "max": 1.0781,
+            "p90_nearest_rank": 1.0557
+          },
+          "value_mae": {
+            "n": 100,
+            "mean": 0.28130299999999997,
+            "median": 0.285435,
+            "min": 0.24929,
+            "max": 0.29157,
+            "p90_nearest_rank": 0.29008
+          },
+          "draw_rate": {
+            "n": 100,
+            "mean": 0.249465,
+            "median": 0.2365,
+            "min": 0.2055,
+            "max": 0.3525,
+            "p90_nearest_rank": 0.313
+          },
+          "avg_plies": {
+            "n": 100,
+            "mean": 99.84110000000001,
+            "median": 98.695,
+            "min": 94.58,
+            "max": 114.21,
+            "p90_nearest_rank": 106.43
+          },
+          "arena_score": {
+            "n": 100,
+            "mean": 0.536745,
+            "median": 0.51095,
+            "min": 0.2156,
+            "max": 0.8281,
+            "p90_nearest_rank": 0.6875
+          },
+          "arena_red_score": {
+            "n": 100,
+            "mean": 0.569063,
+            "median": 0.5312,
+            "min": 0.0625,
+            "max": 0.9875,
+            "p90_nearest_rank": 0.8125
+          },
+          "arena_black_score": {
+            "n": 100,
+            "mean": 0.50444,
+            "median": 0.49065000000000003,
+            "min": 0.1062,
+            "max": 1.0,
+            "p90_nearest_rank": 0.75
+          },
+          "selfplay_sec": {
+            "n": 100,
+            "mean": 498.18800000000005,
+            "median": 494.78499999999997,
+            "min": 421.6,
+            "max": 609.69,
+            "p90_nearest_rank": 551.22
+          },
+          "train_sec": {
+            "n": 100,
+            "mean": 29.8384,
+            "median": 29.54,
+            "min": 28.28,
+            "max": 34.01,
+            "p90_nearest_rank": 31.75
+          },
+          "total_sec": {
+            "n": 100,
+            "mean": 1078.6235000000001,
+            "median": 988.1800000000001,
+            "min": 731.34,
+            "max": 2052.81,
+            "p90_nearest_rank": 1501.66
+          },
+          "resign_rate": {
+            "n": 100,
+            "mean": 0.30966,
+            "median": 0.312,
+            "min": 0.258,
+            "max": 0.344,
+            "p90_nearest_rank": 0.3265
+          },
+          "resign_fp_rate": {
+            "n": 100,
+            "mean": 0.008905999999999999,
+            "median": 0.0078,
+            "min": 0.0,
+            "max": 0.032,
+            "p90_nearest_rank": 0.0219
+          },
+          "lr": {
+            "n": 100,
+            "mean": 0.000101794,
+            "median": 0.00010135,
+            "min": 0.0001,
+            "max": 0.0001054,
+            "p90_nearest_rank": 0.0001043
+          }
+        },
+        "resign_fp_nonzero_rows": 70,
+        "unallocated_total_minus_selfplay_minus_train_seconds": {
+          "n": 100,
+          "mean": 550.5971,
+          "median": 469.06500000000005,
+          "min": 266.94,
+          "max": 1507.55,
+          "p90_nearest_rank": 924.3600000000001
+        },
+        "unallocated_time_fraction": 0.5104627332892339
+      }
+    },
+    {
+      "stage": 4,
+      "documented_iteration_range": [
+        1500,
+        1999
+      ],
+      "source": "logs/metrics0729.csv first monotonic segment",
+      "actual_iteration_range": [
+        1500,
+        1999
+      ],
+      "row_count": 500,
+      "missing_inside_actual_range": [],
+      "games": 1000000,
+      "logged_total_hours": 92.88693055555557,
+      "promotions": 65,
+      "last_promotion_iteration": 1977,
+      "tail100": {
+        "iteration_range": [
+          1900,
+          1999
+        ],
+        "row_count": 100,
+        "promotions": 6,
+        "metrics": {
+          "policy_loss": {
+            "n": 100,
+            "mean": 1.4884623,
+            "median": 1.4914,
+            "min": 1.46175,
+            "max": 1.51449,
+            "p90_nearest_rank": 1.50689
+          },
+          "value_loss": {
+            "n": 100,
+            "mean": 0.17434049999999998,
+            "median": 0.173925,
+            "min": 0.17081,
+            "max": 0.18049,
+            "p90_nearest_rank": 0.17704
+          },
+          "entropy": {
+            "n": 100,
+            "mean": 1.4874778,
+            "median": 1.489765,
+            "min": 1.46194,
+            "max": 1.5137,
+            "p90_nearest_rank": 1.50685
+          },
+          "value_mae": {
+            "n": 100,
+            "mean": 0.2960574,
+            "median": 0.295505,
+            "min": 0.29244,
+            "max": 0.30205,
+            "p90_nearest_rank": 0.29928
+          },
+          "draw_rate": {
+            "n": 100,
+            "mean": 0.18994,
+            "median": 0.1905,
+            "min": 0.158,
+            "max": 0.2125,
+            "p90_nearest_rank": 0.2065
+          },
+          "avg_plies": {
+            "n": 100,
+            "mean": 94.1308,
+            "median": 94.505,
+            "min": 89.77,
+            "max": 98.54,
+            "p90_nearest_rank": 96.41
+          },
+          "arena_score": {
+            "n": 100,
+            "mean": 0.5009089999999999,
+            "median": 0.5031,
+            "min": 0.4281,
+            "max": 0.5875,
+            "p90_nearest_rank": 0.5375
+          },
+          "arena_red_score": {
+            "n": 100,
+            "mean": 0.5053110000000001,
+            "median": 0.50935,
+            "min": 0.4,
+            "max": 0.6438,
+            "p90_nearest_rank": 0.5563
+          },
+          "arena_black_score": {
+            "n": 100,
+            "mean": 0.496497,
+            "median": 0.5031,
+            "min": 0.375,
+            "max": 0.5938,
+            "p90_nearest_rank": 0.5563
+          },
+          "selfplay_sec": {
+            "n": 100,
+            "mean": 373.9095,
+            "median": 371.98,
+            "min": 348.3,
+            "max": 402.48,
+            "p90_nearest_rank": 386.9
+          },
+          "train_sec": {
+            "n": 100,
+            "mean": 27.8777,
+            "median": 28.015,
+            "min": 26.68,
+            "max": 29.13,
+            "p90_nearest_rank": 28.53
+          },
+          "total_sec": {
+            "n": 100,
+            "mean": 587.2932,
+            "median": 586.875,
+            "min": 553.61,
+            "max": 638.08,
+            "p90_nearest_rank": 607.82
+          },
+          "resign_rate": {
+            "n": 100,
+            "mean": 0.390255,
+            "median": 0.39,
+            "min": 0.3545,
+            "max": 0.4155,
+            "p90_nearest_rank": 0.4075
+          },
+          "resign_fp_rate": {
+            "n": 100,
+            "mean": 0.0073609999999999995,
+            "median": 0.0063,
+            "min": 0.0,
+            "max": 0.0323,
+            "p90_nearest_rank": 0.0143
+          },
+          "lr": {
+            "n": 100,
+            "mean": 0.00010101000000000001,
+            "median": 0.00010075,
+            "min": 0.0001,
+            "max": 0.000103,
+            "p90_nearest_rank": 0.0001024
+          }
+        },
+        "resign_fp_nonzero_rows": 73,
+        "unallocated_total_minus_selfplay_minus_train_seconds": {
+          "n": 100,
+          "mean": 185.50599999999997,
+          "median": 184.45999999999998,
+          "min": 161.26000000000005,
+          "max": 224.38000000000002,
+          "p90_nearest_rank": 206.77000000000004
+        },
+        "unallocated_time_fraction": 0.31586607847664505
+      }
+    },
+    {
+      "stage": 5,
+      "documented_iteration_range": [
+        1500,
+        1999
+      ],
+      "source": "logs/metrics0729.csv second monotonic segment",
+      "actual_iteration_range": [
+        1500,
+        1753
+      ],
+      "row_count": 253,
+      "missing_inside_actual_range": [
+        1608
+      ],
+      "games": 506000,
+      "logged_total_hours": 202.40234444444442,
+      "promotions": 25,
+      "last_promotion_iteration": 1727,
+      "tail100": {
+        "iteration_range": [
+          1654,
+          1753
+        ],
+        "row_count": 100,
+        "promotions": 6,
+        "metrics": {
+          "policy_loss": {
+            "n": 100,
+            "mean": 0.9526509,
+            "median": 0.93333,
+            "min": 0.86602,
+            "max": 1.03631,
+            "p90_nearest_rank": 1.02102
+          },
+          "value_loss": {
+            "n": 100,
+            "mean": 0.1262787,
+            "median": 0.119405,
+            "min": 0.10577,
+            "max": 0.14648,
+            "p90_nearest_rank": 0.14448
+          },
+          "entropy": {
+            "n": 100,
+            "mean": 0.952334,
+            "median": 0.932235,
+            "min": 0.86534,
+            "max": 1.03951,
+            "p90_nearest_rank": 1.0204
+          },
+          "value_mae": {
+            "n": 100,
+            "mean": 0.2239063,
+            "median": 0.212545,
+            "min": 0.18992,
+            "max": 0.25556,
+            "p90_nearest_rank": 0.25315
+          },
+          "draw_rate": {
+            "n": 100,
+            "mean": 0.305175,
+            "median": 0.30825,
+            "min": 0.254,
+            "max": 0.335,
+            "p90_nearest_rank": 0.323
+          },
+          "avg_plies": {
+            "n": 100,
+            "mean": 107.46879999999999,
+            "median": 110.89,
+            "min": 94.51,
+            "max": 119.9,
+            "p90_nearest_rank": 114.41
+          },
+          "arena_score": {
+            "n": 100,
+            "mean": 0.508853,
+            "median": 0.4938,
+            "min": 0.45,
+            "max": 0.7219,
+            "p90_nearest_rank": 0.525
+          },
+          "arena_red_score": {
+            "n": 100,
+            "mean": 0.520319,
+            "median": 0.5062,
+            "min": 0.4437,
+            "max": 0.9437,
+            "p90_nearest_rank": 0.525
+          },
+          "arena_black_score": {
+            "n": 100,
+            "mean": 0.497383,
+            "median": 0.4938,
+            "min": 0.4125,
+            "max": 0.9187,
+            "p90_nearest_rank": 0.5188
+          },
+          "selfplay_sec": {
+            "n": 100,
+            "mean": 651.006,
+            "median": 654.7249999999999,
+            "min": 571.83,
+            "max": 734.77,
+            "p90_nearest_rank": 699.78
+          },
+          "train_sec": {
+            "n": 100,
+            "mean": 31.6742,
+            "median": 32.629999999999995,
+            "min": 27.81,
+            "max": 35.45,
+            "p90_nearest_rank": 33.66
+          },
+          "total_sec": {
+            "n": 100,
+            "mean": 2821.9452,
+            "median": 2526.795,
+            "min": 1834.25,
+            "max": 4820.93,
+            "p90_nearest_rank": 3581.86
+          },
+          "resign_rate": {
+            "n": 100,
+            "mean": 0.31116,
+            "median": 0.3115,
+            "min": 0.2815,
+            "max": 0.3405,
+            "p90_nearest_rank": 0.3255
+          },
+          "resign_fp_rate": {
+            "n": 100,
+            "mean": 0.010348999999999999,
+            "median": 0.0081,
+            "min": 0.0,
+            "max": 0.0472,
+            "p90_nearest_rank": 0.0217
+          },
+          "lr": {
+            "n": 100,
+            "mean": 0.000126677,
+            "median": 0.00012645,
+            "min": 0.0001184,
+            "max": 0.0001358,
+            "p90_nearest_rank": 0.0001338
+          }
+        },
+        "resign_fp_nonzero_rows": 73,
+        "unallocated_total_minus_selfplay_minus_train_seconds": {
+          "n": 100,
+          "mean": 2139.265,
+          "median": 1816.0300000000002,
+          "min": 1150.3400000000001,
+          "max": 4190.14,
+          "p90_nearest_rank": 2832.09
+        },
+        "unallocated_time_fraction": 0.7580816948536067
+      }
+    }
+  ],
+  "checkpoints": [
+    {
+      "path": "ckpts/best0716.pt",
+      "iteration": 1498,
+      "model_config": {
+        "blocks": 15,
+        "filters": 192,
+        "se": true,
+        "history_steps": 2
+      },
+      "meta": {
+        "promoted_from": 1498
+      },
+      "parameter_count": 10539835,
+      "trainable_parameter_count": 10539835,
+      "buffer_element_count": 12337,
+      "state_dict_element_count": 10552172
+    },
+    {
+      "path": "ckpts/best0720.pt",
+      "iteration": 1977,
+      "model_config": {
+        "blocks": 15,
+        "filters": 192,
+        "se": true,
+        "history_steps": 2
+      },
+      "meta": {
+        "promoted_from": 1977
+      },
+      "parameter_count": 10539835,
+      "trainable_parameter_count": 10539835,
+      "buffer_element_count": 12337,
+      "state_dict_element_count": 10552172
+    },
+    {
+      "path": "ckpts/best0729.pt",
+      "iteration": 1727,
+      "model_config": {
+        "blocks": 15,
+        "filters": 192,
+        "se": true,
+        "history_steps": 2
+      },
+      "meta": {
+        "promoted_from": 1727
+      },
+      "parameter_count": 10539835,
+      "trainable_parameter_count": 10539835,
+      "buffer_element_count": 12337,
+      "state_dict_element_count": 10552172
+    }
+  ],
+  "local_stage6_measured_metrics_present": false,
+  "limitations": [
+    "Historical stage boundaries: 0-599, 600-999, 1000-1499, 1500-1999; stage five is the appended rollback segment 1500-1753.",
+    "Stage three has no row for iteration 1000; stage five has no row for iteration 1608. No imputation was performed.",
+    "Archive files are overlapping cumulative snapshots, not independent runs. Their rows must not be summed.",
+    "Tail100 statistics average per-iteration metrics; they are not global sample-weighted losses or conditional-rate ratios.",
+    "policy_loss is CE(target,prediction); entropy is H(prediction). CE-H(prediction) is not KL(target||prediction). H(target) was not logged.",
+    "Losses are computed on changing replay-buffer training batches. Lower losses alone do not establish better chess strength or generalization.",
+    "Arena score compares each candidate with that iteration's moving incumbent. It is not a fixed-opponent ladder and cannot establish best0729 versus best0716 strength.",
+    "CSV lacks per-game results, independent opening counts and score SE. Promotion counts and arena means alone cannot establish statistical significance.",
+    "resign_fp_rate equals fp/calib_would per iteration (zero when denominator is zero); numerator and denominator are absent from CSV, so aggregate FP rate and confidence intervals cannot be reconstructed.",
+    "total_sec includes stages beyond selfplay and training; their residual includes arena, checkpoint/buffer handling and other overhead, not a separately measured arena duration.",
+    "No local training log or additional metrics rollback proves a stage-six run; a stage-six configuration and README statement alone are not outcome evidence."
+  ],
+  "implementation_references": {
+    "policy_CE": "rl/train.py:518",
+    "value_MSE": "rl/train.py:519",
+    "prediction_entropy": "rl/train.py:537",
+    "resign_FP_denominator": "rl/train.py:429",
+    "arena_then_total_time": "rl/train.py:819",
+    "CSV_total_time": "rl/train.py:852",
+    "legacy_iteration_deduplication": "scripts/analyze_training.py:86"
+  }
+}
